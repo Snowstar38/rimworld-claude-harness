@@ -1,0 +1,68 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<PrefsData>
+  <volumeMaster>0.8</volumeMaster>
+  <volumeGame>1</volumeGame>
+  <volumeMusic>0.4</volumeMusic>
+  <volumeAmbient>1</volumeAmbient>
+  <volumeUI>1</volumeUI>
+  <screenWidth>0</screenWidth>
+  <screenHeight>0</screenHeight>
+  <fullscreen>False</fullscreen>
+  <uiScale>2.5</uiScale>
+  <customCursorEnabled>True</customCursorEnabled>
+  <hatsOnlyOnMap>False</hatsOnlyOnMap>
+  <plantWindSway>True</plantWindSway>
+  <screenShakeIntensity>1</screenShakeIntensity>
+  <textureCompression>True</textureCompression>
+  <showRealtimeClock>False</showRealtimeClock>
+  <disableTinyText>False</disableTinyText>
+  <animalNameMode>None</animalNameMode>
+  <mechNameMode>WhileDrafted</mechNameMode>
+  <backgroundExpansionId IsNull="True" />
+  <randomBackground>False</randomBackground>
+  <showWeaponsUnderPortraitMode>WhileDrafted</showWeaponsUnderPortraitMode>
+  <dotHighlightDisplayMode>HighlightAll</dotHighlightDisplayMode>
+  <highlightStyleMode>Silhouettes</highlightStyleMode>
+  <visibleMood>True</visibleMood>
+  <twelveHourClock>False</twelveHourClock>
+  <adaptiveTrainingEnabled>False</adaptiveTrainingEnabled>
+  <steamDeckKeyboardMode>False</steamDeckKeyboardMode>
+  <preferredNames />
+  <resourceReadoutCategorized>False</resourceReadoutCategorized>
+  <runInBackground>True</runInBackground>
+  <edgeScreenScroll>True</edgeScreenScroll>
+  <rememberDrawStyles>False</rememberDrawStyles>
+  <zoomSwitchWorldLayer>True</zoomSwitchWorldLayer>
+  <zoomToMouse>False</zoomToMouse>
+  <temperatureMode>Celsius</temperatureMode>
+  <autosaveIntervalDays>1</autosaveIntervalDays>
+  <testMapSizes>False</testMapSizes>
+  <maxNumberOfPlayerSettlements>1</maxNumberOfPlayerSettlements>
+  <pauseOnLoad>False</pauseOnLoad>
+  <automaticPauseMode>Never</automaticPauseMode>
+  <mapDragSensitivity>1.3</mapDragSensitivity>
+  <smoothCameraJumps>True</smoothCameraJumps>
+  <gravshipCutscenes>True</gravshipCutscenes>
+  <autosavesCount>5</autosavesCount>
+  <extremeDifficultyUnlocked>False</extremeDifficultyUnlocked>
+  <pauseOnError>False</pauseOnError>
+  <devMode>False</devMode>
+  <debugActionPalette>
+    <li>Actions\Spawn Pawn...</li>
+  </debugActionPalette>
+  <devPalettePosition>
+    <x>0</x>
+    <y>0</y>
+  </devPalettePosition>
+  <langFolderName>English</langFolderName>
+  <logVerbose>False</logVerbose>
+  <openLogOnWarnings>False</openLogOnWarnings>
+  <closeLogWindowOnEscape>True</closeLogWindowOnEscape>
+  <disableQuickStartCryptoSickness>True</disableQuickStartCryptoSickness>
+  <quickStartDevPaletteOn>False</quickStartDevPaletteOn>
+  <resetModsConfigOnCrash>True</resetModsConfigOnCrash>
+  <simulateNotOwningRoyalty>False</simulateNotOwningRoyalty>
+  <simulateNotOwningIdeology>False</simulateNotOwningIdeology>
+  <simulateNotOwningBiotech>False</simulateNotOwningBiotech>
+  <simulateNotOwningAnomaly>False</simulateNotOwningAnomaly>
+</PrefsData>

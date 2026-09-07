@@ -1,0 +1,15 @@
+bridge/gabs-config/rimworld/
+instruments/state/
+instruments/__pycache__/
+**/__pycache__/
+*.pyc
+companion/artifacts/
+companion/src/bin/
+companion/src/obj/
+profile/Screenshots/
+profile/Saves/Autosave-*.rws
+overlay/events.jsonl
+overlay/state.json
+overlay/chat-config.json
+*.user
+*.log

@@ -1,0 +1,68 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net472</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>HomeBridge.BridgeTools</AssemblyName>
+    <RootNamespace>HomeBridge.BridgeTools</RootNamespace>
+    <OutputPath>..\artifacts\BridgeTools\HomeBridge\</OutputPath>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <EnableDefaultCompileItems>true</EnableDefaultCompileItems>
+    <!-- Nothing here ships anything but our own DLL. -->
+    <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
+    <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
+    <AssemblyVersion>0.1.0.0</AssemblyVersion>
+    <FileVersion>0.1.0.0</FileVersion>
+    <Version>0.1.0</Version>
+    <DebugType>none</DebugType>
+  </PropertyGroup>
+
+  <!--
+    Paths to the two things we reference but never redistribute.
+    Override on the command line if either moves, e.g.
+      dotnet build ... /p:RimWorldManagedDir="D:\...\Managed"
+  -->
+  <PropertyGroup>
+    <RimBridgeSdkDir Condition="'$(RimBridgeSdkDir)' == ''">C:\Home\rimworld\bridge\RimBridgeServer\RimBridgeServer\1.6\Assemblies</RimBridgeSdkDir>
+    <RimWorldManagedDir Condition="'$(RimWorldManagedDir)' == ''">C:\Program Files (x86)\Steam\steamapps\common\RimWorld\RimWorldWin64_Data\Managed</RimWorldManagedDir>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!--
+      net472 targeting pack is not installed system-wide on this machine;
+      this package supplies the reference assemblies without a system install.
+    -->
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies.net472" Version="1.0.3">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+    <PackageReference Include="Lib.Harmony.Ref" Version="2.4.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!--
+      Private=false everywhere: RimBridgeServer resolves RimBridgeServer.Sdk to
+      the copy it ships, and RimWorld obviously supplies its own assemblies.
+      Copying either into the BridgeTools bundle is the documented way to get an
+      SDK-mismatch warning in rimbridge/get_bridge_status.
+    -->
+    <Reference Include="RimBridgeServer.Sdk">
+      <HintPath>$(RimBridgeSdkDir)\RimBridgeServer.Sdk.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Assembly-CSharp">
+      <HintPath>$(RimWorldManagedDir)\Assembly-CSharp.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine">
+      <HintPath>$(RimWorldManagedDir)\UnityEngine.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.CoreModule">
+      <HintPath>$(RimWorldManagedDir)\UnityEngine.CoreModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+</Project>

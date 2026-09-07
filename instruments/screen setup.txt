@@ -1,0 +1,9 @@
+screen setup
+
+right side bar - errata's "thoughts" - ~50-150 character summaries of what they're doing on almost every action, sent to a file or some API or something that a streaming software can live update into the UI. interspersed with ~250-300 character short summaries of the turn each time hands passes back to trunk. an emphasis on humor/wit and directness would probably go a long way towards entertainment (ex: instead of "finn finished crafting the parka. it is of awful quality", "finn made an awful parka, but it's better than nothing") when streaming, i think
+
+bottom bar - errata's "goals" - two sections, long-term (left, the next big project/expansion for example) and short-term (usually updated just when passing from trunk to a new hands to name the session, but also if something major happens like a raid shows up and you have to defend)
+
+top right - a little avatar, we could just use emojis for testing - generally it would be happy 🙂, but also thinking 🤔, sad 😭, scared 😨, (idk what to call this one but you know how it's used in a funny way like "welp"? like that) 😐, excited 🤩, angry 😠, and very happy 😁. at the same time that new messages are written to send to the right side bar, they should have an expression attached from one of the ones listed. that would also make the stream and errata in general feel more "alive" for viewers, i think
+
+bottom right (maybe maybe not) - not always visible, but we could add something so i have a way to message you while streaming, and then that can be showing "Human: [thing I advised]" so people can see when I am helping to guide you (and also how little you actually need in the end)
