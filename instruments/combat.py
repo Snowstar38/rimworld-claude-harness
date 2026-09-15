@@ -3,13 +3,14 @@
   python combat.py begin
   python combat.py status
   python combat.py move <pawn> <x> <z>
-  python combat.py flee <pawn> <x> <z>
+  python combat.py flee <pawn> <x> <z> [--advance SECONDS]
   python combat.py equip <pawn> <x> <z> (--weapon-id ID | --weapon-label LABEL)
   python combat.py attack <pawn> <target> [--mode auto|melee|ranged] [--dry-run]
   python combat.py tend <doctor> <patient> [--dry-run]  (ground tend may draft)
   python combat.py rescue <pawn> <patient> [--dry-run]
   python combat.py draft <pawn>
   python combat.py undraft <pawn> [--dry-run] [--force]
+  python combat.py adopt [<pawn>]
   python combat.py advance [seconds] [--resume]
   python combat.py end [--dry-run] [--force]
   python combat.py release <pawn> [--dry-run] [--force]
@@ -23,10 +24,20 @@ who are no longer colonists (dead, captured, off-map) and discards a STALE
 ledger without touching the game.  ``advance`` refuses after a person paused
 or changed speed during the previous pulse until ``--resume`` is passed.
 
-``end`` refuses while a CONSCIOUS hostile is on the map, and names ``--force``.
-When every hostile still counted is DOWNED it proceeds and prints a reminder
-naming them, because a downed raider is a thing to finish off or capture and a
-downed animal stands back up -- not a reason to hold five colonists drafted.
+``end`` refuses while a CONSCIOUS, NEAR hostile is on the map, and names
+``--force``.  A hostile that is downed, asleep or dormant, or more than
+``END_FAR_HOSTILE_CELLS`` cells from any colonist is named on one line and
+blocks nothing: a downed raider is a thing to finish off or capture and a
+downed animal stands back up, and five insectoids asleep sixty cells away are
+not a reason to hold five colonists drafted.  ``end`` decides all of that
+BEFORE it touches the clock, so a refusal leaves the game exactly as it found
+it, and its last line always says whether the ledger closed.
+
+The roster is no longer fixed at ``begin``: a ghoul, a colony mech, a slave or
+a late joiner is adopted from ``home/list_pawns`` the first time a verb names
+them (``ADOPTED <name> into the ledger``), and ``combat.py adopt <name>`` does
+it on demand.  Bare ``combat.py adopt`` still means "take over an inherited
+ledger".
 
 ## attack / draft / undraft go through ``home/order`` -- 2026-09-04
 
@@ -48,6 +59,12 @@ game's own choice of verb.
 
 **If an order is refused, that is information, not a wall.** Read
 ``errorKind``, fix that one thing, order again.  The refusal costs no game time.
+
+**Every command here leaves the clock PAUSED**, and the last line says so and
+names the two ways back: ``combat.py advance`` inside the fight, ``play.py
+start`` outside it.  ``flee`` also says what would refuse the next ``advance``,
+because a retreat that is queued behind another pawn's tactical decision never
+runs.
 """
 import argparse
 import json
@@ -59,6 +76,7 @@ import clock
 import rim
 import status as colony_status
 import move as move_orders
+import pawns as pawn_rows
 import combat_actions
 import combat_camera
 
@@ -70,7 +88,25 @@ VERSION = 1
 STREAM_STATE = os.path.join(STATE, "stream.json")
 COMBAT_EVENT_TOOL = "home/play_until_event"
 COMBAT_ORDER_TOOL = "home/order"
+COMBAT_LIST_PAWNS_TOOL = "home/list_pawns"
 COMBAT_POLL_MS = 250
+# A hostile asleep or dormant is still ON the map and is still named -- but it
+# is not a reason to hold five colonists drafted. 2026-09-08 (Threadneedle):
+# `end` refused over five insectoids asleep 60+ cells away and only `--force`
+# closed the session. These are the game's own JobDefs, read out of
+# Data\*\Defs\JobDefs: `Wait_AsleepDormancy` is what RimWorld's
+# CompCanBeDormant.SleepJob starts on a dormant mech or insect hive,
+# `ActivityDormant` is Anomaly's, and sleeping animals and raiders lie in
+# `LayDown`. `LayDownAwake` is deliberately NOT here: awake is awake.
+DORMANT_JOBS = {"LayDown": "asleep", "LayDownResting": "asleep",
+                "Wait_Asleep": "asleep", "RevenantSleep": "asleep",
+                "Wait_AsleepDormancy": "dormant",
+                "ActivityDormant": "dormant"}
+# Chebyshev cells to the nearest colonist, the same measure `home/status`
+# reports. 50 is past every vanilla weapon's range (the longest, a sniper
+# rifle / doomsday launcher, is 44.9), so nothing beyond it can shoot anybody
+# this session drafted without walking first -- and walking wakes the pulse.
+END_FAR_HOSTILE_CELLS = 50
 # Hediff_Injury.Severity is HIT POINTS (a gunshot is ~10-18, a scratch 2-5),
 # summed over a pawn's injuries and compared against the pulse's entry
 # baseline. Bleed rate is RimWorld's per-day fraction. 2026-09-04: these were
@@ -116,6 +152,25 @@ class OwnershipRefusal(CombatRefusal):
     pass
 
 
+class PawnNotInRoster(CombatRefusal):
+    """The ledger's roster does not name this pawn. `matches` says how many
+    it half-matched: 0 is the case an adoption can answer, 2+ is ambiguity."""
+    matches = 0
+    token = None
+
+
+class ArgumentRefusal(CombatRefusal):
+    """A refusal about the command's own numbers, nothing the game did.
+
+    2026-09-08: `combat.py advance 25` was refused for being over the 20 s cap
+    and the refusal PAUSED the game, because every failing clock verb pauses on
+    its way out. A number the caller typed is not a reason to stop the colony.
+    Over the cap is now CLAMPED (see `clamp_advance_seconds`); what is left
+    here -- zero or negative seconds -- refuses without touching anything.
+    """
+    pass
+
+
 class SupervisedPlayRefusal(CombatRefusal):
     """Durable supervisor owns the clock; refusal must not pause or rewrite."""
     pass
@@ -141,6 +196,89 @@ def refuse_if_supervised(call=None):
             "`python play.py pause` instead of combat.py advance"
             % (row.get("epoch"), row.get("requestedSpeed")))
     return row
+
+
+def supervised_service_row():
+    """The live supervised-play service, read from disk. No bridge call."""
+    try:
+        import play
+        import play_service
+        row = play_service.read_json(play_service.SERVICE_STATE)
+        return row if play.service_alive(row) else None
+    except Exception:
+        return None
+
+
+# Every command here ends with the clock stopped, and until 2026-09-07 nothing
+# said so: an order followed by `play.py start` left the game paused and both
+# programs reported success.
+STAGE_ONE_PAUSE = "stage 1 pauses before it issues any order, by design"
+ADVANCE_PAUSE = "the pulse ended and the companion paused on its budget"
+REFUSAL_PAUSE = "the command failed and paused rather than leave time running"
+_CLOCK_PAUSED_BY = []
+# The supervised-play session a stage-1 pause stopped, if there was one.
+_SUPERVISED_AT_PAUSE = []
+
+
+def note_clock_paused(why):
+    if why and why not in _CLOCK_PAUSED_BY:
+        _CLOCK_PAUSED_BY.append(why)
+
+
+def clock_left_paused_lines(reasons=None, supervised=None):
+    """The last thing combat.py says. Empty when it never stopped the clock."""
+    reasons = _CLOCK_PAUSED_BY if reasons is None else list(reasons)
+    if not reasons:
+        return []
+    lines = ["CLOCK LEFT PAUSED by combat.py -- %s. Nothing in the game runs "
+             "until it is resumed:" % "; ".join(reasons)]
+    if supervised:
+        lines.append("   supervised play (epoch %s) was running and this pause "
+                     "ended it." % supervised.get("epoch"))
+    lines.append("   inside this fight:       python combat.py advance 20")
+    lines.append("   back to supervised play: python play.py start")
+    return lines
+
+
+def pending_decision_lines(ledger):
+    """One line per pawn whose latched decision refuses `advance`, and the
+    command that clears it.
+
+    A decision is cleared by ordering THAT pawn -- ordering somebody else, or
+    advancing, does nothing. 2026-09-07: two `flee` calls ran and the next
+    `advance` still refused, naming a pawn nobody had re-ordered.
+    """
+    lines = []
+    for pid, row in ((ledger or {}).get("pendingDecisions") or {}).items():
+        row = row or {}
+        name = (ledger.get("pawns") or {}).get(pid, {}).get("name") or pid
+        lines.append("   %s (%s): order %s again -- `python combat.py move %s "
+                     "<x> <z>`, `python combat.py flee %s <x> <z>` or "
+                     "`python combat.py attack %s <target>`"
+                     % (name, row.get("reason") or "no reason recorded",
+                        name, pid, pid, pid))
+        blob = "%s %s" % (row.get("reason") or "", row.get("error") or "")
+        if "range" in blob.lower():
+            lines.append("      out of range is a POSITION problem, not a "
+                         "refusal to fight: move them toward the target, or "
+                         "force the melee verb with `python combat.py attack "
+                         "%s <target> --mode melee`." % pid)
+    return lines
+
+
+def flee_next_step_lines(ledger, seconds=None):
+    """What has to happen for a queued retreat to run, and what would stop it."""
+    lines = ["the retreat is QUEUED on the pawn -- combat.py paused the clock as "
+             "stage 1, so nobody has moved yet. Run time to make it happen:",
+             "   python combat.py advance %d   (or pass --advance %d to flee)"
+             % (int(seconds or 20), int(seconds or 20))]
+    blockers = pending_decision_lines(ledger)
+    if blockers:
+        lines.append("   THE NEXT ADVANCE WILL REFUSE FIRST -- %d pawn(s) still "
+                     "owe a tactical decision:"
+                     % len((ledger or {}).get("pendingDecisions") or {}))
+        lines.extend(blockers)
+    return lines
 
 
 def pause_supervised_for_cleanup(pause_func=None, status_call=None):
@@ -256,7 +394,14 @@ def _pawns(snapshot):
     return rows
 
 
-def begin(snapshot, identity, path=LEDGER, turn_owner=None):
+def begin(snapshot, identity, path=LEDGER, turn_owner=None, roster_reader=None):
+    """Open the ledger and enumerate everybody this session may have to undraft.
+
+    `roster_reader` is a ``home/list_pawns`` caller.  It is None in every test
+    and every library use, and the CLI passes the live one: the status read
+    alone cannot see a ghoul or a colony mech (see `adopt_pawn`), so `begin`
+    asks the pawn list too rather than leaving the roster short.
+    """
     existing = load_ledger(path)
     if existing:
         stale = stale_reason(existing, _tick(snapshot), identity)
@@ -272,6 +417,14 @@ def begin(snapshot, identity, path=LEDGER, turn_owner=None):
     for pid, p in _pawns(snapshot).items():
         pawns[pid] = {"name": p.get("name") or pid,
                       "originalDrafted": bool(p.get("drafted"))}
+    if roster_reader is not None:
+        for pid, row in colony_draftables(roster_reader, snapshot).items():
+            if pid in pawns:
+                continue
+            pawns[pid] = {"name": row.get("name") or pid,
+                          "originalDrafted": bool(row.get("drafted")),
+                          "adopted": True, "kind": _roster_kind(row),
+                          "source": COMBAT_LIST_PAWNS_TOOL}
     ledger = {"version": VERSION, "active": True, "cleanupPending": False,
               "createdAt": time.time(), "identity": identity,
               "turnOwner": turn_owner if turn_owner is not None else turn_identity(),
@@ -336,10 +489,262 @@ def _resolve_session_pawn(token, ledger):
     if len(hits) != 1:
         roster = ", ".join(sorted("%s=%s" % ((row.get("name") or "?"), pid)
                                   for pid, row in pawns.items())) or "none"
-        raise CombatRefusal("pawn %r is not one unambiguous colonist at combat "
-                            "begin (%d matches; the session knows: %s)"
-                            % (token, len(hits), roster))
+        refusal = PawnNotInRoster(
+            "pawn %r is not one unambiguous colonist at combat begin "
+            "(%d matches; the session knows: %s)%s"
+            % (token, len(hits), roster,
+               "" if hits else
+               ". If they ARE a colony pawn the roster never heard of -- a "
+               "ghoul, a colony mech, a slave, somebody who joined after "
+               "`begin` -- run `python combat.py adopt %s`." % token))
+        refusal.matches = len(hits)
+        refusal.token = tok
+        raise refusal
     return hits[0]
+
+
+# ------------------------------------------------- learning a new colony pawn
+#
+# 2026-09-08 (Threadneedle): `combat.py draft Ben` refused with "not one
+# unambiguous colonist at combat begin (0 matches)" while the SAME read said
+# `canBeDrafted=True`.  Ben Cooper is a ghoul.  `home/status`'s colonists[] is
+# `Pawn.IsFreeColonist`, whose tail is `Pawn.IsColonist`, whose body ends
+# `&& !IsSubhuman` -- so a ghoul is a colony pawn that is structurally not a
+# colonist and can never appear there.  Neither can a colony mech.
+#
+# The roster was fixed at `begin` and had no way to learn one.  Now it has two:
+# `begin` sweeps `home/list_pawns` for colony-controlled draftable pawns the
+# status read cannot carry, and any verb that fails to resolve a pawn asks the
+# same question again before refusing.  The gate is the game's own: a pawn has
+# a `Pawn_DraftController` iff its faction is the player's and it is humanlike
+# (colonist, ghoul, slave) or a colony mech -- never a prisoner, never an
+# animal, never another faction's.
+
+
+def _list_pawns_call(caller=None):
+    """The one place a real ``home/list_pawns`` call is built. strict=False:
+    a tool that answers "no" is answering, not faulting."""
+    return caller or (lambda params: rim.game(COMBAT_LIST_PAWNS_TOOL, params,
+                                              strict=False))
+
+
+# The live pawn-list caller, armed by `main` for the length of one invocation
+# and empty everywhere else -- the same shape as `_CLOCK_PAUSED_BY`. It is not
+# a default argument because a library caller (and every test) must be able to
+# hit a missing pawn without the module reaching for the bridge behind them.
+_ROSTER_READER = []
+
+
+def _roster_reader(explicit=None):
+    if explicit is not None:
+        return explicit
+    return _ROSTER_READER[0] if _ROSTER_READER else None
+
+
+# settings:true is what carries `settings.thingId` (Pawn.ThingID, "Human618");
+# Verse.Thing.GetUniqueLoadID() is literally "Thing_" + ThingID, which is the
+# form home/status and this ledger key off, so the two are one `Thing_` apart.
+ROSTER_QUERIES = ({"humanlikeOnly": True, "settings": True,
+                   "includeColonists": True, "includeDead": False},
+                  {"mechanoidsOnly": True, "settings": True,
+                   "includeColonists": True, "includeDead": False})
+
+
+def _roster_rows(reader=None):
+    """Every spawned humanlike and mechanoid row, with settings{}. Never raises."""
+    call = _list_pawns_call(reader)
+    rows = []
+    for query in ROSTER_QUERIES:
+        try:
+            reply = call(dict(query))
+        except Exception:
+            continue
+        if isinstance(reply, dict):
+            rows.extend(r for r in (reply.get("pawns") or [])
+                        if isinstance(r, dict))
+    return rows
+
+
+def _player_faction(rows, snapshot=None):
+    """The colony's faction NAME, from the rows themselves.
+
+    list_pawns rows carry a faction name, not a bool, so the colony is
+    identified by a row that already knows it is ours: a colonist, or failing
+    that a pawn the status read listed as a colonist by name.
+    """
+    for row in rows:
+        if (row.get("playerFaction") or pawn_rows.is_colony_member(row)
+                or row.get("isFreeColonist") or row.get("tame")):
+            if row.get("faction"):
+                return row.get("faction")
+    known = set((r.get("name") or "").lower()
+                for r in _pawns(snapshot or {}).values())
+    for row in rows:
+        if (row.get("name") or "").lower() in known and row.get("faction"):
+            return row.get("faction")
+    return None
+
+
+def roster_id(row):
+    """The ledger key for a list_pawns row, in `home/status`' own id form."""
+    thing_id = ((row.get("settings") or {}).get("thingId")
+                or row.get("thingId"))
+    if not thing_id:
+        return None
+    thing_id = str(thing_id)
+    return thing_id if thing_id.startswith("Thing_") else "Thing_" + thing_id
+
+
+def is_colony_draftable(row, faction=None):
+    """Colony-controlled and draftable, by the same test the game applies.
+
+    `Pawn.drafter` exists only for a player-faction humanlike or a colony mech
+    (RimWorld.PawnComponentsUtility), which is why a prisoner and an animal are
+    excluded here and a ghoul is not.  Downed and mental-state pawns are still
+    adopted: those are states that pass, and the ORDER is what refuses, with
+    the game's own reason.
+    """
+    if not isinstance(row, dict) or row.get("dead"):
+        return False
+    if row.get("animal") or row.get("isPrisoner"):
+        return False
+    if not (row.get("humanlike") or row.get("mechanoid")):
+        return False
+    # `pawns.is_colony_member` is the single copy of "one of ours" for a
+    # list_pawns row -- `isColonist or (ghoul and playerFaction)`, because
+    # RimWorld's own IsColonist ends in `!IsSubhuman` and drops every ghoul.
+    # It collapses to `isColonist` on a DLL older than 2026-09-11.
+    if pawn_rows.is_colony_member(row) or row.get("isFreeColonist"):
+        return True
+    # `playerFaction` is the companion's own "is it ours" bool, added to
+    # list_pawns rows on 2026-09-11 alongside `ghoul` for exactly this case.
+    # It is authoritative when present; when it is not, the colony is known
+    # by its faction NAME, which is all an older payload carries.
+    if row.get("playerFaction") is True:
+        return True
+    if row.get("playerFaction") is False or row.get("hostile"):
+        return False
+    return bool(faction) and row.get("faction") == faction
+
+
+def colony_draftables(reader=None, snapshot=None):
+    """{ledger id: row} for every colony pawn a draft order can address."""
+    rows = _roster_rows(reader)
+    faction = _player_faction(rows, snapshot)
+    out = {}
+    for row in rows:
+        if not is_colony_draftable(row, faction):
+            continue
+        pid = roster_id(row)
+        if pid:
+            out[pid] = row
+    return out
+
+
+def _roster_kind(row):
+    """The word for what this pawn is, for the ADOPTED line."""
+    # `ghoul` is the companion's own Pawn.IsGhoul bool (2026-09-11); the
+    # others are read defensively so a renamed field degrades to kindDef
+    # rather than to a wrong word.
+    if pawn_rows.is_ghoul(row):
+        return "ghoul"
+    for key, word in (("isGhoul", "ghoul"), ("isSlave", "slave"),
+                      ("slave", "slave"), ("mechanoid", "colony mech")):
+        if row.get(key):
+            return word
+    kind = (row.get("kindDef") or "").lower()
+    if "ghoul" in kind:
+        return "ghoul"
+    if row.get("isFreeColonist") or row.get("isColonist"):
+        return "colonist"
+    return row.get("kindDef") or row.get("defName") or "colony pawn"
+
+
+def adopt_pawn(token, path=LEDGER, reader=None, snapshot=None, announce=True):
+    """Teach the ledger one colony pawn it did not know at `begin`.
+
+    Returns (pawn_id, row).  Refuses -- naming what the game DOES see -- rather
+    than adopting anything the colony does not control.
+    """
+    ledger = load_ledger(path)
+    if not ledger or not ledger.get("active"):
+        raise CombatRefusal("no active combat session; run `python combat.py begin`")
+    candidates = colony_draftables(reader, snapshot)
+    tok = str(token).strip()
+    low = tok.lower()
+    hits = [pid for pid, row in candidates.items()
+            if (row.get("name") or "").lower() == low]
+    if not hits:
+        hits = [pid for pid, row in candidates.items()
+                if low and low in (row.get("name") or "").lower()]
+    if not hits:
+        hits = [pid for pid in candidates
+                if pid.lower() == low or pid.lower().endswith("_" + low)
+                or (tok.isdigit() and pid.rstrip("0123456789") != pid
+                    and pid[len(pid.rstrip("0123456789")):] == tok)]
+    if len(hits) != 1:
+        known = ", ".join(sorted("%s=%s" % (row.get("name") or "?", pid)
+                                 for pid, row in candidates.items())) or "none"
+        raise CombatRefusal(
+            "%r is not one colony-controlled draftable pawn in %s (%d matches). "
+            "The colony pawns the game lists: %s"
+            % (token, COMBAT_LIST_PAWNS_TOOL, len(hits), known))
+    pid = hits[0]
+    row = candidates[pid]
+    name = row.get("name") or pid
+    known = (ledger.get("pawns") or {}).get(pid)
+    entry = {"name": name, "adopted": True, "adoptedAt": time.time(),
+             "kind": _roster_kind(row), "source": COMBAT_LIST_PAWNS_TOOL,
+             # The state to restore is the one the SESSION first saw, never
+             # the one it just put them in: re-adopting a pawn this session
+             # drafted must not turn "undraft them at the end" into
+             # "leave them drafted".
+             "originalDrafted": bool(known.get("originalDrafted")) if known
+                                else bool(row.get("drafted"))}
+    ledger.setdefault("pawns", {})[pid] = entry
+    _atomic_write(ledger, path)
+    if announce and known:
+        print("ALREADY IN THE LEDGER: %s (%s), restore state %s -- nothing "
+              "changed." % (name, pid,
+                            "drafted" if entry["originalDrafted"]
+                            else "undrafted"))
+    elif announce:
+        print("ADOPTED %s into the ledger -- %s, %s at %s, read from %s. The "
+              "session now owes them the same cleanup as anybody else."
+              % (name, _roster_kind(row),
+                 "already drafted" if row.get("drafted") else "undrafted",
+                 _position_word(row.get("position")), COMBAT_LIST_PAWNS_TOOL))
+    return pid, row
+
+
+def _position_word(pos):
+    if isinstance(pos, dict) and pos.get("x") is not None:
+        return "%s,%s" % (pos.get("x"), pos.get("z"))
+    return "an unread cell"
+
+
+def resolve_or_adopt(token, ledger, path=LEDGER, reader=None, snapshot=None):
+    """The roster id for a token, learning the pawn if the roster missed them.
+
+    Returns (pawn_id, ledger) -- the ledger RELOADED when an adoption wrote it,
+    because every caller reads `ledger["pawns"][pid]` straight afterwards.
+
+    `reader` is the ``home/list_pawns`` caller and is REQUIRED for the second
+    read to happen at all: a library caller that passed none gets the plain
+    refusal and no bridge traffic, and the CLI passes the live one.
+    """
+    try:
+        return _resolve_session_pawn(token, ledger), ledger
+    except PawnNotInRoster as miss:
+        if reader is None or getattr(miss, "matches", 0) != 0:
+            raise
+        try:
+            pid, _ = adopt_pawn(token, path=path, reader=reader,
+                                snapshot=snapshot)
+        except CombatRefusal as adopt_error:
+            raise PawnNotInRoster("%s\n   and %s could not adopt them: %s"
+                                  % (miss, COMBAT_LIST_PAWNS_TOOL, adopt_error))
+        return pid, load_ledger(path)
 
 
 # ------------------------------------------------------- home/order plumbing
@@ -541,7 +946,7 @@ def print_pawn_verdict(pawn, caller=None):
 
 
 def issue_move(pawn, x, z, snapshot, identity, path=LEDGER, issuer=None,
-               order_kind="move"):
+               order_kind="move", roster_reader=None):
     """Issue one verified Goto and persist it; never advance game time."""
     ledger = load_ledger(path)
     if not ledger or not ledger.get("active"):
@@ -549,7 +954,8 @@ def issue_move(pawn, x, z, snapshot, identity, path=LEDGER, issuer=None,
     stale = stale_reason(ledger, _tick(snapshot), identity)
     if stale:
         raise CombatRefusal("STALE ledger: %s; refusing movement" % stale)
-    pid = _resolve_session_pawn(pawn, ledger)
+    pid, ledger = resolve_or_adopt(pawn, ledger, path,
+                                   _roster_reader(roster_reader), snapshot)
     name = ledger["pawns"][pid].get("name") or pid
 
     def before_draft(row):
@@ -612,14 +1018,16 @@ def record_move_failure(pawn, x, z, message, path=LEDGER):
                          destination={"x": int(x), "z": int(z)})
 
 
-def _checked_session(pawn, snapshot, identity, path, operation):
+def _checked_session(pawn, snapshot, identity, path, operation,
+                     roster_reader=None):
     ledger = load_ledger(path)
     if not ledger or not ledger.get("active"):
         raise CombatRefusal("no active combat session; run `python combat.py begin`")
     stale = stale_reason(ledger, _tick(snapshot), identity)
     if stale:
         raise CombatRefusal("STALE ledger: %s; refusing %s" % (stale, operation))
-    pid = _resolve_session_pawn(pawn, ledger)
+    pid, ledger = resolve_or_adopt(pawn, ledger, path,
+                                   _roster_reader(roster_reader), snapshot)
     return ledger, pid, ledger["pawns"][pid].get("name") or pid
 
 
@@ -1078,9 +1486,44 @@ def _pause_verdict(paused):
             else "!! COULD NOT VERIFY PAUSE -- press Space in RimWorld now")
 
 
+def _seconds_word(value):
+    return ("%g" % float(value))
+
+
+def clamp_advance_seconds(seconds):
+    """(seconds to run, the clamp note or None). Never touches the game.
+
+    2026-09-08: `combat.py advance 25` was REFUSED for being over the cap, and
+    because a failed clock verb pauses on its way out, the refusal stopped the
+    colony -- over a number the operator typed. A number too big is a number
+    to clamp, and the only thing to say about it is what it became. Zero or
+    negative still refuses (there is no pulse to run), as an `ArgumentRefusal`
+    the CLI knows not to pause for.
+    """
+    seconds = float(seconds)
+    if seconds <= 0:
+        raise ArgumentRefusal(
+            "advance duration must be positive; `python combat.py advance %d` "
+            "is the ordinary pulse" % int(DEFAULT_ADVANCE_SECONDS))
+    if seconds <= MAX_ADVANCE_SECONDS:
+        return seconds, None
+    return MAX_ADVANCE_SECONDS, {
+        "asked": seconds, "used": MAX_ADVANCE_SECONDS,
+        "note": "advance %s -> %s (cap): combat pulses are %s s or less "
+                "because the companion blocks every other bridge call while "
+                "one runs. Nothing was refused and the clock was not touched; "
+                "run it again for more time."
+                % (_seconds_word(seconds), _seconds_word(MAX_ADVANCE_SECONDS),
+                   _seconds_word(MAX_ADVANCE_SECONDS))}
+
+
 def advance(seconds, snapshot, identity, path=LEDGER, waiter=None, pause=None,
             speed="Normal", snapshot_reader=None, resume=False):
     """Run one companion-owned combat pulse; never use client polling."""
+    # The number first, before any read and before any lock: a duration the
+    # caller typed is decided here, with nothing asked of the game, so an
+    # impossible one cannot cost a pause and an over-long one just clamps.
+    seconds, clamped = clamp_advance_seconds(seconds)
     if waiter is None:
         refuse_if_supervised()
     ledger = load_ledger(path)
@@ -1094,11 +1537,12 @@ def advance(seconds, snapshot, identity, path=LEDGER, waiter=None, pause=None,
         _atomic_write(ledger, path)
     pending = ledger.get("pendingDecisions") or {}
     if pending:
-        names = ["%s (%s)" % (ledger.get("pawns", {}).get(pid, {}).get("name") or pid,
-                              (row or {}).get("reason") or "?")
-                 for pid, row in pending.items()]
-        raise CombatRefusal("tactical decision required for %s; issue a new move/flee/order before advancing"
-                            % ", ".join(names))
+        names = [ledger.get("pawns", {}).get(pid, {}).get("name") or pid
+                 for pid in pending]
+        raise CombatRefusal(
+            "tactical decision required for %s; no time runs until each of them "
+            "has a new order\n%s"
+            % (", ".join(names), "\n".join(pending_decision_lines(ledger))))
     # Human control always wins, across pulses too: a pause or speed change
     # by a person during the last pulse is not lifted until the operator
     # says so explicitly.
@@ -1111,13 +1555,6 @@ def advance(seconds, snapshot, identity, path=LEDGER, waiter=None, pause=None,
         last["acknowledged"] = True
         ledger["lastStop"] = last
         _atomic_write(ledger, path)
-    seconds = float(seconds)
-    if seconds <= 0:
-        raise CombatRefusal("advance duration must be positive")
-    if seconds > MAX_ADVANCE_SECONDS:
-        raise CombatRefusal("advance of %.0f s refused; combat pulses are %.0f s or less "
-                            "(the companion blocks every other bridge call while it runs)"
-                            % (seconds, MAX_ADVANCE_SECONDS))
     args = _combat_watch_args(ledger, seconds, speed)
     call = waiter or (lambda payload: rim.game(COMBAT_EVENT_TOOL, payload,
                                                 strict=False))
@@ -1140,6 +1577,8 @@ def advance(seconds, snapshot, identity, path=LEDGER, waiter=None, pause=None,
             raise CombatRefusal("combat pulse did not complete cleanly (%s: %s); %s"
                                 % (stop or "invalid response",
                                    detail or "no detail", _pause_verdict(paused)))
+    if clamped:
+        result["advanceClamped"] = clamped
     next_tick = result.get("ticksGame", result.get("endTick"))
     if next_tick is not None and tick is not None and next_tick < tick:
         raise CombatRefusal("game tick regressed during advance (%s -> %s)"
@@ -1285,25 +1724,76 @@ def _resolve_name(token, ledger):
 # cannot name them all refuses, as before.
 
 
-def _remaining_hostiles(snapshot):
-    """(count, names of the downed ones, names of the conscious ones)."""
+def harmless_reason(row):
+    """Why this hostile cannot block `end`, or None if it can.
+
+    Asleep or dormant, or far enough away that it cannot shoot anybody without
+    walking first. Nothing here is "gone": every row this names is still
+    printed on the `still on the map, not a threat:` line.
+    """
+    job = row.get("job")
+    if job in DORMANT_JOBS:
+        return DORMANT_JOBS[job]
+    distance = row.get("distanceToNearestColonist")
+    if (isinstance(distance, (int, float)) and not isinstance(distance, bool)
+            and distance > END_FAR_HOSTILE_CELLS):
+        return "far off"
+    return None
+
+
+def assess_hostiles(snapshot):
+    """Which remaining hostiles refuse an `end`, and which only get a mention.
+
+    `blocking` is the conscious, near ones -- and anything COUNTED but not
+    NAMED, because unaccounted-for has to be read as conscious: the false
+    negative is a colonist standing up in front of a raider who can still
+    shoot. `downed` keeps its own list because a downed raider is a thing to
+    finish off, which is a different sentence from a sleeping one.
+    """
     try:
         summary = colony_status.threat_summary(snapshot)
+        rows = list(summary.get("rows") or [])
+        total = summary.get("total") or 0
     except Exception:
-        threats = snapshot.get("threats") or {}
-        count = threats.get("hostileCount") or len(threats.get("hostiles") or [])
-        return count, [], []
-    rows = summary.get("rows") or []
-    downed = [_threat_name(r) for r in rows if r.get("downed")]
-    awake = [_threat_name(r) for r in rows if not r.get("downed")]
-    total = summary.get("total") or 0
-    # Anything counted but not named is unaccounted for, and unaccounted-for is
-    # treated as conscious: the false negative here is a colonist standing up in
-    # front of a raider who can still shoot.
-    unnamed = total - len(downed) - len(awake)
+        threats = (snapshot or {}).get("threats") or {}
+        rows = list(threats.get("hostiles") or [])
+        total = threats.get("hostileCount") or len(rows)
+    blocking, downed, harmless = [], [], []
+    for row in rows:
+        if row.get("downed"):
+            downed.append(_threat_name(row))
+            continue
+        reason = harmless_reason(row)
+        if reason:
+            harmless.append((row, reason))
+        else:
+            blocking.append(_threat_name(row))
+    unnamed = total - len(rows)
     if unnamed > 0:
-        awake += ["%d unnamed hostile(s)" % unnamed]
-    return total, downed, awake
+        blocking.append("%d unnamed hostile(s)" % unnamed)
+    return {"total": total, "blocking": blocking, "downed": downed,
+            "harmless": harmless, "notes": harmless_lines(harmless)}
+
+
+def harmless_lines(harmless):
+    """The one line `end` prints about what is still out there and asleep."""
+    if not harmless:
+        return []
+    groups = {}
+    for row, reason in harmless:
+        key = (str(row.get("name") or row.get("defName")
+                   or row.get("kindDef") or "a hostile"), reason)
+        count, nearest = groups.get(key, (0, None))
+        distance = row.get("distanceToNearestColonist")
+        if isinstance(distance, (int, float)) and not isinstance(distance, bool):
+            nearest = distance if nearest is None else min(nearest, distance)
+        groups[key] = (count + 1, nearest)
+    parts = []
+    for (label, reason), (count, nearest) in sorted(groups.items()):
+        where = ("%d+ cells away" % int(nearest) if nearest is not None
+                 else "distance not reported")
+        parts.append("%d %s %s %s" % (count, label, reason, where))
+    return ["still on the map, not a threat: " + "; ".join(parts)]
 
 
 def _threat_name(row):
@@ -1325,8 +1815,59 @@ def _downed_reminder(downed_names, plans, snapshot):
             % (", ".join(sorted(set(still))) or "nobody")]
 
 
+def _current_rows(snapshot, ledger, ids, resolver=None):
+    """The current state of every pawn cleanup has to look at.
+
+    `home/status`' colonists[] is `Pawn.IsFreeColonist`, so an ADOPTED pawn --
+    a ghoul, a colony mech -- is never in it, and cleanup would have read them
+    as dead or captured and demanded --force to drop an obligation it should
+    simply have honoured. For those, and only those, ask `home/order` for the
+    one pawn: no extra call is made when the roster is all colonists.
+    """
+    rows = dict(_pawns(snapshot))
+    for pid in ids:
+        if pid in rows:
+            continue
+        if not (ledger.get("pawns") or {}).get(pid, {}).get("adopted"):
+            continue
+        reply = (resolver or resolve_pawn)(pid) or {}
+        row = reply.get("pawn") or {}
+        if row.get("spawned") and not row.get("dead"):
+            rows[pid] = {"thingId": pid, "name": row.get("name"),
+                         "drafted": bool(row.get("drafted")),
+                         "downed": bool(row.get("downed"))}
+    return rows
+
+
+def _restore_draft(pawn_id, drafted, adopted=False, caller=None):
+    """Put one pawn back the way `begin` found them.
+
+    An adopted pawn goes through ``home/order``, not ``rimworld/set_draft``:
+    the order tool is the one that knows what a ghoul or a colony mech is, and
+    it answers with the reason when it will not.
+    """
+    if not adopted:
+        return rim.game("rimworld/set_draft",
+                        {"pawnId": pawn_id, "drafted": drafted})
+    reply = _order_reply(
+        _order_call(caller)({"action": "draft" if drafted else "undraft",
+                             "pawn": pawn_id}),
+        "the draft restoration")
+    after = reply.get("after") or reply.get("pawn") or {}
+    return {"drafted": bool(after.get("drafted")),
+            "error": reply.get("error")}
+
+
 def reconcile(snapshot, identity, pawn=None, dry_run=False, force=False,
-              path=LEDGER, set_draft=None):
+              path=LEDGER, set_draft=None, before_write=None, resolver=None):
+    """Restore what this session drafted, and say what is still out there.
+
+    `before_write` runs ONCE, after every refusal has had its chance and
+    before the first thing changes -- it is where `end` pauses the clock.
+    2026-09-08: the pause happened first and the refusal came second, so a
+    refusal over five sleeping insectoids stopped the colony and then declined
+    to do anything. A refusal must leave the clock exactly where it found it.
+    """
     ledger = load_ledger(path)
     if not ledger:
         return ["no active combat session"]
@@ -1342,7 +1883,7 @@ def reconcile(snapshot, identity, pawn=None, dry_run=False, force=False,
                             "(`end --force` discards the ledger)" % stale)
     obligations = ledger.get("draftObligations") or {}
     ids = [_resolve_name(pawn, ledger)] if pawn else list(obligations)
-    current = _pawns(snapshot)
+    current = _current_rows(snapshot, ledger, ids, resolver)
     plans, unresolved, abandoned = [], [], []
     for pid in ids:
         base = (ledger.get("pawns") or {}).get(pid, {})
@@ -1359,33 +1900,45 @@ def reconcile(snapshot, identity, pawn=None, dry_run=False, force=False,
             continue
         wanted = bool(base.get("originalDrafted"))
         plans.append((pid, row.get("name") or pid, bool(row.get("drafted")), wanted))
-    hostile_count, downed_names, awake_names = _remaining_hostiles(snapshot)
-    all_downed = bool(hostile_count) and not awake_names and bool(downed_names)
+    threat = assess_hostiles(snapshot)
+    blocking, downed_names = threat["blocking"], threat["downed"]
+    all_downed = bool(downed_names) and not blocking
     dangerous = [x for x in plans if x[2] and not x[3]]
     lines = ["%s: %s -> %s" % (name, "drafted" if have else "undrafted",
                                 "drafted" if wanted else "undrafted")
              for _, name, have, wanted in plans]
+    # Unconditional on `all_downed`. It used to be gated on `dangerous` as
+    # well -- on there being a pawn this session had to put BACK to undrafted
+    # -- so a session whose fighters were already drafted at `begin` closed the
+    # ledger over a downed raider and said nothing about it. The reminder is
+    # about what is still lying on the map, not about who gets undrafted.
     reminder = (_downed_reminder(downed_names, plans, snapshot)
-                if all_downed and dangerous else [])
+                if all_downed else [])
+    # Named whether or not anything blocked: "nothing refused this" and "there
+    # is nothing out there" are different facts and the operator needs both.
+    reminder = threat["notes"] + reminder
     if dry_run:
-        if hostile_count and dangerous and not force and not all_downed:
+        if blocking and dangerous and not force:
             warning = ["WARNING: %d hostile(s) remain%s; real cleanup requires --force"
-                       % (hostile_count,
-                          (" -- " + ", ".join(awake_names)) if awake_names else "")]
+                       % (threat["total"], " -- " + ", ".join(blocking))]
         else:
             warning = []
         return ["DRY RUN"] + warning + lines + unresolved + abandoned + reminder
-    if hostile_count and dangerous and not force and not all_downed:
+    if blocking and dangerous and not force:
         raise CombatRefusal(
-            "%d hostile(s) remain and %s still conscious; refusing to undraft %s. "
-            "`python combat.py end --force` overrides this."
-            % (hostile_count,
-               ("%s is" % awake_names[0]) if len(awake_names) == 1
-               else ("%s are" % ", ".join(awake_names)) if awake_names
-               else "at least one is",
-               ", ".join(x[1] for x in dangerous)))
-    setter = set_draft or (lambda pid, drafted: rim.game(
-        "rimworld/set_draft", {"pawnId": pid, "drafted": drafted}))
+            "%d hostile(s) remain and %s conscious and within %d cells; "
+            "refusing to undraft %s. `python combat.py end --force` overrides "
+            "this.%s"
+            % (threat["total"],
+               ("%s is" % blocking[0]) if len(blocking) == 1
+               else "%s are" % ", ".join(blocking),
+               END_FAR_HOSTILE_CELLS, ", ".join(x[1] for x in dangerous),
+               ("\n   " + threat["notes"][0]) if threat["notes"] else ""))
+    if before_write is not None:
+        before_write()
+    setter = set_draft or (lambda pid, drafted: _restore_draft(
+        pid, drafted, adopted=bool((ledger.get("pawns") or {})
+                                   .get(pid, {}).get("adopted"))))
     for pid, name, have, wanted in plans:
         if have != wanted:
             result = setter(pid, wanted)
@@ -1411,12 +1964,81 @@ def reconcile(snapshot, identity, pawn=None, dry_run=False, force=False,
     return ((lines + abandoned) or ["no controller-drafted pawns to restore"]) + reminder
 
 
-def _live_snapshot(pause=False):
+def _live_snapshot(pause=False, supervised=None):
     if pause:
+        row = supervised_service_row() if supervised is None else supervised
         result = rim.game("rimworld/pause_game", {"pause": True})
         if result.get("paused") is not True:
             raise CombatRefusal("RimWorld did not confirm pause; refusing cleanup")
+        note_clock_paused(STAGE_ONE_PAUSE)
+        if row:
+            _SUPERVISED_AT_PAUSE.append(row)
     return colony_status.read()
+
+
+def cleanup_pause(supervised=True, pause=None, status_call=None):
+    """Stop the clock for a cleanup that is definitely going to happen.
+
+    Called by `reconcile` through `before_write`, which means every refusal
+    has already been made and this pause cannot be the thing a refusal leaves
+    behind.
+    """
+    if supervised and pause_supervised_for_cleanup(status_call=status_call):
+        print("SUPERVISED PLAY PAUSED before combat cleanup; it will not "
+              "auto-resume.")
+    row = supervised_service_row()
+    stopper = pause or (lambda: rim.game("rimworld/pause_game", {"pause": True}))
+    result = stopper()
+    if not isinstance(result, dict) or result.get("paused") is not True:
+        raise CombatRefusal("RimWorld did not confirm pause; refusing cleanup")
+    note_clock_paused(STAGE_ONE_PAUSE)
+    if row:
+        _SUPERVISED_AT_PAUSE.append(row)
+    return True
+
+
+def end_closure_line(dry_run=False, path=None):
+    """The last line of every `end`: is the ledger closed or is it not."""
+    path = LEDGER if path is None else path
+    if dry_run:
+        return ("COMBAT SESSION STILL OPEN -- this was a DRY RUN; nothing was "
+                "restored and nothing was closed. Run `python combat.py end` "
+                "for real.")
+    if not os.path.exists(path):
+        return ("COMBAT SESSION CLOSED -- ledger removed; nothing is drafted "
+                "on this session's account.")
+    return ("COMBAT SESSION STILL OPEN -- obligations remain (see above); run "
+            "`python combat.py end --force` to abandon them.")
+
+
+def print_advance_result(result):
+    """The lines an `advance` prints. Shared with `flee --advance`."""
+    clamped = (result or {}).get("advanceClamped")
+    if clamped:
+        print(clamped.get("note"))
+    print("COMBAT STOP  %s%s" %
+          (result.get("stopReason"),
+           ": " + str(result.get("stopDetail"))
+           if result.get("stopDetail") else ""))
+    if result.get("stopReason") in HUMAN_STOPS:
+        print("   a person stopped the clock; the next advance needs --resume")
+    for note in result.get("notes") or []:
+        print("   note: %s" % note)
+    # An alert that did NOT stop the pulse is worth one line: silence
+    # here is how a standing alert looks identical to no alert at all.
+    # The companion emits one row per key: label, priority,
+    # msSinceLastCounted, pollsDebounced (a bare string is tolerated).
+    for row in result.get("alertsDebounced") or []:
+        if isinstance(row, dict):
+            label = row.get("label") or row.get("alertKey")
+            ago = row.get("msSinceLastCounted")
+            since = (", last counted %.0f s ago" % (ago / 1000.0)
+                     if isinstance(ago, (int, float)) else "")
+        else:
+            label, since = row, ""
+        print("   note: alert %r was already standing and did not stop "
+              "this pulse (%.0f s debounce%s)"
+              % (label, COMBAT_ALERT_DEBOUNCE_MS / 1000.0, since))
 
 
 def main(argv=None):
@@ -1429,7 +2051,12 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="command", required=True)
     sub.add_parser("begin")
     sub.add_parser("status")
-    sub.add_parser("adopt", help="take over an inherited ledger without losing obligations")
+    adopting = sub.add_parser(
+        "adopt", help="bare: take over an inherited ledger without losing "
+                      "obligations. With a name: teach the roster one colony "
+                      "pawn `begin` could not see (a ghoul, a colony mech, a "
+                      "slave, a late joiner).")
+    adopting.add_argument("pawn", nargs="?")
     moving = sub.add_parser("move")
     moving.add_argument("pawn")
     moving.add_argument("x", type=int)
@@ -1438,6 +2065,11 @@ def main(argv=None):
     fleeing.add_argument("pawn")
     fleeing.add_argument("x", type=int)
     fleeing.add_argument("z", type=int)
+    fleeing.add_argument("--advance", type=float, default=0.0, metavar="SECONDS",
+                         help="run that many seconds of bounded combat time "
+                              "straight after the order, so the retreat "
+                              "actually happens (<= %d)"
+                              % int(MAX_ADVANCE_SECONDS))
     equipping = sub.add_parser("equip")
     equipping.add_argument("pawn")
     equipping.add_argument("x", type=int)
@@ -1483,16 +2115,30 @@ def main(argv=None):
         p.add_argument("--dry-run", action="store_true")
         p.add_argument("--force", action="store_true")
     args = ap.parse_args(argv)
+    # One invocation, one account of what it did to the clock.
+    _CLOCK_PAUSED_BY[:] = []
+    _SUPERVISED_AT_PAUSE[:] = []
+    _ROSTER_READER[:] = []
     try:
         if args.command not in ("status", "adopt", "end", "release"):
             warning = inherited_warning()
             if warning:
                 raise OwnershipRefusal(warning)
         rim.init()
+        # Armed for this invocation only: a verb that cannot find a pawn in the
+        # roster asks the game for the colony's pawns before it refuses.
+        _ROSTER_READER[:] = [_list_pawns_call()]
         if args.command == "begin":
             snap = _live_snapshot(pause=True)
-            ledger, made = begin(snap, _identity())
+            ledger, made = begin(snap, _identity(),
+                                 roster_reader=_list_pawns_call())
             print(("STARTED " if made else "EXISTING ") + session_summary(ledger, snap, _identity()))
+            adopted = sorted(row.get("name") or pid
+                             for pid, row in (ledger.get("pawns") or {}).items()
+                             if row.get("adopted"))
+            if adopted and made:
+                print("   roster also carries %d colony pawn(s) the colonist "
+                      "read cannot see: %s" % (len(adopted), ", ".join(adopted)))
         elif args.command == "status":
             snap = _live_snapshot()
             print(session_summary(load_ledger(), snap, _identity()))
@@ -1508,10 +2154,15 @@ def main(argv=None):
             if warning:
                 print(warning)
         elif args.command == "adopt":
-            ledger = adopt_turn()
-            print("COMBAT LEDGER ADOPTED by turn %s; %d cleanup obligation(s) preserved."
-                  % ((ledger.get("turnOwner") or {}).get("turn"),
-                     len(ledger.get("draftObligations") or {})))
+            if args.pawn:
+                pid, row = adopt_pawn(args.pawn)
+                print("   the roster knows %s as %s; every combat verb will "
+                      "address them now." % (row.get("name") or pid, pid))
+            else:
+                ledger = adopt_turn()
+                print("COMBAT LEDGER ADOPTED by turn %s; %d cleanup obligation(s) preserved."
+                      % ((ledger.get("turnOwner") or {}).get("turn"),
+                         len(ledger.get("draftObligations") or {})))
         elif args.command == "move":
             snap = _live_snapshot(pause=True)
             order = issue_move(args.pawn, args.x, args.z, snap, _identity())
@@ -1527,6 +2178,22 @@ def main(argv=None):
                            "%s -> %s,%s; watching immediate injury hook"
                            % (order.get("pawnName") or order.get("pawnId"),
                               args.x, args.z), snap)
+            print("\n".join(flee_next_step_lines(load_ledger(), args.advance)))
+            if args.advance:
+                # The refusal belongs to the advance, not to the order that
+                # already landed: latching a decision on the fleeing pawn here
+                # would wedge the very escape this call just issued.
+                try:
+                    result = advance(args.advance, _live_snapshot(), _identity())
+                    if result.get("stopReason") not in HUMAN_STOPS:
+                        note_clock_paused(ADVANCE_PAUSE)
+                    print_advance_result(result)
+                except CombatRefusal as advance_error:
+                    print("FLEE ORDER STANDS -- the advance was refused: %s"
+                          % advance_error)
+                    print("   the retreat is still queued on the pawn; clear "
+                          "that, then `python combat.py advance %d`."
+                          % int(args.advance))
         elif args.command == "equip":
             snap = _live_snapshot(pause=True)
             ident = _identity()
@@ -1631,54 +2298,47 @@ def main(argv=None):
         elif args.command == "advance":
             snap = _live_snapshot()
             result = advance(args.seconds, snap, _identity(), resume=args.resume)
-            print("COMBAT STOP  %s%s" %
-                  (result.get("stopReason"),
-                   ": " + str(result.get("stopDetail"))
-                   if result.get("stopDetail") else ""))
-            if result.get("stopReason") in HUMAN_STOPS:
-                print("   a person stopped the clock; the next advance needs --resume")
-            for note in result.get("notes") or []:
-                print("   note: %s" % note)
-            # An alert that did NOT stop the pulse is worth one line: silence
-            # here is how a standing alert looks identical to no alert at all.
-            # The companion emits one row per key: label, priority,
-            # msSinceLastCounted, pollsDebounced (a bare string is tolerated).
-            for row in result.get("alertsDebounced") or []:
-                if isinstance(row, dict):
-                    label = row.get("label") or row.get("alertKey")
-                    ago = row.get("msSinceLastCounted")
-                    since = (", last counted %.0f s ago" % (ago / 1000.0)
-                             if isinstance(ago, (int, float)) else "")
-                else:
-                    label, since = row, ""
-                print("   note: alert %r was already standing and did not stop "
-                      "this pulse (%.0f s debounce%s)"
-                      % (label, COMBAT_ALERT_DEBOUNCE_MS / 1000.0, since))
+            if result.get("stopReason") not in HUMAN_STOPS:
+                note_clock_paused(ADVANCE_PAUSE)
+            print_advance_result(result)
         else:
-            if args.command == "end" and not args.dry_run:
-                if pause_supervised_for_cleanup():
-                    print("SUPERVISED PLAY PAUSED before combat cleanup; it will not auto-resume.")
-            snap = _live_snapshot(pause=not args.dry_run)
-            lines = reconcile(snap, _identity(), getattr(args, "pawn", None),
-                              args.dry_run, args.force)
-            print("\n".join(lines))
+            # The read is UNPAUSED. Everything `end` can refuse for is decided
+            # off this snapshot, and the clock is not touched until reconcile
+            # has cleared every refusal and is about to change something --
+            # 2026-09-08, `end` paused the game and THEN refused over sleeping
+            # insectoids, which is the one thing a refusal may never do.
+            snap = _live_snapshot()
+            try:
+                lines = reconcile(
+                    snap, _identity(), getattr(args, "pawn", None),
+                    args.dry_run, args.force,
+                    before_write=None if args.dry_run else
+                    (lambda: cleanup_pause(supervised=args.command == "end")))
+                print("\n".join(lines))
+            except CombatRefusal as refusal:
+                if args.command != "end":
+                    raise
+                print("COMBAT REFUSED -- %s" % refusal)
+                print(end_closure_line(args.dry_run))
+                return 1
             # 2026-09-04: `end` used to stop at reconcile's lines, which say
             # what was restored and nothing about what happened to the session
             # -- so "no controller-drafted pawns to restore" arrived with no
             # statement that the ledger was gone, one line under status.py
-            # calling the session active. One closing sentence, always.
-            if args.command == "end" and not args.dry_run:
-                closed = not os.path.exists(LEDGER)
-                print("COMBAT SESSION %s" %
-                      ("CLOSED -- ledger removed; nothing is drafted on this "
-                       "session's account." if closed else
-                       "STILL OPEN -- obligations remain (see above); run "
-                       "`python combat.py end --force` to abandon them."))
+            # calling the session active. One closing sentence, always -- on
+            # the dry run and on the refusal too, since 2026-09-08, when `end`
+            # printed its stage-1 text and never said whether it had closed.
+            if args.command == "end":
+                print(end_closure_line(args.dry_run))
         return 0
     except (CombatRefusal, rim.BridgeError, OSError, RuntimeError,
             ValueError, KeyError, KeyboardInterrupt) as e:
         command = getattr(args, "command", None)
-        if not isinstance(e, (OwnershipRefusal, SupervisedPlayRefusal)) and command in ("move", "flee", "attack", "equip", "advance", "draft",
+        # ArgumentRefusal is in this tuple for the same reason the other two
+        # are: it was raised BEFORE anything was asked of the game, so pausing
+        # the colony over it would be the refusal doing damage on its way out.
+        if not isinstance(e, (OwnershipRefusal, SupervisedPlayRefusal,
+                              ArgumentRefusal)) and command in ("move", "flee", "attack", "equip", "advance", "draft",
                        "undraft", "tend", "rescue"):
             # Anything that may have touched a pawn or the clock ends paused,
             # and says whether the pause was CONFIRMED rather than assuming.
@@ -1693,6 +2353,8 @@ def main(argv=None):
                     record_order_failure(args.pawn, "%s failed" % command, e,
                                          target=getattr(args, "patient", None))
             finally:
+                if paused:
+                    note_clock_paused(REFUSAL_PAUSE)
                 print("%s FAILED -- %s; a new verified order is required"
                       % (command.upper(), _pause_verdict(paused)))
         print("COMBAT REFUSED -- %s" % (e if not isinstance(e, KeyboardInterrupt)
@@ -1704,13 +2366,27 @@ def main(argv=None):
         # what it thinks of them and print it: incapableOfViolence,
         # canBeDrafted, weapon, mental state. One extra read, no game time, and
         # it is the read whose absence killed Finn.
-        if not isinstance(e, (OwnershipRefusal, SupervisedPlayRefusal)) and command in ("move", "flee", "attack", "draft", "undraft", "tend",
-                       "rescue"):
+        if (not isinstance(e, (OwnershipRefusal, SupervisedPlayRefusal))
+                and getattr(args, "pawn", None)
+                and command in ("move", "flee", "attack", "draft", "undraft",
+                                "tend", "rescue", "adopt")):
             try:
                 print_pawn_verdict(getattr(args, "pawn", None))
             except Exception as probe_error:
                 print("   (could not read the pawn's state: %s)" % probe_error)
         return 1
+    finally:
+        for row in clock_left_paused_lines(
+                supervised=_SUPERVISED_AT_PAUSE[0] if _SUPERVISED_AT_PAUSE else None):
+            print(row)
+        # Disarmed on the way out, after the lines above have read them. The
+        # live pawn-list caller belongs to ONE invocation: left armed, the next
+        # caller in this process -- a test, an importer, a second main() --
+        # would silently reach the bridge through a function it handed no
+        # reader to, which is the one thing `_roster_reader` exists to prevent.
+        _ROSTER_READER[:] = []
+        _CLOCK_PAUSED_BY[:] = []
+        _SUPERVISED_AT_PAUSE[:] = []
 
 
 if __name__ == "__main__":

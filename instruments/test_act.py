@@ -12,6 +12,39 @@ def animal(x=10, z=20, tid="Ibex404123", name="ibex"):
             "animals": {"thingId": tid}}
 
 
+def field_row(field, before, after, refused=None, also_removed=()):
+    """One `home/pawn_config` fields[] row, in the shape the tool emits."""
+    return {"field": field, "requested": after,
+            "before": before, "after": before if refused else after,
+            "changed": (not refused) and before != after,
+            "refused": bool(refused), "reason": refused,
+            "alsoRemoved": list(also_removed)}
+
+
+def config_reply(rows, success=True, unknown=(), **extra):
+    """A `home/pawn_config` reply. `unknown` is what an OLDER companion DLL
+    puts in unknownArguments for a field it does not declare."""
+    rows = list(rows)
+    reply = {"success": success, "tool": "home/pawn_config",
+             "fields": [r for r in rows if str(r["field"]) not in unknown],
+             "refused": [r for r in rows if r["refused"]],
+             "unknownArguments": list(unknown)}
+    reply.update(extra)
+    return reply
+
+
+def bridge(reply, tool="home/pawn_config"):
+    """Mock `rim.game` so only `tool` is answered; anything else is a fault in
+    the test, not a silent fallthrough to a real socket."""
+    def answer(name, args=None, **kw):
+        if name != tool:
+            raise AssertionError("unexpected bridge call %r" % name)
+        answer.calls.append(args or {})
+        return reply(args or {}) if callable(reply) else reply
+    answer.calls = []
+    return mock.patch.object(act.rim, "game", side_effect=answer), answer
+
+
 def row(label, ident, category="Floors", **kw):
     """One `list_architect_designators` row, with the fields _pick reads."""
     d = {"label": label, "id": ident, "kind": kw.pop("kind", "designator"),
@@ -40,8 +73,9 @@ class HuntTests(unittest.TestCase):
             self.assertEqual([pawn], act._animal_matches("Thing_WildBoar334597", [pawn]))
 
     def test_hunt_asks_for_the_animals_block_that_carries_the_id(self):
+        patch, _ = bridge(config_reply([field_row("hunt", False, True)]))
         with mock.patch("pawns.all_pawns", return_value=[animal()]) as all_pawns, \
-             mock.patch.object(act, "apply", return_value={"success": True}):
+             patch:
             act.hunt("Ibex404123", do=True)
         self.assertEqual({"animalsOnly": True, "animals": True},
                          all_pawns.call_args.kwargs)
@@ -55,62 +89,113 @@ class HuntTests(unittest.TestCase):
         self.assertIn("Ibex404123", message)
         self.assertNotIn("None", message)
 
-    def test_hunt_refreshes_the_cell_immediately_before_apply(self):
+    def test_the_mark_goes_on_the_animal_by_id_not_at_a_cell(self):
+        # The whole point of the 2026-09-11 rewrite: the designation hangs on
+        # the ANIMAL, so the write carries a ThingID and no coordinates. An
+        # animal that walked between the read and the write is still the right
+        # animal, with no retry loop to get there.
+        patch, sent = bridge(config_reply([field_row("hunt", False, True)]))
+        with mock.patch("pawns.all_pawns", return_value=[animal(10, 20)]), \
+             mock.patch.object(act, "apply") as apply, patch:
+            act.hunt("Ibex404123", do=True)
+        apply.assert_not_called()
+        self.assertEqual([{"pawn": "Ibex404123", "dryRun": False, "hunt": "on"}],
+                         sent.calls)
+
+    def test_it_is_a_dry_run_until_do(self):
+        patch, sent = bridge(config_reply([field_row("hunt", False, True)]))
+        with mock.patch("pawns.all_pawns", return_value=[animal()]), patch:
+            act.hunt("Ibex404123")
+        self.assertIs(True, sent.calls[0]["dryRun"])
+
+    def test_an_old_companion_dll_falls_back_to_the_cell_designator(self):
+        # The host DROPS an argument a tool does not declare and answers
+        # success:true with no field row -- which reads exactly like a write
+        # that landed. unknownArguments is the only thing that says otherwise.
+        old = config_reply([field_row("hunt", False, True)], unknown=("hunt",))
         reads = iter(([animal(10, 20)], [animal(12, 23)]))
+        patch, _ = bridge(old)
         with mock.patch("pawns.all_pawns", side_effect=lambda **kw: next(reads)), \
-             mock.patch.object(act, "apply", return_value={"success": True}) as apply:
+             mock.patch.object(act, "apply", return_value={"success": True}) as apply, \
+             patch:
             act.hunt("Ibex404123", do=True)
         self.assertEqual(("Hunt", 12, 23), apply.call_args.args[:3])
 
-    def test_hunt_retries_the_stale_cell_refusal(self):
+    def test_the_fallback_still_retries_the_stale_cell_refusal(self):
+        old = config_reply([field_row("hunt", False, True)], unknown=("hunt",))
         reads = iter(([animal(10, 20)], [animal(11, 21)], [animal(12, 22)]))
         stale = {"success": False, "message": "Must designate huntable animals",
                  "rejectedCells": [{"x": 11, "z": 21,
                                      "reason": "Must designate huntable animals"}]}
+        patch, _ = bridge(old)
         with mock.patch("pawns.all_pawns", side_effect=lambda **kw: next(reads)), \
-             mock.patch.object(act, "apply", side_effect=[stale, {"success": True}]) as apply:
+             mock.patch.object(act, "apply", side_effect=[stale, {"success": True}]) as apply, \
+             patch:
             result = act.hunt("Ibex404123", do=True)
         self.assertTrue(result[0][1]["success"])
         self.assertEqual(("Hunt", 12, 22), apply.call_args.args[:3])
 
     def test_an_already_marked_animal_is_a_no_op_not_a_refusal(self):
+        # A second AddDesignation is a Verse.Log.Error, which pauses the
+        # colony; the tool answers with a no-op row and so does this.
         marked = animal()
         marked["animals"]["designations"] = {"hunt": True, "tame": False}
         out = io.StringIO()
+        patch, _ = bridge(config_reply([field_row("hunt", True, True)]))
         with mock.patch.object(act.rim, "init"), \
              mock.patch("pawns.all_pawns", return_value=[marked]), \
              mock.patch.object(act, "apply") as apply, \
-             mock.patch("sys.stdout", out):
+             patch, mock.patch("sys.stdout", out):
             self.assertEqual(0, act.main(["hunt", "Ibex404123", "--do"]))
         apply.assert_not_called()
         self.assertIn("NO-OP", out.getvalue())
 
-    def test_an_unmarked_animal_still_reaches_the_designator(self):
-        unmarked = animal()
-        unmarked["animals"]["designations"] = {"hunt": False}
-        with mock.patch("pawns.all_pawns", return_value=[unmarked]), \
-             mock.patch.object(act, "apply", return_value={"success": True}) as apply:
-            act.hunt("Ibex404123", do=True)
-        self.assertEqual(("Hunt", 10, 20), apply.call_args.args[:3])
+    def test_what_the_designator_also_cleared_is_printed(self):
+        # Designator_Hunt.DesignateThing calls RemoveAllDesignationsOn FIRST,
+        # so a hunt mark silently eats a tame one unless it is said out loud.
+        out = io.StringIO()
+        patch, _ = bridge(config_reply(
+            [field_row("hunt", False, True, also_removed=["Tame"])],
+            dryRun=False, applied=True))
+        with mock.patch.object(act.rim, "init"), \
+             mock.patch("pawns.all_pawns", return_value=[animal()]), \
+             patch, mock.patch("sys.stdout", out):
+            self.assertEqual(0, act.main(["hunt", "Ibex404123", "--do"]))
+        text = out.getvalue()
+        self.assertIn("APPLIED hunt to this ANIMAL", text)
+        self.assertIn("also cleared Tame", text)
+        self.assertNotIn("cell(s)", text)
 
-    def test_tame_uses_the_tame_label_and_names_the_cell_mates(self):
+    def test_a_refused_field_is_a_refusal_with_the_games_own_reason(self):
+        why = ("This animal belongs to \"Player\", a humanlike faction ... the "
+               "write you want is slaughter")
+        out = io.StringIO()
+        patch, _ = bridge(config_reply([field_row("hunt", False, True, refused=why)]))
+        with mock.patch.object(act.rim, "init"), \
+             mock.patch("pawns.all_pawns", return_value=[animal()]), \
+             patch, mock.patch("sys.stdout", out):
+            self.assertEqual(1, act.main(["hunt", "Ibex404123", "--do"]))
+        self.assertIn("REFUSED", out.getvalue())
+        self.assertIn("the write you want is slaughter", out.getvalue())
+
+    def test_tame_writes_the_tame_field_and_names_the_cell_mates(self):
         fox = animal(49, 96, "Fox112", "fox")
         donkey = animal(49, 96, "Donkey405307", "donkey")
-        with mock.patch("pawns.all_pawns", return_value=[fox, donkey]), \
-             mock.patch.object(act, "apply", return_value={"success": True}) as apply:
+        patch, sent = bridge(config_reply([field_row("tame", False, True)]))
+        with mock.patch("pawns.all_pawns", return_value=[fox, donkey]), patch:
             out = act.tame("Fox112", do=True)
-        self.assertEqual("Tame", apply.call_args.args[0])
+        self.assertEqual("on", sent.calls[0]["tame"])
         self.assertEqual([donkey], out[0][2])
 
     def test_tame_cli_prints_the_target_id_and_the_other_animals(self):
         fox = animal(49, 96, "Fox112", "fox")
         donkey = animal(49, 96, "Donkey405307", "donkey")
         out = io.StringIO()
+        patch, _ = bridge(config_reply(
+            [field_row("tame", False, True, refused="Wildness is 1.0")]))
         with mock.patch.object(act.rim, "init"), \
              mock.patch("pawns.all_pawns", return_value=[fox, donkey]), \
-             mock.patch.object(act, "apply", return_value={
-                 "success": False, "message": "Cannot tame donkey: Not enough food"}), \
-             mock.patch("sys.stdout", out):
+             patch, mock.patch("sys.stdout", out):
             act.main(["tame", "Fox112"])
         self.assertIn("(Fox112)", out.getvalue())
         self.assertIn("Donkey405307", out.getvalue())
@@ -213,6 +298,7 @@ class ApplyCliTests(unittest.TestCase):
         with mock.patch.object(act.rim, "init"), \
              mock.patch.object(act, "apply", return_value={"success": True,
                                                             "dryRun": False}) as apply, \
+             mock.patch.object(act.pick, "clear_designator"), \
              mock.patch("sys.stdout", new_callable=io.StringIO):
             self.assertEqual(0, act.main(["apply", "Harvest", "1", "2", "--do"]))
         self.assertFalse(apply.call_args.kwargs["dry"])
@@ -228,6 +314,7 @@ class ApplyCliTests(unittest.TestCase):
              mock.patch.object(act, "designation", return_value="Hunt"), \
              mock.patch.object(act, "cells", return_value=grid), \
              mock.patch.dict(act._designation, {}, clear=False), \
+             mock.patch.object(act.pick, "clear_designator"), \
              mock.patch("sys.stdout", out):
             rc = act.main(["apply", "Hunt", "49", "96", "--do"])
         self.assertEqual(0, rc)
@@ -240,6 +327,7 @@ class ApplyCliTests(unittest.TestCase):
              mock.patch.object(act, "apply", return_value=refused), \
              mock.patch.object(act, "designation", return_value="Hunt"), \
              mock.patch.object(act, "cells", return_value=[]), \
+             mock.patch.object(act.pick, "clear_designator"), \
              mock.patch("sys.stdout", new_callable=io.StringIO):
             self.assertEqual(1, act.main(["apply", "Hunt", "49", "96", "--do"]))
 
@@ -249,9 +337,15 @@ class ApplyCliTests(unittest.TestCase):
         grid = [{"x": 20, "z": 30,
                  "things": [{"defName": "Steel", "forbidden": True}]}]
         out = io.StringIO()
+        # designation mocked because _rejected_notes consults the designation
+        # table, and loading it is a live architect-menu fetch. None is its
+        # real answer for Forbid, which is a CompForbiddable toggle, not a
+        # designation.
         with mock.patch.object(act.rim, "init"), \
              mock.patch.object(act, "apply", return_value=refused), \
+             mock.patch.object(act, "designation", return_value=None), \
              mock.patch.object(act, "cells", return_value=grid), \
+             mock.patch.object(act.pick, "clear_designator"), \
              mock.patch("sys.stdout", out):
             rc = act.main(["apply", "Forbid", "20", "30", "--do"])
         self.assertEqual(0, rc)
@@ -417,8 +511,10 @@ class CancelNoopTests(unittest.TestCase):
                  "things": [{"className": "Building", "label": "wall"}]}]
         rc, text = self._main(grid)
         self.assertEqual(0, rc)
-        self.assertIn("nothing to cancel at 113,140 (built, no "
-                      "blueprint/designation)", text)
+        self.assertIn("nothing to cancel at 113,140", text)
+        # ... and what IS there, with the command that removes it.
+        self.assertIn("a finished wall stands at 113,140", text)
+        self.assertIn("act.py deconstruct 113 140 --do", text)
 
     def test_a_standing_blueprint_is_still_a_real_refusal(self):
         grid = [{"x": 113, "z": 140, "designations": [],
@@ -477,6 +573,7 @@ class UndesignateTests(unittest.TestCase):
         self.assertIn("20,30 -- removed mine", text)
         self.assertIn("!! still designated at 21,30 -- tame", text)
         self.assertIn("sits on the ANIMAL", text)
+        self.assertIn("act.py undesignate <animal> --do", text)
 
     def test_an_unread_rectangle_raises_instead_of_reporting_nothing(self):
         with mock.patch.object(act, "cells", return_value=None):
@@ -597,6 +694,342 @@ class AllowAliasTests(unittest.TestCase):
              mock.patch("sys.stdout", new_callable=io.StringIO):
             self.assertEqual(0, act.main(["unforbid", "20", "30", "--size", "4", "4"]))
         self.assertEqual((20, 30, 4, 4), allow.call_args.args)
+
+
+class ArgumentSpellingTests(unittest.TestCase):
+    """`x,z` is one token to a person; every label is a verb."""
+
+    def test_a_comma_pair_becomes_two_coordinates(self):
+        self.assertEqual(["apply", "Mine", "106", "127"],
+                         act.expand_argv(["apply", "Mine", "106,127"]))
+
+    def test_a_bare_label_becomes_apply(self):
+        self.assertEqual(["apply", "mine", "106", "127"],
+                         act.expand_argv(["mine", "106", "127"]))
+
+    def test_a_real_command_is_left_alone(self):
+        for argv in (["hunt", "Ibex404123"], ["labels", "wall"],
+                     ["undesignate", "20", "30"]):
+            self.assertEqual(argv, act.expand_argv(list(argv)))
+
+    def test_the_bare_verb_reaches_apply_with_that_label(self):
+        out = io.StringIO()
+        with mock.patch.object(act.rim, "init"), \
+             mock.patch.object(act, "apply", return_value={"success": True,
+                                                          "acceptedCellCount": 1}) as apply, \
+             mock.patch.object(act, "paints", return_value=None), \
+             mock.patch("sys.stdout", out):
+            act.main(["mine", "106,127"])
+        self.assertEqual(("mine", 106, 127, 1, 1), apply.call_args.args)
+        self.assertIn("DRY RUN", out.getvalue())
+
+
+class UnforbidRedirectTests(unittest.TestCase):
+    """`apply "Unforbid"` names a designator that does not exist."""
+
+    def test_it_says_what_it_is_doing_and_runs_allow(self):
+        out = io.StringIO()
+        with mock.patch.object(act.rim, "init"), \
+             mock.patch.object(act, "_resolves", return_value=False), \
+             mock.patch.object(act, "allow", return_value={
+                 "dryRun": True, "found": [], "unforbidden": [],
+                 "stillForbidden": [], "failed": []}) as allow, \
+             mock.patch("sys.stdout", out):
+            self.assertEqual(0, act.main(["apply", "Unforbid", "120", "140", "4", "4"]))
+        self.assertEqual((120, 140, 4, 4), allow.call_args.args)
+        self.assertIn("REDIRECT", out.getvalue())
+        self.assertIn("act.py allow 120 140 4 4", out.getvalue())
+
+    def test_a_label_that_does_resolve_is_left_to_the_designator(self):
+        with mock.patch.object(act.rim, "init"), \
+             mock.patch.object(act, "_resolves", return_value=True), \
+             mock.patch.object(act, "apply", return_value={"success": True}) as apply, \
+             mock.patch.object(act, "paints", return_value=None), \
+             mock.patch.object(act, "allow") as allow, \
+             mock.patch("sys.stdout", new_callable=io.StringIO):
+            act.main(["apply", "Allow", "120", "140"])
+        allow.assert_not_called()
+        self.assertEqual("Allow", apply.call_args.args[0])
+
+
+class HuntManyTests(unittest.TestCase):
+    """Three ids on one line failed, naming the 2nd and 3rd."""
+
+    def test_every_id_on_the_line_is_designated_and_reported(self):
+        rows = [animal(10, 20, "Ibex404123", "ibex"),
+                animal(11, 21, "Hare1", "hare"),
+                animal(12, 22, "Deer2", "deer")]
+        out = io.StringIO()
+        patch, sent = bridge(config_reply([field_row("hunt", False, True)],
+                                          dryRun=False, applied=True))
+        with mock.patch.object(act.rim, "init"), \
+             mock.patch("pawns.all_pawns", return_value=rows), \
+             patch, mock.patch("sys.stdout", out):
+            rc = act.main(["hunt", "Ibex404123", "Hare1", "Deer2", "--do"])
+        self.assertEqual(0, rc)
+        self.assertEqual(["Ibex404123", "Hare1", "Deer2"],
+                         [c["pawn"] for c in sent.calls])
+        text = out.getvalue()
+        for name in ("Ibex404123", "Hare1", "Deer2"):
+            self.assertIn(name, text)
+
+    def test_one_miss_does_not_stop_the_others(self):
+        rows = [animal(10, 20, "Ibex404123", "ibex")]
+        out = io.StringIO()
+        patch, sent = bridge(config_reply([field_row("hunt", False, True)],
+                                          dryRun=False, applied=True))
+        with mock.patch.object(act.rim, "init"), \
+             mock.patch("pawns.all_pawns", return_value=rows), \
+             patch, mock.patch("sys.stdout", out):
+            rc = act.main(["hunt", "Gone999", "Ibex404123", "--do"])
+        self.assertEqual(1, rc)
+        self.assertEqual(["Ibex404123"], [c["pawn"] for c in sent.calls])
+        self.assertIn("Gone999", out.getvalue())
+        self.assertIn("Ibex404123", out.getvalue())
+
+
+class LabelMissTests(unittest.TestCase):
+    """`act.py labels <word>` printed the filtered list -- empty -- and stopped,
+    so a typo was answered with a blank screen (BUGS.md, 2026-09-11)."""
+
+    def tearDown(self):
+        act._rows[:] = []
+        act._index()
+
+    def run_cli(self, word):
+        menu(row("wall...", "d1", "Structure"), row("Cooler", "d2", "Temperature"))
+        out = io.StringIO()
+        with mock.patch.object(act.rim, "init"), mock.patch("sys.stdout", out):
+            rc = act.main(["labels", word])
+        return rc, out.getvalue()
+
+    def test_a_miss_says_so_and_lists_the_nearest(self):
+        rc, text = self.run_cli("coolar")
+        self.assertEqual(1, rc)
+        self.assertIn("no label matches 'coolar'", text)
+        self.assertIn("Cooler", text)
+
+    def test_a_miss_with_nothing_close_names_the_full_listing(self):
+        rc, text = self.run_cli("zzzzqqq")
+        self.assertEqual(1, rc)
+        self.assertIn("no label matches 'zzzzqqq'", text)
+        self.assertIn("python act.py labels", text)
+
+    def test_a_hit_still_just_prints_the_rows(self):
+        rc, text = self.run_cli("wall")
+        self.assertEqual(0, rc)
+        self.assertIn("wall...", text)
+        self.assertNotIn("no label matches", text)
+
+
+class UninstallTests(unittest.TestCase):
+    """Uninstall keeps a minifiable building whole; deconstruct does not."""
+
+    def test_a_cell_goes_straight_to_the_orders_designator(self):
+        out = io.StringIO()
+        with mock.patch.object(act.rim, "init"), \
+             mock.patch.object(act, "apply", return_value={
+                 "success": True, "acceptedCellCount": 1}) as apply, \
+             mock.patch("sys.stdout", out):
+            rc = act.main(["uninstall", "106,127", "--do"])
+        self.assertEqual(0, rc)
+        self.assertEqual((("Orders", "Uninstall"), 106, 127), apply.call_args.args)
+        self.assertIs(False, apply.call_args.kwargs["dry"])
+
+    def test_a_thing_id_is_resolved_to_its_cell(self):
+        out = io.StringIO()
+        with mock.patch.object(act.rim, "init"), \
+             mock.patch.object(act.pick, "resolve", return_value={
+                 "label": "cooler", "position": {"x": 113, "z": 146}}), \
+             mock.patch.object(act, "apply", return_value={
+                 "success": True, "acceptedCellCount": 1}) as apply, \
+             mock.patch("sys.stdout", out):
+            act.main(["uninstall", "Thing_Cooler123"])
+        self.assertEqual((("Orders", "Uninstall"), 113, 146), apply.call_args.args)
+        self.assertIs(True, apply.call_args.kwargs["dry"])
+        self.assertIn("cooler is at 113,146", out.getvalue())
+
+    def test_a_menu_without_the_designator_names_the_gizmo_route(self):
+        out = io.StringIO()
+        with mock.patch.object(act.rim, "init"), \
+             mock.patch.object(act, "apply", side_effect=KeyError("no designator")), \
+             mock.patch("sys.stdout", out):
+            rc = act.main(["uninstall", "106", "127", "--do"])
+        text = out.getvalue()
+        self.assertEqual(1, rc)
+        self.assertIn('buildings.py gizmo <thingId> "Uninstall" --do', text)
+        self.assertIn("REVERSE designator", text)
+        self.assertIn("not minifiable", text)
+        self.assertNotIn("act.py deconstruct", text)
+
+
+class UndesignateAnimalTests(unittest.TestCase):
+    """Hunt sits on the ANIMAL, and the animal has moved since the last read."""
+
+    def marked(self, **marks):
+        p = animal(10, 20)
+        p["animals"]["designations"] = dict({"hunt": False, "tame": False,
+                                             "slaughter": False,
+                                             "releaseToWild": False}, **marks)
+        return p
+
+    def test_a_hunt_is_cleared_through_pawn_config_and_read_back(self):
+        # The bug: `act.py hunt <id> --do` then `act.py undesignate <id> --do`
+        # left the hunt standing, because Cancel is a CELL designator and Hunt
+        # sits on the animal. The `after` here is a fresh read, not the reply.
+        before, after = self.marked(hunt=True), self.marked()
+        after["position"] = {"x": 12, "z": 23}
+        reads = iter(([before], [after]))
+        out = io.StringIO()
+        patch, sent = bridge(config_reply([field_row("hunt", True, False)],
+                                          dryRun=False, applied=True))
+        with mock.patch.object(act.rim, "init"), \
+             mock.patch("pawns.all_pawns", side_effect=lambda **kw: next(reads)), \
+             mock.patch.object(act, "apply") as apply, \
+             patch, mock.patch("sys.stdout", out):
+            rc = act.main(["undesignate", "Ibex404123", "--do"])
+        self.assertEqual(0, rc)
+        apply.assert_not_called()
+        self.assertEqual([{"pawn": "Ibex404123", "dryRun": False, "hunt": "off"}],
+                         sent.calls)
+        self.assertIn("CANCELLED hunt", out.getvalue())
+
+    def test_every_standing_mark_is_cleared_in_one_call(self):
+        before = self.marked(hunt=True, slaughter=True)
+        reads = iter(([before], [self.marked()]))
+        out = io.StringIO()
+        patch, sent = bridge(config_reply(
+            [field_row("hunt", True, False), field_row("slaughter", True, False)],
+            dryRun=False, applied=True))
+        with mock.patch.object(act.rim, "init"), \
+             mock.patch("pawns.all_pawns", side_effect=lambda **kw: next(reads)), \
+             patch, mock.patch("sys.stdout", out):
+            rc = act.main(["undesignate", "Ibex404123", "--do"])
+        self.assertEqual(0, rc)
+        self.assertEqual({"hunt": "off", "slaughter": "off"},
+                         {k: v for k, v in sent.calls[0].items()
+                          if k in ("hunt", "slaughter")})
+        self.assertIn("CANCELLED hunt, slaughter", out.getvalue())
+
+    def test_a_mark_the_tool_refused_is_named_with_its_reason(self):
+        still = self.marked(slaughter=True)
+        out = io.StringIO()
+        patch, _ = bridge(config_reply(
+            [field_row("slaughter", True, False,
+                       refused="The designation manager was not reachable.")]))
+        with mock.patch.object(act.rim, "init"), \
+             mock.patch("pawns.all_pawns", return_value=[still]), \
+             patch, mock.patch("sys.stdout", out):
+            rc = act.main(["undesignate", "Ibex404123", "--do"])
+        self.assertEqual(1, rc)
+        self.assertIn("slaughter still stands", out.getvalue())
+        self.assertIn("designation manager was not reachable", out.getvalue())
+
+    def test_an_old_companion_dll_says_so_and_names_the_reinstall(self):
+        still = self.marked(slaughter=True)
+        out = io.StringIO()
+        patch, _ = bridge(config_reply([field_row("slaughter", True, False)],
+                                       unknown=("slaughter",)))
+        with mock.patch.object(act.rim, "init"), \
+             mock.patch("pawns.all_pawns", return_value=[still]), \
+             mock.patch.object(act, "apply", return_value={"success": True}) as apply, \
+             patch, mock.patch("sys.stdout", out):
+            rc = act.main(["undesignate", "Ibex404123", "--do"])
+        self.assertEqual(1, rc)
+        self.assertEqual((("Orders", "Cancel"), 10, 20), apply.call_args.args)
+        self.assertIn("Reinstall the companion DLL", out.getvalue())
+
+    def test_an_unmarked_animal_is_a_no_op_and_never_designates(self):
+        out = io.StringIO()
+        patch, sent = bridge(config_reply([]))
+        with mock.patch.object(act.rim, "init"), \
+             mock.patch("pawns.all_pawns", return_value=[self.marked()]), \
+             mock.patch.object(act, "apply") as apply, \
+             patch, mock.patch("sys.stdout", out):
+            rc = act.main(["undesignate", "Ibex404123", "--do"])
+        self.assertEqual(0, rc)
+        apply.assert_not_called()
+        self.assertEqual([], sent.calls)
+        self.assertIn("NO-OP", out.getvalue())
+
+    def test_it_is_a_dry_run_until_do(self):
+        out = io.StringIO()
+        patch, sent = bridge(config_reply([field_row("hunt", True, False)]))
+        with mock.patch.object(act.rim, "init"), \
+             mock.patch("pawns.all_pawns", return_value=[self.marked(hunt=True)]), \
+             patch, mock.patch("sys.stdout", out):
+            act.main(["undesignate", "Ibex404123"])
+        self.assertIs(True, sent.calls[0]["dryRun"])
+        self.assertIn("DRY RUN", out.getvalue())
+
+
+class NothingToCancelSaysWhatIsThereTests(unittest.TestCase):
+    """"nothing to cancel" 90 s after a blueprint id came back at that cell."""
+
+    def run_cli(self, grid):
+        out = io.StringIO()
+        with mock.patch.object(act.rim, "init"), \
+             mock.patch.object(act, "cells", return_value=grid), \
+             mock.patch("sys.stdout", out):
+            rc = act.main(["undesignate", "128", "147"])
+        return rc, out.getvalue()
+
+    def test_a_finished_wall_is_named_with_the_command_that_removes_it(self):
+        rc, text = self.run_cli([{"x": 128, "z": 147, "designations": [],
+                                  "things": [{"className": "Building_Door",
+                                              "label": "wall"}]}])
+        self.assertEqual(0, rc)
+        self.assertIn("a finished wall stands at 128,147", text)
+        self.assertIn("python act.py deconstruct 128 147 --do", text)
+        self.assertIn("act.py uninstall 128 147 --do", text)
+
+    def test_an_animal_is_named_with_the_animal_form(self):
+        rc, text = self.run_cli([{"x": 128, "z": 147, "designations": [],
+                                  "things": [{"className": "Pawn", "label": "ibex"}]}])
+        self.assertIn("Hunt, Tame and Slaughter sit on the ANIMAL", text)
+        self.assertIn("act.py undesignate ibex --do", text)
+
+    def test_an_empty_cell_still_says_it_is_empty(self):
+        rc, text = self.run_cli([])
+        self.assertEqual(0, rc)
+        self.assertIn("every cell read is empty", text)
+
+
+
+class SlaughterRouteTest(unittest.TestCase):
+    """Our own animal refuses hunt -- and the way out must be pasteable.
+
+    Live 2026-09-12: the companion's own sentence ends "the write you want is
+    slaughter -- home/pawn_config {pawn, slaughter:\"on\", dryRun:false}",
+    which is a bridge payload. PLAYBOOK and BUGS.md promise the CLI spelling.
+    """
+
+    REFUSAL = {"success": False,
+               "message": ('This animal belongs to "The Narrow Way", a '
+                           "humanlike faction ... the write you want is "
+                           "slaughter -- home/pawn_config {pawn, "
+                           'slaughter:"on", dryRun:false} -- not hunt.')}
+
+    def printed(self, result, animal_id=None):
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            code = act._print_result(result, dry=False, animal_id=animal_id)
+        return code, out.getvalue()
+
+    def test_the_refusal_names_the_pawns_py_command_with_the_id(self):
+        code, text = self.printed(self.REFUSAL, animal_id="GuineaPig45908")
+        self.assertEqual(1, code)
+        self.assertIn("python pawns.py set GuineaPig45908 --slaughter on --do",
+                      text)
+
+    def test_without_an_id_it_still_gives_the_shape(self):
+        _, text = self.printed(self.REFUSAL)
+        self.assertIn("python pawns.py set <animal-id> --slaughter on --do",
+                      text)
+
+    def test_an_unrelated_refusal_gets_no_slaughter_line(self):
+        _, text = self.printed({"success": False,
+                                "message": "Must designate haulable items"})
+        self.assertNotIn("slaughter", text)
 
 
 if __name__ == "__main__":

@@ -94,6 +94,71 @@ class LongEventRetryTests(unittest.TestCase):
         self.assertNotIn("retried", str(caught.exception))
 
 
+class ThreatClassificationTests(unittest.TestCase):
+    """The guard's classification has to survive the trip out to the refusal.
+
+    `start` answers with a status snapshot and nothing else, so before
+    2026-09-11 a threat stop reached `play.py` as one name and no ThingID --
+    and `play.py`'s own `home/status` re-read disagreed with the guard about
+    wild predators, which is how a wolverine could block a start that
+    `--ignore-hostile all` could not unblock.
+    """
+
+    STOPPED = {"success": True, "active": False, "epoch": 7,
+               "stopReason": "predator_hunt",
+               "stopDetail": "lynx [predator_hunting_ours] hunting Rosie, "
+                             "a colony animal (19 cells from Finn)",
+               "stopThreats": [{"thingId": "Thing_Lynx4", "pawnId": 4,
+                                "name": "lynx",
+                                "category": "predator_hunting_ours",
+                                "reason": "hunting Rosie, a colony animal",
+                                "stops": True},
+                               {"thingId": "Thing_Wolverine88", "pawnId": 88,
+                                "name": "wolverine", "category": "predator",
+                                "reason": "hunting wildlife, 41 cells from Finn",
+                                "stops": False}]}
+
+    def test_the_predator_ignore_list_reaches_the_companion(self):
+        call = Recorder([{"success": True, "active": True, "epoch": 4,
+                          "baselineAlerts": []}],
+                        status_reply={"epoch": 4, "stopReason": None})
+        config = dict(CONFIG, ignoredPredatorIds="all")
+        with mock.patch.object(play_service, "binding_alive", return_value=True), \
+             mock.patch.object(play_service, "atomic_json", lambda *a, **k: None):
+            play_service.run(
+                config, call=call, runtime_path=Path("runtime.json"),
+                state_path=Path("state.json"), stop_path=Path("no-stop-file"),
+                alive=lambda pid: True, publisher=lambda *a, **k: {"accepted": True},
+                clock=lambda: 1000.0, sleeper=lambda s: None, max_cycles=1)
+        started = [c for c in call.calls if c["op"] == "start"][0]
+        self.assertEqual("all", started["ignoredPredatorIds"])
+        self.assertEqual("", started["ignoredHostileIds"])
+
+    def test_a_start_that_stopped_writes_the_threat_rows_to_the_state_file(self):
+        written = {}
+        call = Recorder([self.STOPPED],
+                        status_reply={"epoch": 7, "stopReason": "predator_hunt"})
+        with mock.patch.object(play_service, "binding_alive", return_value=True), \
+             mock.patch.object(play_service, "atomic_json",
+                               lambda path, value: written.update(value)):
+            with self.assertRaisesRegex(RuntimeError, "stopped during start"):
+                play_service.run(
+                    CONFIG, call=call, runtime_path=Path("runtime.json"),
+                    state_path=Path("state.json"), stop_path=Path("no-stop-file"),
+                    alive=lambda pid: True,
+                    publisher=lambda *a, **k: {"accepted": True},
+                    clock=lambda: 1000.0, sleeper=lambda s: None, max_cycles=1)
+        self.assertEqual("Thing_Lynx4", written["stopThreats"][0]["thingId"])
+        self.assertEqual("predator_hunting_ours",
+                         written["stopThreats"][0]["category"])
+        # The non-stopping row travels too: the refusal lists what was
+        # considered, not only what blocked.
+        self.assertEqual("predator", written["stopThreats"][1]["category"])
+        self.assertIs(False, written["stopThreats"][1]["stops"])
+        # It is not READY: the rows are evidence for the refusal, not a start.
+        self.assertIs(False, written["ready"])
+
+
 class UnnamedStopTests(unittest.TestCase):
     OK = {"success": True, "active": True, "epoch": 9, "baselineAlerts": []}
 

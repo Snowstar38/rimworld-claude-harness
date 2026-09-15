@@ -102,7 +102,10 @@ class RotaServiceTests(unittest.TestCase):
         kill.assert_not_called()
 
     def test_stream_go_ensures_service(self):
+        # cmd_go also resets the overlay's turn counter; ov.post stubbed so
+        # the reset is not a real POST.
         with mock.patch.object(rota_service, "ensure_started", return_value=(True, "started")) as start, \
+             mock.patch.object(stream.ov, "post", return_value=(True, None)), \
              mock.patch("sys.stdout", new_callable=io.StringIO):
             self.assertEqual(0, stream.cmd_go(None))
         start.assert_called_once_with()

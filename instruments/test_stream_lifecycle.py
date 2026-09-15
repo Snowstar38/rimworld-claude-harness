@@ -308,7 +308,7 @@ class HandsCloseTests(unittest.TestCase):
 
     def test_force_overrides_a_live_heartbeat_and_says_so_in_the_state(self):
         self.beat(age=8)
-        self.assertEqual(0, self.run_close("M says it is gone", force=True)[0])
+        self.assertEqual(0, self.run_close("michelle says it is gone", force=True)[0])
         self.assertEqual("core-forced",
                          json.loads(self.file.read_text())["handsEndedBy"])
 
@@ -484,6 +484,47 @@ class GoResetsTheCounterTests(unittest.TestCase):
         self.assertEqual({}, saved)
         self.assertNotIn("turn counter reset", text)
         self.assertEqual([], posts)
+
+
+class GoalLengthTests(unittest.TestCase):
+    """The two strings below are verbatim from the stream, and the verdicts are
+    what M's OBS captures show the bar actually did with them."""
+
+    FIT = "Five alive at spring thaw -- winter is meat, cooking, and somewhere warm to sleep."
+    CUT = "Hold to spring -- berries, hydroponics, and a colony that farms behind its own wall."
+
+    def test_the_goal_that_rendered_whole_does_not_warn(self):
+        self.assertEqual(82, len(self.FIT))
+        self.assertIsNone(stream.goal_warning(long=self.FIT))
+
+    def test_the_goal_that_rendered_truncated_warns(self):
+        self.assertEqual(84, len(self.CUT))
+        line = stream.goal_warning(long=self.CUT)
+        self.assertIn("84 chars", line)
+        # What the viewer was actually left with on 2026-09-07 11:47.
+        self.assertIn("behind its own wal", line)
+
+    def test_it_names_each_zone_and_stays_quiet_about_empty_ones(self):
+        line = stream.goal_warning(long=self.CUT, short="")
+        self.assertIn("long goal", line)
+        self.assertNotIn("short goal", line)
+
+    def test_setting_goals_warns_before_posting_them(self):
+        args = mock.Mock(long=self.CUT, short=None)
+        with mock.patch.object(stream.ov, "post", return_value=(True, None)), \
+             mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            self.assertEqual(0, stream.cmd_goals(args))
+        # Warned, and still posted -- this names a cost, it does not veto.
+        self.assertIn("and then an ellipsis", out.getvalue())
+
+    def test_a_turn_goal_is_checked_on_the_hands_start_path_too(self):
+        args = mock.Mock(goal=self.CUT)
+        with mock.patch.object(stream, "load", return_value={"turn": 2}), \
+             mock.patch.object(stream, "save"), \
+             mock.patch.object(stream.ov, "post", return_value=(True, None)), \
+             mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            stream.cmd_hands_start(args)
+        self.assertIn("short goal is 84 chars", out.getvalue())
 
 
 if __name__ == "__main__":

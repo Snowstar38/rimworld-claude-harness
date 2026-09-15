@@ -8,7 +8,7 @@ same MCP surface over HTTP (`gabs server http`), so this speaks that directly.
   python rim.py tools          # ALL the live game tool names (every page)
   python rim.py tools --grep cell   # ... only the ones whose name contains "cell"
   python rim.py detail <tool>  # schema for one game tool
-  python rim.py call <tool> '<json args>'
+  python rim.py call <tool> '<json args>' [--out FILE]
   python rim.py g <gabs_tool> '<json args>'   # games_start, games_connect, ...
 
 Add `--say "..."` and `--mood <mood>` to any of these to narrate the call to the
@@ -34,10 +34,9 @@ def _log(row):
     except Exception:
         pass
 
-HARNESS = os.environ.get("RIMWORLD_HARNESS_ROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-ROOT = os.path.join(HARNESS, "bridge")
-GABS = os.path.join(ROOT, "gabs", "gabs.exe")
-CFG = os.path.join(ROOT, "gabs-config")
+ROOT = r"C:\Home\rimworld\bridge"
+GABS = ROOT + r"\gabs\gabs-v1.1.1-windows-amd64\gabs.exe"
+CFG = ROOT + r"\gabs-config"
 URL = "http://127.0.0.1:8080/mcp"
 GAME = "rimworld"
 _id = [0]
@@ -289,16 +288,82 @@ def game(name, args=None, strict=True, timeout=600):
 
 _size = []
 
+# Keys a reply is known to spell the map size under, in the order they are
+# looked for. `mapSize` is what `home/get_cells_plus` emits on every success.
+_SIZE_KEYS = ("mapSize", "map_size", "mapsize", "size", "dimensions")
+_SIZE_PAIRS = (("x", "z"), ("width", "height"), ("w", "h"), ("cols", "rows"),
+               ("X", "Z"))
 
-def map_size():
-    """(width, height) of the current map, probed once.
 
-    Nothing on the bridge reports it, and a scan that runs off the edge used to
-    come back empty rather than erroring -- so an edge-adjacent sweep silently
-    under-reported. Binary-search the boundary instead of assuming 250.
+def parse_size(v):
+    """(width, height) out of any shape a bridge spells a map size in, or None.
+
+    Accepts `{x, z}`, `{width, height}`, `[250, 250]`, the bare `250` a square
+    map is sometimes reported as, and a string such as "250x250".
     """
-    if _size:
-        return _size[0]
+    if v is None or isinstance(v, bool):
+        return None
+    if isinstance(v, int):
+        return (v, v) if v > 0 else None
+    if isinstance(v, (list, tuple)):
+        nums = [n for n in v if isinstance(n, int) and not isinstance(n, bool)]
+        return (nums[0], nums[1]) if len(nums) >= 2 else None
+    if isinstance(v, str):
+        nums = [int(n) for n in re.findall(r"\d+", v)]
+        if len(nums) >= 2:
+            return nums[0], nums[1]
+        return (nums[0], nums[0]) if nums else None
+    if isinstance(v, dict):
+        for a, b in _SIZE_PAIRS:
+            if isinstance(v.get(a), int) and isinstance(v.get(b), int):
+                return v[a], v[b]
+        for k in _SIZE_KEYS:
+            if k in v:
+                got = parse_size(v[k])
+                if got:
+                    return got
+    return None
+
+
+def size_in_reply(r, depth=3):
+    """The map size carried somewhere in a reply, or None. Named keys only.
+
+    A rect echo also has `x`/`z`, so this never reads the top level as a size:
+    it descends only through keys that mean "the map".
+    """
+    if not isinstance(r, dict) or depth < 0:
+        return None
+    for k in _SIZE_KEYS:
+        if k in r:
+            got = parse_size(r[k])
+            if got:
+                return got
+    for k in ("map", "mapInfo", "currentMap", "result", "data"):
+        got = size_in_reply(r.get(k), depth - 1)
+        if got:
+            return got
+    return None
+
+
+def _size_from_plus():
+    """(w, h) from `home/get_cells_plus`, which reports mapSize on every
+    success. One call. None if the companion is not loaded or did not say."""
+    try:
+        r = game("home/get_cells_plus",
+                 {"x": 0, "z": 0, "width": 1, "height": 1, "fields": "terrain"},
+                 strict=False)
+    except Exception:
+        return None
+    return size_in_reply(r)
+
+
+def _size_by_probe():
+    """(w, h) by binary-searching the map edge with `rimworld/get_cell_info`.
+
+    ~20 calls, and the fallback for a bridge with no companion tools. A scan
+    that runs off the edge comes back empty rather than erroring, so an
+    edge-adjacent sweep silently under-reports if this guesses 250.
+    """
     dims = []
     for axis in ("x", "z"):
         lo, hi = 1, 1024
@@ -306,10 +371,27 @@ def map_size():
             mid = (lo + hi + 1) // 2
             args = {"x": 0, "z": 0}
             args[axis] = mid - 1
-            ok = game("rimworld/get_cell_info", args, strict=False).get("success")
-            lo, hi = (mid, hi) if ok else (lo, mid - 1)
+            r = game("rimworld/get_cell_info", args, strict=False)
+            if not isinstance(r, dict):
+                # A prose refusal, or a fragment list from a split reply.
+                # Guessing an edge off this would put a wrong map size behind
+                # every later clamp, so stop where the evidence stops.
+                raise BridgeError(
+                    "rimworld/get_cell_info answered with a %s, not a payload,"
+                    " while probing the map edge at %s=%d: %.200r. Map size"
+                    " unknown -- try `python rim.py call rimworld/get_cell_info"
+                    " '{\"x\":0,\"z\":0}'` to see what the bridge is returning."
+                    % (type(r).__name__, axis, mid - 1, r))
+            lo, hi = (mid, hi) if r.get("success") else (lo, mid - 1)
         dims.append(lo)
-    _size.append(tuple(dims))
+    return tuple(dims)
+
+
+def map_size():
+    """(width, height) of the current map, probed once and cached."""
+    if _size:
+        return _size[0]
+    _size.append(_size_from_plus() or _size_by_probe())
     return _size[0]
 
 
@@ -323,9 +405,16 @@ def main():
     # `--grep <s>` is pulled out before argv[3] is parsed as JSON: `tools --grep
     # cell` used to reach json.loads("cell") and die on the flag it was given.
     argv, needle = list(sys.argv), None
+    out_path = None
     if "--grep" in argv:
         i = argv.index("--grep")
         needle = argv[i + 1] if i + 1 < len(argv) else ""
+        del argv[i:i + 2]
+    if "--out" in argv:
+        i = argv.index("--out")
+        if i + 1 >= len(argv) or not argv[i + 1]:
+            raise SystemExit("--out requires a file path")
+        out_path = argv[i + 1]
         del argv[i:i + 2]
     a = json.loads(argv[3]) if len(argv) > 3 else {}
     if cmd == "tools":
@@ -342,7 +431,12 @@ def main():
         print(json.dumps(tool("games_tool_detail",
                               {"gameId": GAME, "tool": argv[2]}), indent=1))
     elif cmd == "call":
-        print(json.dumps(game(argv[2], a), indent=1)[:8000])
+        rendered = json.dumps(game(argv[2], a), indent=1)
+        if out_path is not None:
+            with open(out_path, "w", encoding="utf-8", newline="") as f:
+                f.write(rendered)
+                f.write(chr(10))
+        print(rendered[:8000])
     elif cmd == "g":
         print(json.dumps(tool(argv[2], a), indent=1)[:8000])
     else:

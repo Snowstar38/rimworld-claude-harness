@@ -22,12 +22,20 @@ listing.
 
   python act.py apply "Mine" 90 120 8 8          # dry run; sizes are positional
   python act.py apply "Mine" 90 120 --size 8 8   # ... or --size, or --width/--height
-  python act.py hunt Alpaca            # resolve the CURRENT cell, dry run
+  python act.py hunt Alpaca            # mark the ANIMAL, dry run
   python act.py hunt Alpaca --do       # read + designate in ONE process
   python act.py tame Fox --do          # same machinery, Tame instead of Hunt
   python act.py allow 120 140 4 4      # unforbid loose items (alias: unforbid)
   python act.py undesignate 120 140 4 4   # Cancel: designations AND blueprints/
                                           # frames; dry, --do applies
+  python act.py undesignate Ibex404123 --do   # ...or the designation on an ANIMAL
+  python act.py uninstall 106 127 --do    # not in the menu; names the gizmo route
+  python act.py mine 106 127              # any label is a verb: apply "Mine"
+  python act.py apply "Mine" 106,127      # x,z is one token or two
+
+Any designator label works as a bare verb -- `act.py mine`, `act.py deconstruct`,
+`act.py haul 120 140` -- with the same arguments `apply "<Label>"` takes.
+`Unforbid` is not a designator; `apply "Unforbid"` says so and runs `allow`.
 
 Every write here is DRY BY DEFAULT and a dry run says so in the words
 `DRY RUN - would designate N cell(s) (nothing applied; add --do)`. The applied
@@ -37,11 +45,20 @@ cannot be scrolled past (turns 5 and 16).
 
 `hunt` exists because animals walk: a cell read by `pawns.py` in one process is
 stale by the time a second process designates it, which is the whole of
-"Must designate huntable animals" on a cell that had an alpaca on it.
+"Must designate huntable animals" on a cell that had an alpaca on it. Since
+2026-09-11 it does not aim at a cell at all: Hunt, Tame, Slaughter and
+ReleaseAnimalToWild are designations the game hangs on the ANIMAL, so
+`hunt`, `tame` and `undesignate <animal>` write them through
+`home/pawn_config`, addressed by ThingID. A cell is then a thing the output
+mentions, not a thing the write depends on. The cell designator is still there
+as a fallback for a companion DLL older than that field (`unknownArguments`
+names it), and `undesignate <x> <z>` is still the cell form for everything that
+really does sit on a cell.
 """
 import argparse
 import difflib
 import json
+import re
 import sys
 
 import pick
@@ -253,6 +270,17 @@ def paints(label):
     return None
 
 
+def _resolves(label):
+    """Does this label name a designator at all? Ambiguity counts as yes."""
+    try:
+        designator(label)
+        return True
+    except KeyError:
+        return _bare(label) in _ambiguous
+    except Exception:
+        return False
+
+
 def labels():
     """Every bare label, plus the ambiguous ones with their categories."""
     if not _cache:
@@ -372,7 +400,10 @@ def _cell_note(bare, want, cell, reason=""):
         # for a real refusal -- three sightings, turns 6, 12 and 14.
         if names or any(t.get("isBlueprint") or t.get("isFrame") for t in things):
             return None
-        return ("noop", "nothing to cancel (built, no blueprint/designation)")
+        advice = cell_advice(cell.get("x"), cell.get("z"), cell)
+        return ("noop", "nothing to cancel -- %s"
+                % (advice or "this cell is empty: no designation, no blueprint, "
+                             "no frame, nothing standing"))
     if want and want.lower() in names:
         pass                                  # handled below, before the rest
     elif bare in ("haul things", "haul"):
@@ -454,10 +485,13 @@ def _noop_reason(label, result, x, z, w, h, notes=None):
         return None
     if _bare(label) == "cancel":
         if len(noop) == 1:
-            return ("nothing to cancel at %s,%s (built, no "
-                    "blueprint/designation)" % noop[0])
-        return ("nothing to cancel at %d cell(s) (built, no "
-                "blueprint/designation): %s"
+            return "nothing to cancel at %s,%s -- %s" % (
+                noop[0][0], noop[0][1],
+                (notes.get(noop[0]) or ("", ""))[1].replace(
+                    "nothing to cancel -- ", "")
+                or "no designation, no blueprint, no frame")
+        return ("nothing to cancel at %d cell(s) (no designation, no "
+                "blueprint, no frame): %s"
                 % (len(noop), " ".join("%s,%s" % c for c in noop[:SAMPLE])
                    + (" ..." if len(noop) > SAMPLE else "")))
     want = _designation_of(label)
@@ -673,14 +707,12 @@ def _at(rows, p):
     return out
 
 
-def designate_animal(label, token, do=False, every=False):
-    """Resolve an animal's CURRENT cell and designate in the SAME process.
+# The four designations the Animals tab draws, as `home/list_pawns` hoists them.
+ANIMAL_MARKS = ("hunt", "tame", "slaughter", "releaseToWild")
 
-    Animals walk, so a cell read by one `pawns.py` process is already stale
-    when a second process designates it.
 
-    -> [(pawn, result, others in the same cell)]
-    """
+def _match_animals(token, every=False):
+    """(every living animal, the ones this token names). Raises on a miss."""
     rows = _read_animals()
     hits = _animal_matches(token, rows)
     if not hits:
@@ -695,44 +727,183 @@ def designate_animal(label, token, do=False, every=False):
                             (p.get("position") or {}).get("x"),
                             (p.get("position") or {}).get("z"))
                          for p in hits[:SUGGEST])))
+    return rows, hits
+
+
+def marks(p):
+    """The designations standing on this animal, in the game's own spelling."""
+    des = ((p.get("animals") or {}).get("designations") or {})
+    return [k for k in ANIMAL_MARKS if des.get(k)]
+
+
+PAWN_CONFIG = "home/pawn_config"
+
+
+def _config_marks(tid, wanted, do=False):
+    """Write designation marks on ONE animal through `home/pawn_config`.
+
+    `wanted` is `{"hunt": True, "slaughter": False, ...}` -- the field names the
+    tool declares, which are the ones `animals.designations` already reads back.
+    Dry unless `do`.
+
+    -> `(reply, {field: field row})`, or **None** when this bridge's companion
+    DLL predates these fields. That case has to be detected rather than
+    trusted: the host drops an argument a tool does not declare, lists it in
+    `unknownArguments` and answers `success: true` with no field row -- which
+    reads exactly like a write that landed. None means "fall back to the cell
+    designator", not "it failed".
+    """
+    args = {"pawn": tid, "dryRun": not do}
+    args.update({k: ("on" if v else "off") for k, v in wanted.items()})
+    # strict=False: a refused field is the answer, not a fault.
+    reply = rim.game(PAWN_CONFIG, args, strict=False)
+    if not isinstance(reply, dict):
+        return ({"success": False,
+                 "message": "%s replied with a %s, not a payload: %.200s"
+                            % (PAWN_CONFIG, type(reply).__name__, reply)}, {})
+    if reply.get("success") is False:
+        # A tool-level refusal -- the pawn did not resolve, there is no map --
+        # is an answer about this animal, not evidence of an old DLL.
+        return (reply, {})
+    rows = {}
+    for row in reply.get("fields") or []:
+        if isinstance(row, dict) and row.get("field") in wanted:
+            rows[str(row.get("field"))] = row
+    unknown = set(str(u) for u in reply.get("unknownArguments") or [])
+    if unknown & set(wanted) or any(f not in rows for f in wanted):
+        return None
+    return (reply, rows)
+
+
+def _mark_result(p, field, want, do, reply, rows):
+    """One `_config_marks` field row as the reply shape `_print_result` reads.
+
+    `designationOn` is what tells the printer this landed on an animal and not
+    on a rectangle of cells, so it never counts a pawn as `1 cell(s)`.
+    """
+    if reply.get("success") is False:
+        return {"success": False, "designationOn": field,
+                "message": reply.get("message") or reply.get("error")
+                           or "%s refused without saying why" % PAWN_CONFIG}
+    row = rows.get(field) or {}
+    if row.get("refused"):
+        return {"success": False, "designationOn": field,
+                "message": row.get("reason") or "the field was refused with no reason"}
+    if bool(row.get("before")) == bool(want):
+        # Adding a designation that is already there is a Verse.Log.Error,
+        # which pauses the colony; the tool answers with a no-op row instead.
+        return {"success": True, "dryRun": not do, "alreadyDesignated": True,
+                "message": "already carries the %s designation" % field}
+    return {"success": True, "dryRun": not do, "designationOn": field,
+            "acceptedCellCount": 1, "rejectedCellCount": 0,
+            "alsoRemoved": list(row.get("alsoRemoved") or [])}
+
+
+def _designate_by_cell(label, p, rows, do=False):
+    """The pre-2026-09-11 route: aim the architect designator at the animal's
+    CURRENT cell. Only reached when the companion DLL has no `hunt`/`tame`
+    field. A read and a cell designator are separate bridge calls, so a running
+    animal can still cross a cell between them: re-resolve and retry the game's
+    stale-cell refusal, and only that one -- every other refusal is
+    authoritative.
+
+    -> (the pawn as last read, result, the animal rows as last read)
+    """
+    tid = _animal_id(p)
+    result = None
+    for attempt in range(3):
+        if tid:
+            rows = _read_animals()
+            fresh = _animal_matches(tid, rows)
+            if fresh:
+                p = fresh[0]
+        if _standing(p, label):
+            # The game refuses a duplicate with the same sentence it uses
+            # for "not huntable", so say which this is instead of retrying.
+            result = {"success": True, "dryRun": not do,
+                      "alreadyDesignated": True,
+                      "message": "already carries the %s designation" % label}
+            break
+        pos = p.get("position") or {}
+        result = apply(label, pos.get("x"), pos.get("z"), dry=not do)
+        reason = " ".join(str(x.get("reason") or "")
+                          for x in result.get("rejectedCells") or [])
+        message = str(result.get("message") or "")
+        if result.get("success") or "Must designate" not in (reason + " " + message):
+            break
+    return p, result, rows
+
+
+def designate_animal(label, token, do=False, every=False):
+    """Mark one animal for Hunt or Tame, resolved and written in ONE process.
+
+    The designation hangs on the ANIMAL, so this writes it through
+    `home/pawn_config` by ThingID and the animal's position never enters the
+    write. An animal that walked between the read and the write is still the
+    right animal.
+
+    -> [(pawn, result, others in the same cell)]
+    """
+    rows, hits = _match_animals(token, every)
+    field = _bare(label)
     out = []
     for p in hits:
-        # A read and a cell designator are separate bridge calls, so a running
-        # animal can still cross a cell between them. Re-resolve and retry only
-        # the game's stale-cell refusal; every other refusal is authoritative.
         tid = _animal_id(p)
         result = None
-        for attempt in range(3):
-            if tid:
-                rows = _read_animals()
-                fresh = _animal_matches(tid, rows)
-                if fresh:
-                    p = fresh[0]
-            if _standing(p, label):
-                # The game refuses a duplicate with the same sentence it uses
-                # for "not huntable", so say which this is instead of retrying.
-                result = {"success": True, "dryRun": not do,
-                          "alreadyDesignated": True,
-                          "message": "already carries the %s designation" % label}
-                break
-            pos = p.get("position") or {}
-            result = apply(label, pos.get("x"), pos.get("z"), dry=not do)
-            reason = " ".join(str(x.get("reason") or "")
-                              for x in result.get("rejectedCells") or [])
-            message = str(result.get("message") or "")
-            if result.get("success") or "Must designate" not in (reason + " " + message):
-                break
+        if tid and field in ANIMAL_MARKS:
+            got = _config_marks(tid, {field: True}, do=do)
+            if got is not None:
+                result = _mark_result(p, field, True, do, got[0], got[1])
+        if result is None:
+            p, result, rows = _designate_by_cell(label, p, rows, do=do)
         out.append((p, result, _at(rows, p)))
     return out
 
 
+def undesignate_animal(token, do=False, every=False):
+    """Clear every Animals-tab designation standing on an ANIMAL.
+
+    Hunt, Tame, Slaughter and ReleaseAnimalToWild hang on the animal rather
+    than on the cell, so the architect `Cancel` designator -- which drives
+    `DesignateSingleCell` -- cannot reach any of them, and `undesignate x z`
+    off an earlier read aims at a cell the animal has already left. This asks
+    `home/pawn_config` to turn each standing mark OFF by ThingID, then reads
+    the animal back: what is reported gone was measured, not inferred from an
+    accepted-cell count.
+
+    -> [(pawn, before, result, after)]
+    """
+    _, hits = _match_animals(token, every)
+    out = []
+    for p in hits:
+        tid = _animal_id(p)
+        before = marks(p)
+        result, after = None, list(before)
+        if before:
+            got = _config_marks(tid, {m: False for m in before}, do=do) if tid else None
+            if got is None:
+                # No hunt/tame field on this bridge: the old cell route, which
+                # reaches none of these, so the survivors are named honestly.
+                pos = p.get("position") or {}
+                result = apply(UNDESIGNATE_DESIGNATOR, pos.get("x"), pos.get("z"),
+                               dry=not do)
+            else:
+                result = got[0]
+            if do and tid:
+                fresh = _animal_matches(tid, _read_animals())
+                if fresh:
+                    after = marks(fresh[0])
+        out.append((p, before, result, after))
+    return out
+
+
 def hunt(token, do=False, every=False):
-    """`Hunt` on an animal's current cell. See `designate_animal`."""
+    """`Hunt` on an animal, by ThingID. See `designate_animal`."""
     return designate_animal("Hunt", token, do=do, every=every)
 
 
 def tame(token, do=False, every=False):
-    """`Tame` on an animal's current cell. See `designate_animal`."""
+    """`Tame` on an animal, by ThingID. See `designate_animal`."""
     return designate_animal("Tame", token, do=do, every=every)
 
 
@@ -786,7 +957,58 @@ def clear():
 # `home/remove_designation`.
 UNDESIGNATE_DESIGNATOR = ("Orders", "Cancel")
 
+# `Designator_Uninstall` is a REVERSE designator in vanilla, not an architect
+# one, so this lookup misses and the refusal names the gizmo route instead.
+UNINSTALL_DESIGNATOR = ("Orders", "Uninstall")
+
 THING_DESIGNATIONS = ("tame", "hunt", "slaughter", "releaseanimaltowild")
+
+
+def _kind_of(thing):
+    """"blueprint", "frame", "pawn", "building" or "thing" for one cell row.
+
+    `className` is the runtime type name off `home/get_cells_plus`.
+    """
+    if thing.get("isBlueprint"):
+        return "blueprint"
+    if thing.get("isFrame"):
+        return "frame"
+    name = str(thing.get("className") or "")
+    if name.startswith("Pawn"):
+        return "pawn"
+    if name.startswith("Building"):
+        return "building"
+    return "thing"
+
+
+def cell_advice(x, z, cell):
+    """What stands at a cell Cancel had nothing to do at, and what removes it.
+
+    "" for a cell that really is empty. "Nothing to cancel" over a wall that
+    finished building is true and reads as "the build never happened", so this
+    says what IS there and names the command that removes it.
+    """
+    things = cell.get("things") or []
+    built = [t for t in things if _kind_of(t) == "building"]
+    pawns = [t for t in things if _kind_of(t) == "pawn"]
+    if built:
+        label = built[0].get("label") or built[0].get("defName") or "building"
+        return ("a finished %s stands at %s,%s -- Cancel does not touch a built "
+                "thing. To remove it: `python act.py deconstruct %s %s --do` "
+                "(the materials come back in part), or `python act.py uninstall "
+                "%s %s --do` if it minifies, which keeps it whole."
+                % (label, x, z, x, z, x, z))
+    if pawns:
+        label = pawns[0].get("label") or pawns[0].get("defName") or "an animal"
+        return ("%s stands at %s,%s -- Hunt, Tame and Slaughter sit on the "
+                "ANIMAL, not on the cell: `python act.py undesignate %s --do`."
+                % (label, x, z, label))
+    if things:
+        return ("%s at %s,%s -- nothing here carries a designation and nothing "
+                "is being built." % (", ".join(sorted({
+                    str(t.get("label") or t.get("defName")) for t in things}))[:120],
+                    x, z))
+    return ""
 
 
 def designations_in(x, z, w=1, h=1, grid=None):
@@ -845,12 +1067,19 @@ def undesignate(x, z, w=1, h=1, do=False):
 
     Dry by default. Everything in `removed` / `left` / `leftPending` is read
     off the map afterwards, never inferred from the designator's own
-    accepted-cell count.
+    accepted-cell count. `standing` carries what the cells hold, so a rectangle
+    with nothing to cancel can say what IS there instead of only what is not.
     """
     grid = cells(x, z, w, h, fields="designations,things")
     found = designations_in(x, z, w, h, grid=grid)
     pending = pending_in(x, z, w, h, grid=grid)
+    standing = []
+    for c in grid or []:
+        line = cell_advice(c.get("x"), c.get("z"), c)
+        if line:
+            standing.append(line)
     report = {"dryRun": not do, "found": found, "pending": pending,
+              "standing": standing,
               "removed": [], "removedPending": [], "left": [],
               "leftPending": [], "result": None}
     if not do or not (found or pending):
@@ -884,9 +1113,16 @@ def _print_undesignate(report):
     n_found = sum(len(names) for _, _, names in found)
     if not found and not pending:
         print("nothing to cancel in this rectangle: no designations, no "
-              "blueprints, no frames. (Cancel removes all three; if something "
-              "here still needs removing it is not one of them -- a built "
-              "thing wants Deconstruct, and Tame/Hunt sit on the ANIMAL.)")
+              "blueprints, no frames. Cancel removes those three and nothing "
+              "else.")
+        standing = report.get("standing") or []
+        for line in standing[:SAMPLE]:
+            print("  " + line)
+        if len(standing) > SAMPLE:
+            print("  (+%d more cell(s) with something standing on them)"
+                  % (len(standing) - SAMPLE))
+        if not standing:
+            print("  every cell read is empty -- nothing stands here at all.")
         return 0
     if report["dryRun"]:
         print("DRY RUN - would cancel %d designation(s) in %d cell(s) and %d "
@@ -912,11 +1148,102 @@ def _print_undesignate(report):
         print("  !! still designated at %s,%s -- %s%s"
               % (x, z, ", ".join(names),
                  "   (that designation sits on the ANIMAL, not the cell; the "
-                 "Cancel designator cannot reach it -- the bridge has no "
-                 "remove_designation op, see BUGS.md)" if thingy else ""))
+                 "Cancel designator cannot reach it. The write that does: "
+                 "`python act.py undesignate <animal> --do`, which clears it "
+                 "through home/pawn_config by ThingID)" if thingy else ""))
     for x, z, label, kind in left_pending:
         print("  !! %s still standing at %s,%s -- %s" % (kind, x, z, label))
     return 0 if not (left or left_pending) else 1
+
+
+# ------------------------------------------------------------------ uninstall --
+# `Designator_Uninstall` is what keeps a minifiable building whole; Deconstruct
+# is the lossy route. Vanilla puts it in no Architect category, so this tries
+# the menu and hands over to the gizmo route when it is not there.
+
+
+def uninstall(x, z, do=False):
+    """Designate the building at one cell for uninstall. -> the apply reply."""
+    return apply(UNINSTALL_DESIGNATOR, x, z, dry=not do)
+
+
+def uninstall_target(token):
+    """(x, z, label) for a thingId, or None when nothing on the map is it."""
+    target = pick.resolve(token)
+    pos = (target or {}).get("position") or {}
+    if pos.get("x") is None or pos.get("z") is None:
+        return None
+    return (pos.get("x"), pos.get("z"),
+            target.get("label") or target.get("defName") or token)
+
+
+NO_UNINSTALL = (
+    "Uninstall is not in the architect menu at all -- it is a REVERSE "
+    "designator, which the inspect grid adds to a SELECTED thing's bar. The "
+    "route is `python buildings.py gizmo <thingId> \"Uninstall\" --do`, which "
+    "selects the thing, lists the whole bar and clicks the real button; "
+    "`python buildings.py <x>,<z>` gives you the thingId. A thing whose "
+    "selected bar carries no Uninstall is not minifiable -- a cooler is not, a "
+    "heater is -- and deconstruct is then the only removal, at the cost of "
+    "part of the materials.")
+
+
+def _mark_refusals(result):
+    """{field: reason} for every field `home/pawn_config` would not write."""
+    out = {}
+    for row in (result or {}).get("fields") or []:
+        if isinstance(row, dict) and row.get("refused") and row.get("reason"):
+            out[str(row.get("field"))] = str(row.get("reason"))
+    return out
+
+
+def _print_undesignate_animal(results, do, as_json=False):
+    """The animal form of `undesignate`. -> 0 when nothing survived."""
+    if as_json:
+        print(json.dumps([{"animal": p.get("name") or p.get("defName"),
+                           "thingId": _animal_id(p), "before": before,
+                           "after": after, "result": result}
+                          for p, before, result, after in results], indent=1))
+        return 0
+    rc = 0
+    for p, before, result, after in results:
+        pos = p.get("position") or {}
+        name = p.get("name") or p.get("defName")
+        print("%s (%s) at %s,%s" % (name, _animal_id(p), pos.get("x"), pos.get("z")))
+        if not before:
+            print("  NO-OP: no Hunt, Tame, Slaughter or release designation "
+                  "stands on this animal -- there is nothing to cancel.")
+            continue
+        if not do:
+            print("  DRY RUN - would cancel %s at %s,%s (nothing applied; add "
+                  "--do)" % (", ".join(before), pos.get("x"), pos.get("z")))
+            continue
+        gone = [m for m in before if m not in after]
+        if gone:
+            print("  CANCELLED %s (read back off the animal)" % ", ".join(gone))
+        why = _mark_refusals(result)
+        for mark in after:
+            rc = 1
+            if mark in why:
+                print("  !! %s still stands -- %s" % (mark, why[mark]))
+            elif (result or {}).get("fields") is not None:
+                print("  !! %s still stands even though home/pawn_config "
+                      "reported no refusal -- re-read it with `python pawns.py "
+                      "%s --animals` before trusting either answer."
+                      % (mark, _animal_id(p)))
+            else:
+                # The fallback route ran: this bridge's companion DLL has no
+                # hunt/tame field, so the Cancel designator was all there was
+                # and it reaches none of these.
+                print("  !! %s still stands -- the Cancel designator cannot "
+                      "reach a designation that sits on the ANIMAL, and this "
+                      "bridge's home/pawn_config has no %s field. Reinstall "
+                      "the companion DLL (rimworld\\companion\\INSTALL.md); "
+                      "`python pawns.py set %s --%s off --do` is the route for "
+                      "slaughter and releaseToWild meanwhile."
+                      % (mark, mark, _animal_id(p),
+                         "slaughter" if mark == "slaughter" else "releasetowild"))
+    return rc
 
 
 def _counts(result):
@@ -933,7 +1260,23 @@ def _counts(result):
     return (len(took) if a is None else a, len(lost) if r is None else r)
 
 
-def _print_result(result, as_json=False, dry=None, notes=None):
+
+def _slaughter_route(message, animal_id):
+    """The CLI line for "this animal is ours", not the raw bridge write.
+
+    Live 2026-09-12: `act.py hunt` on a colony animal refused correctly and
+    then spelled the route as `home/pawn_config {pawn, slaughter:"on"}` -- a
+    bridge payload, not something you can paste. PLAYBOOK and BUGS.md both
+    promise `pawns.py set <id> --slaughter on --do`, so say that.
+    """
+    if not message or "slaughter" not in message.lower():
+        return []
+    return ["   the pasteable form of that: python pawns.py set %s "
+            "--slaughter on --do" % (animal_id or "<animal-id>")]
+
+
+def _print_result(result, as_json=False, dry=None, notes=None,
+                  animal_id=None):
     """The one line that says whether anything happened. `dry` is the CALLER's
     intent and outranks the reply, because the reply has come back without a
     `dryRun` field and a missing one used to read as "applied" (turn 5/16).
@@ -948,6 +1291,22 @@ def _print_result(result, as_json=False, dry=None, notes=None):
         return 1 if result.get("success") is False else 0
     if result.get("alreadyDesignated"):
         print("NO-OP: %s" % result.get("message"))
+        return 0
+    mark = result.get("designationOn")
+    if mark and result.get("success"):
+        # A designation the game hangs on the ANIMAL. There is no rectangle in
+        # it, so counting cells here would be a made-up number.
+        if dry is None:
+            dry = bool(result.get("dryRun"))
+        if dry:
+            print("DRY RUN - would designate %s on this ANIMAL (nothing "
+                  "applied; add --do)" % mark)
+        else:
+            print("APPLIED %s to this ANIMAL (read back off the animal)" % mark)
+        for cleared in result.get("alsoRemoved") or []:
+            print("  also cleared %s -- Designator_%s clears every other "
+                  "designation on the animal before adding its own"
+                  % (cleared, mark.capitalize()))
         return 0
     said = result.get("dryRun")
     if dry is None:
@@ -972,8 +1331,10 @@ def _print_result(result, as_json=False, dry=None, notes=None):
         else:
             print("APPLIED %d cell(s); %s" % (accepted, tail))
     else:
-        print("REFUSED: %s" % (result.get("message") or
-                               "no requested cell was accepted"))
+        message = result.get("message") or "no requested cell was accepted"
+        print("REFUSED: %s" % message)
+        for row in _slaughter_route(message, animal_id):
+            print(row)
     for cell in result.get("rejectedCells") or []:
         key = (cell.get("x"), cell.get("z"))
         kind, text = notes.get(key) or (None, None)
@@ -1046,6 +1407,36 @@ def _rect(ns, parser):
             1 if ns.height is None else ns.height)
 
 
+KNOWN_COMMANDS = ("apply", "clear", "hunt", "tame", "allow", "unforbid",
+                  "undesignate", "undesignate-animal", "uninstall", "labels")
+
+_COORD = re.compile(r"^(-?\d+)\s*,\s*(-?\d+)$")
+
+
+def _is_number(token):
+    return str(token).lstrip("-").isdigit()
+
+
+def expand_argv(argv):
+    """Two spellings folded into the one grammar.
+
+    `106,127` is one token to a person and two coordinates to argparse, and
+    every designator label is a verb: `act.py mine 106 127` is `act.py apply
+    "Mine" 106 127`. A leading token that is not a command becomes `apply`'s
+    label, so a typo still gets the designator lookup's own near-miss list.
+    """
+    out = []
+    for a in argv:
+        m = _COORD.match(str(a))
+        if m:
+            out.extend([m.group(1), m.group(2)])
+        else:
+            out.append(a)
+    if out and not str(out[0]).startswith("-") and out[0] not in KNOWN_COMMANDS:
+        out.insert(0, "apply")
+    return out
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1064,8 +1455,9 @@ def main(argv=None):
     ap.add_argument("--json", action="store_true")
     sub.add_parser("clear", help="drop the currently armed designator")
     for verb, what in (("hunt", "Hunt"), ("tame", "Tame")):
-        hp = sub.add_parser(verb, help="designate %s on an animal's CURRENT cell" % what)
-        hp.add_argument("animal", help="name, defName, kindDef or thingId")
+        hp = sub.add_parser(verb, help="mark an ANIMAL for %s, by name or thingId" % what)
+        hp.add_argument("animal", nargs="+",
+                        help="one or more: name, defName, kindDef or thingId")
         hp.add_argument("--do", action="store_true", help="designate; default is a dry run")
         hp.add_argument("--all", action="store_true", dest="every",
                         help="every animal the name matches, not one")
@@ -1085,38 +1477,122 @@ def main(argv=None):
     dp.add_argument("--do", action="store_true",
                     help="remove them; default is a dry run")
     dp.add_argument("--json", action="store_true")
+    up = sub.add_parser("undesignate-animal", help=argparse.SUPPRESS)
+    up.add_argument("animal", nargs="+")
+    up.add_argument("--do", action="store_true")
+    up.add_argument("--all", action="store_true", dest="every")
+    up.add_argument("--json", action="store_true")
+    ip = sub.add_parser("uninstall",
+                        help="Uninstall a minifiable building (keeps it whole)")
+    ip.add_argument("target", nargs="+", help="x z, x,z, or a thingId")
+    ip.add_argument("--do", action="store_true",
+                    help="designate; default is a dry run")
+    ip.add_argument("--json", action="store_true")
     lp = sub.add_parser("labels", help="the whole designator menu")
     lp.add_argument("word", nargs="?", help="substring filter")
+    argv = expand_argv(list(sys.argv[1:] if argv is None else argv))
+    first = next((a for a in argv[1:] if not str(a).startswith("-")), None)
+    if argv and argv[0] == "undesignate" and first is not None and not _is_number(first):
+        # `undesignate <animal>`: the designation is on the ANIMAL, and the
+        # animal has moved since whatever read named this cell.
+        argv = ["undesignate-animal"] + argv[1:]
     ns = parser.parse_args(argv)
 
     rim.init()
     if ns.command == "labels":
         word = (ns.word or "").lower()
-        for label, note in labels():
-            if word in label.lower():
-                print("  %s%s" % (label, note))
+        rows = [(l, n) for l, n in labels() if word in l.lower()]
+        for label, note in rows:
+            print("  %s%s" % (label, note))
+        if not rows:
+            # A miss used to print the filtered list -- which is empty -- and
+            # nothing else, so the command answered a typo with a blank screen.
+            close = suggest(word) if word else []
+            print("no label matches %r (%d labels on this bridge)"
+                  % (ns.word or "", len(labels())))
+            if close:
+                print("  nearest: %s" % ", ".join(str(c) for c in close))
+            else:
+                print("  nothing close. `python act.py labels` lists them all.")
+            return 1
         return 0
     if ns.command in ("hunt", "tame"):
-        try:
-            results = designate_animal(ns.command.capitalize(), ns.animal,
-                                       do=ns.do, every=ns.every)
-        except KeyError as ex:
-            parser.error(str(ex.args[0] if ex.args else ex))
+        # One process, several animals. A miss on one token is reported
+        # against that token and the rest still run: each answer is separate.
         rc = 0
-        for p, result, others in results:
-            pos = p.get("position") or {}
-            print("%s %s (%s) at %s,%s"
-                  % (ns.command.upper() if ns.do else "would " + ns.command,
-                     p.get("name") or p.get("defName"), _animal_id(p),
-                     pos.get("x"), pos.get("z")))
-            if others:
-                print("  also on %s,%s: %s -- a refusal from this cell can name "
-                      "any of them, not the one asked for"
-                      % (pos.get("x"), pos.get("z"),
-                         ", ".join("%s %s" % (o.get("name") or o.get("defName"),
-                                              _animal_id(o))
-                                   for o in others[:SUGGEST])))
-            rc |= _print_result(result, dry=not ns.do)
+        for token in ns.animal:
+            if len(ns.animal) > 1:
+                print("-- %s" % token)
+            try:
+                results = designate_animal(ns.command.capitalize(), token,
+                                           do=ns.do, every=ns.every)
+            except KeyError as ex:
+                if len(ns.animal) == 1:
+                    parser.error(str(ex.args[0] if ex.args else ex))
+                print("REFUSED: %s" % (ex.args[0] if ex.args else ex))
+                rc = 1
+                continue
+            for p, result, others in results:
+                pos = p.get("position") or {}
+                print("%s %s (%s) at %s,%s"
+                      % (ns.command.upper() if ns.do else "would " + ns.command,
+                         p.get("name") or p.get("defName"), _animal_id(p),
+                         pos.get("x"), pos.get("z")))
+                if others:
+                    print("  also on %s,%s: %s -- a refusal from this cell can "
+                          "name any of them, not the one asked for"
+                          % (pos.get("x"), pos.get("z"),
+                             ", ".join("%s %s" % (o.get("name") or o.get("defName"),
+                                                  _animal_id(o))
+                                       for o in others[:SUGGEST])))
+                rc |= _print_result(result, dry=not ns.do,
+                                    animal_id=_animal_id(p))
+        return rc
+    if ns.command == "undesignate-animal":
+        rc = 0
+        for token in ns.animal:
+            try:
+                results = undesignate_animal(token, do=ns.do, every=ns.every)
+            except KeyError as ex:
+                print("REFUSED: %s" % (ex.args[0] if ex.args else ex))
+                rc = 1
+                continue
+            rc |= _print_undesignate_animal(results, ns.do, as_json=ns.json)
+        return rc
+    if ns.command == "uninstall":
+        if all(_is_number(t) for t in ns.target):
+            if len(ns.target) != 2:
+                parser.error("uninstall takes `x z`, `x,z` or one thingId; got %s"
+                             % " ".join(ns.target))
+            x, z, label = int(ns.target[0]), int(ns.target[1]), None
+        else:
+            if len(ns.target) != 1:
+                parser.error("uninstall takes ONE thingId, or `x z`; got %s"
+                             % " ".join(ns.target))
+            found = uninstall_target(ns.target[0])
+            if found is None:
+                parser.error("nothing on the map has the id %r "
+                             "(python buildings.py --near <x> <z> <r> lists ids)"
+                             % ns.target[0])
+            x, z, label = found
+            print("%s is at %s,%s" % (label, x, z))
+        try:
+            result = uninstall(x, z, do=ns.do)
+        except KeyError:
+            print("REFUSED: %s" % NO_UNINSTALL)
+            return 1
+        if ns.json:
+            print(json.dumps(result, indent=1))
+            return 0 if result.get("success") else 1
+        notes = _rejected_notes(UNINSTALL_DESIGNATOR, result, x, z, 1, 1)
+        rc = _print_result(result, dry=not ns.do, notes=notes)
+        accepted, _ = _counts(result)
+        if accepted and ns.do:
+            print("  the building stands until a builder does the job; it comes "
+                  "back as a minified item, not as materials.")
+        elif not accepted:
+            print("  Uninstall only takes a MINIFIABLE building of ours. "
+                  "`python buildings.py <x>,<z>` says what is on the cell.")
         return rc
     if ns.command == "clear":
         selected = clear()
@@ -1139,6 +1615,18 @@ def main(argv=None):
         return _print_undesignate(report)
     label = (ns.category, ns.label) if ns.category else ns.label
     w, h = _rect(ns, parser)
+    if _bare(label) in ("unforbid", "allow") and not _resolves(label):
+        # There is no Unforbid designator: Forbid is one, and its opposite is
+        # the per-thing Allow toggle, which is what `act.py allow` fires.
+        print("REDIRECT: there is no %r designator. Unforbidding is the "
+              "per-thing Allow toggle -- running `python act.py allow %s %s %s "
+              "%s%s` instead."
+              % (ns.label, ns.x, ns.z, w, h, " --do" if ns.do else ""))
+        report = allow(ns.x, ns.z, w, h, do=ns.do)
+        if ns.json:
+            print(json.dumps(report, indent=1))
+            return 0
+        return _print_allow(report)
     if ns.do:
         # `build.py` leaves a placement designator armed, and an armed
         # designator swallows the click the next gizmo call needs (turn 10).

@@ -3,30 +3,45 @@ import io
 import unittest
 from unittest.mock import patch
 
+import buildings
 import mini_install as mini
 
 
 class MiniInstallTests(unittest.TestCase):
     def run_install(self, *, do=True, kind="RimWorld.MinifiedThing", armed=False,
-                    ids=None, to=None, placed=None):
+                    ids=None, to=None, placed=None, armed_after=None):
         calls = []
+        # The designator is read twice in one operation: once BEFORE any click
+        # (an armed one refuses outright) and once after a placing click that
+        # was not confirmed, where a surviving designator means the game
+        # refused the cell. `armed_after` is that second answer.
+        designator_reads = []
         ids = iter(ids if ids is not None else ["Thing_MinifiedThing42"] * 2)
-        # placed: what `home/get_cells_plus` reports at the destination,
-        # before and after the placing click.
+        # placed: what `home/list_buildings` reports at the destination, one
+        # entry per read -- the first is the "before" snapshot, the rest are
+        # the polls after the placing click.
         placed = iter(placed if placed is not None
-                      else [[], [{"isBlueprint": True, "label": "turret (blueprint)"}]])
+                      else [[], [{"isBlueprint": True, "label": "turret",
+                                  "thingId": "Thing_Blueprint9",
+                                  "position": {"x": 120, "z": 140},
+                                  "workLeftText": "3"}]])
 
         def game(tool, args, **kw):
             calls.append((tool, args))
-            if tool == "home/get_cells_plus":
-                return {"success": True,
-                        "cells": [{"x": args["x"], "z": args["z"],
-                                   "things": next(placed)}]}
+            if tool == "home/list_buildings":
+                try:
+                    rows = next(placed)
+                except StopIteration:
+                    rows = []
+                return {"success": True, "buildings": rows}
             if tool.endswith("get_map_target_info"):
                 return {"success": True, "target": {"className": kind, "spawned": True,
                         "thingId": "Thing_MinifiedThing42", "position": {"x": 3, "z": 4}}}
             if tool.endswith("get_designator_state"):
-                return {"success": True, "designatorState": {"hasSelection": armed}}
+                designator_reads.append(1)
+                held = (armed if len(designator_reads) == 1 or armed_after is None
+                        else armed_after)
+                return {"success": True, "designatorState": {"hasSelection": held}}
             if tool.endswith("get_selection_semantics"):
                 return {"success": True, "selectedCount": 1,
                         "selectedObjects": [{"id": next(ids)}]}
@@ -39,7 +54,9 @@ class MiniInstallTests(unittest.TestCase):
         out = io.StringIO()
         moved = []
         with patch.object(mini.rim, "game", side_effect=game), \
+             patch.object(buildings.rim, "game", side_effect=game), \
              patch.object(mini.time, "sleep"), \
+             patch.object(buildings.time, "sleep"), \
              patch.object(mini.pick, "ensure_camera",
                           side_effect=lambda x, z, **kw: moved.append((x, z))), \
              contextlib.redirect_stdout(out):
@@ -96,11 +113,57 @@ class MiniInstallTests(unittest.TestCase):
         self.assertEqual([(3, 4), (120, 140)], self.moved)
         clicks = [args for tool, args in calls if tool.endswith("click_cell")]
         self.assertEqual({"x": 120, "z": 140}, clicks[-1])
-        self.assertIn("INSTALL PLACED", self.printed)
+        self.assertIn("PLACED -- CONFIRMED", self.printed)
 
-    def test_a_placing_click_that_left_no_blueprint_is_a_failure(self):
-        calls, error = self.run_install(to=[120, 140], placed=[[], []])
-        self.assertIn("left NO blueprint", error)
+    def test_a_blueprint_the_first_read_missed_is_still_confirmed(self):
+        """WEIRD 12/17/35/43/59: the click returns before the game has spawned
+        the blueprint, so one read straight after it saw an empty cell."""
+        calls, error = self.run_install(
+            to=[120, 140],
+            placed=[[], [], [], [{"isBlueprint": True, "label": "turret",
+                                  "thingId": "Thing_Blueprint9",
+                                  "position": {"x": 120, "z": 140},
+                                  "workLeftText": "3"}]])
+        self.assertIsNone(error)
+        self.assertIn("PLACED -- CONFIRMED", self.printed)
+        self.assertIn("Seen on read 3 of 4", self.printed)
+
+    def test_nothing_seen_never_says_the_cell_is_empty(self):
+        calls, error = self.run_install(to=[120, 140], placed=[[], [], [], [], []])
+        self.assertIn("not confirmed", error)
+        self.assertIn("NOT VISIBLE YET", self.printed)
+        self.assertIn("--near 120 140 2 --every", self.printed)
+        self.assertNotIn("the cell reads empty", self.printed)
+        # Nothing armed afterwards: this really is "not seen", so the refusal
+        # sentence must NOT appear.
+        self.assertNotIn("REFUSED BY THE GAME", self.printed)
+
+    def test_a_surviving_designator_is_named_as_a_refusal_and_cleared(self):
+        # Live 2026-09-12: a 3x3 holding platform sent to a cell whose footprint
+        # overlapped a blueprint. The game refused the click and the old code
+        # called it "not visible yet" while leaving the designator armed.
+        cleared = []
+        with patch.object(mini, "drop_designator",
+                          side_effect=lambda: cleared.append(True)):
+            calls, error = self.run_install(to=[120, 140], armed=False,
+                                            armed_after=True,
+                                            placed=[[], [], [], [], []])
+        self.assertIn("not confirmed", error)
+        self.assertIn("REFUSED BY THE GAME", self.printed)
+        self.assertIn("STILL ARMED", self.printed)
+        self.assertIn("build.py <def> 120 140", self.printed)
+        self.assertEqual([True], cleared)
+
+    def test_something_else_at_the_cell_gets_its_own_sentence(self):
+        wall = [{"defName": "Wall", "label": "sandstone wall",
+                 "thingId": "Thing_Wall3", "status": "built",
+                 "position": {"x": 120, "z": 140}}]
+        calls, error = self.run_install(to=[120, 140],
+                                        placed=[wall, wall, wall, wall, wall])
+        self.assertIn("not confirmed", error)
+        self.assertIn("NOT PLACED -- SOMETHING ELSE IS THERE", self.printed)
+        self.assertIn("sandstone wall", self.printed)
+        self.assertNotIn("NOT VISIBLE YET", self.printed)
 
     def test_the_destination_dry_run_writes_nothing(self):
         calls, error = self.run_install(do=False, to=[120, 140])

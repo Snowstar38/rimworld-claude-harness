@@ -10,7 +10,22 @@
   python ui.py close              # close whatever main tab is open (close_main_tab)
   python ui.py click "OK"         # click by visible text; prints what changed
   python ui.py main-tab:Work click "Firefighter"   # ... scoped to one surface
+  python ui.py click --index 2    # click the 3rd TEXT-FREE button (see the read)
+  python ui.py targeter           # is a map click being read as a TARGET?
+  python ui.py targeter --cancel  # close one (by deselecting), and confirm
+  python ui.py click --rect 1200,800,180,180      # ... or by its rectangle
   (--full = no text truncation, --json = the structure, --raw = raw byte count)
+
+## Buttons with no text
+
+An image button -- a storyteller portrait -- draws no label, so there is no text
+to click it by. The read lists every such element with its rectangle and a
+number, and `click --index N` / `click --rect x,y,w,h` press one through the
+bridge from the same capture that numbered it. `click.py <x> <y>` is the real
+mouse, for the two surfaces `get_ui_layout` cannot see at all.
+
+A radio or option-tile row prints `[x]` or `[ ]` when the bridge reports its
+selection state. Older bridge builds leave the state unknown as `[?]`.
 
 ## Opening a tab to READ it
 
@@ -31,6 +46,44 @@ RimWorld's IMGUI draws a label and an invisible button as separate elements, so
 `get_ui_layout` reports the readable text with `actionable: false` and the thing
 you can actually click with `label: null`. Matching on the label alone silently
 finds nothing clickable. This pairs them by rectangle overlap.
+
+## The gizmo bar goes by the real mouse
+
+`rimworld/click_ui_target` fires a gizmo perfectly well -- it injects a
+MouseDown/MouseUp inside the patched `Widgets.ButtonInvisible` and forces the
+return to true, `Command.GizmoOnGUIInt` sets `Interacted`, and
+`GizmoGridDrawer` calls `ProcessInput`. What it does NOT do is move the OS
+cursor. So a gizmo that opens a TARGETER -- `Command_VerbTarget` /
+`Command_Target`, e.g. "Deploy turret" on a worn turret pack -- comes up with
+its placement ghost wherever the physical mouse was parked, because
+`Targeter.CurrentTargetUnderMouse` reads `UI.MousePositionOnUIInverted`. And a
+targeter is not a Window, so the window-stack diff on both sides of the click
+(the bridge's own `changed`, and `_signature` here) is identical before and
+after: the click reported "nothing opened or closed" while the targeter sat
+open and invisible. That cost fourteen turns live on 2026-09-08.
+
+So: **an element on the `selection-gizmos` surface is clicked with the real
+mouse** (`click.py`, one click, no synthesis), and every click now reads
+`home/status`'s `ui.targeter` back when it might matter. `--bridge` forces the
+old path, `--pixel` forces the mouse for anything else.
+
+Once a targeter is open, **`order.py deploy` is the route that places things**.
+Live on Threadneedle 2026-09-11 a synthetic Escape and a synthetic right-click
+both left the targeter standing -- neither reaches
+`Targeter.ProcessInputEvents`, where the cancel keybinding and the right-button
+test live -- and a real map click at a cell that passed both of `order.py
+deploy`'s gates was swallowed. That third one had two causes under it, both now
+addressed in `click.py`: the window was not verifiably in the foreground, and
+Unity reads the target cell from the mouse position it last received, so a
+`ValidateTarget` computed at a stale cell fails and `ProcessInputEvents` answers
+with `Event.current.Use(); return;` -- eaten, targeter still open. `click.py
+--cell` now verifies focus, moves twice, and reads `ui.targeter` back on both
+sides, so it says `TARGETER CLOSED` or `TARGETER STILL OPEN` instead of
+guessing. Until that is confirmed live, deploy with `order.py deploy`.
+
+`ui.py targeter --cancel` is the route that closes one, and it works by clearing
+the selection, because `Targeter.ConfirmStillValid` calls `StopTargeting()` the
+moment the caster stops being selected.
 
 ## The slim read
 
@@ -54,6 +107,9 @@ matches too, and a line cut at `_TRUNC` still clicks by prefix). Pass `surface=`
 to `click` / `find` / `row_toggle` to scope the act to the surface you read.
 """
 import json, re, sys, time, rim
+# The OS-pixel size of the RimWorld window, shared with the cell->pixel
+# converter so the two never disagree about what screen they aim at.
+from cell2px import SCREEN
 
 # Rich-text markup RimWorld puts in pawn labels ("Finn<color=#999999FF>, Illu...").
 # Nothing else in the stack strips it; a reader should not have to read it.
@@ -79,6 +135,32 @@ def _norm(label):
     return " / ".join(p for p in lines if p)
 
 
+def printed_text(label):
+    """The printed form of a label, under a public name.
+
+    `slim` prints this and `find` matches it, so a caller holding a raw string
+    from somewhere else -- a letter's `DiaOption.text`, say -- passes it through
+    here to get the text a click will land on.
+    """
+    return _norm(label)
+
+
+def supervised_play_alive():
+    """Is the supervised-play service running? True / False / None (unreadable).
+
+    A disk read, no bridge call. It lives beside the things that force-pause the
+    game -- a main tab, a letter dialog -- because the watcher stops on any
+    force pause and nothing else says so.
+    """
+    try:
+        import play
+        import play_service
+        row = play_service.read_json(play_service.SERVICE_STATE) or {}
+        return bool(play.service_alive(row))
+    except Exception:
+        return None
+
+
 def _on_row(row_rect, tog_rect):
     """Does an unlabelled toggle belong to the row at `row_rect`?
 
@@ -92,6 +174,34 @@ def _on_row(row_rect, tog_rect):
     tc = tog_rect["y"] + tog_rect["height"] / 2
     return (tog_rect["y"] <= rc <= tog_rect["y"] + tog_rect["height"]
             or abs(rc - tc) <= _ROW_TOL)
+
+
+_MOUSE = None
+_MOUSE_ERR = None
+
+
+def mouse():
+    """click.py, the real-mouse module beside this one, or None.
+
+    Loaded by PATH rather than by `import click`, because `click` is also a
+    popular pip package and whichever of the two wins would depend on where
+    the caller was run from. It imports winctl, so it can legitimately fail on
+    a machine without it; the reason is kept and printed rather than raised.
+    """
+    global _MOUSE, _MOUSE_ERR
+    if _MOUSE is not None or _MOUSE_ERR is not None:
+        return _MOUSE
+    import importlib.util, os
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "click.py")
+    try:
+        spec = importlib.util.spec_from_file_location("_rimworld_click", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+    except Exception as e:
+        _MOUSE_ERR = "%s: %s" % (type(e).__name__, e)
+        return None
+    _MOUSE = mod
+    return _MOUSE
 
 
 def layout(surface=None, timeout_ms=None):
@@ -206,8 +316,46 @@ def _matches(els, text, exact=True):
     return []
 
 
-def find(text, exact=True, els=None, surface=None):
-    els = list(elements(surface)) if els is None else els
+def _composite_target(payload, text, exact=True):
+    """The actionable behind a row text that slim PRINTED but no label carries.
+
+    slim joins a row's own labels with " " and an inert neighbour on the same
+    line with "  ", so the text a reader copies out of the listing is often a
+    composite of two or three draws and matches no single `label`. Match it
+    against the same rows the reader saw and hand back that row's actionable.
+    `own` is the row before the neighbour was merged in, so both halves work.
+    """
+    want = _norm(text)
+    stem = _TRUNC_MARK.sub("", want).rstrip()
+    for s in (payload.get("surfaces") or []):
+        for row in slim_surface(s, full=True, keep_targets=True).get("rows") or []:
+            if not row.get("_tid"):
+                continue
+            for cand in (row.get("text"), row.get("own")):
+                got = _norm(cand)
+                if not got:
+                    continue
+                if got == want:
+                    return row["_tid"]
+                if len(stem) >= _TRUNC - 3 and got.startswith(stem):
+                    return row["_tid"]
+                if not exact and want and want in got.lower():
+                    return row["_tid"]
+    return None
+
+
+def find(text, exact=True, els=None, surface=None, payload=None):
+    """The targetId to click for `text`, or None. Ids are per-capture.
+
+    Pass `payload` (a whole `get_ui_layout` reply) to let a composite row text
+    resolve as well as a single label -- `click` does, so anything the read
+    printed as clickable can be pasted straight back.
+    """
+    if payload is None and els is None:
+        payload = layout(surface)
+    if els is None:
+        els = [e for s in (payload.get("surfaces") or [])
+               for e in (s.get("elements") or [])]
     labs = _matches(els, text, exact)
     for lab in labs:
         if lab.get("actionable"):
@@ -221,6 +369,8 @@ def find(text, exact=True, els=None, surface=None):
                     and e.get("screenRect") and test(e, lab)]
             if best:
                 return min(best, key=lambda e: e["screenRect"]["width"] * e["screenRect"]["height"])["targetId"]
+    if payload is not None:
+        return _composite_target(payload, text, exact)
     return None
 
 
@@ -231,11 +381,14 @@ def probe(text, radius=40.0, exact=True):
     exists but nothing clickable pairs with it, this is the ONE call that shows
     why -- the geometry, not a guess about it. `python ui.py --probe E`.
     """
-    els = list(elements())
+    raw = layout(None)
+    els = [e for s in (raw.get("surfaces") or []) for e in (s.get("elements") or [])]
     labs = _matches(els, text, exact)
     L = ["PROBE %r: %d label(s) match" % (text, len(labs))]
     if not labs:
         L.append("  no element carries that text: checked, not assumed")
+        for line in _composite_report(raw, text):
+            L.append(line)
     for n, lab in enumerate(labs):
         lr = _rect(lab)
         L.append("  [%d] LABEL %r kind=%s actionable=%s rect=%s"
@@ -264,8 +417,36 @@ def probe(text, radius=40.0, exact=True):
                         ("  text=%r" % (e.get("label") or "").strip()) if e.get("label") else "",
                         ("  PAIRS BY: " + ",".join(tests)) if tests else ""))
         L.append("      centre of the label is %.1f,%.1f" % (lcx, lcy))
-    L.append("find() would return: %r" % find(text, exact, els=els))
+    L.append("find() would return: %r" % find(text, exact, els=els, payload=raw))
+    free = free_actionables(raw)
+    if free:
+        L.append("  %d actionable element(s) on screen carry NO text at all; "
+                 "click one by its place in the read: `python ui.py click "
+                 "--index N`, or `python ui.py click --rect x,y,w,h`." % len(free))
     return '\n'.join(L)
+
+
+def _composite_report(payload, text):
+    """Lines explaining a text slim printed that no single label carries."""
+    want = _norm(text)
+    stem = _TRUNC_MARK.sub("", want).rstrip()
+    for s in (payload.get("surfaces") or []):
+        for row in slim_surface(s, full=True, keep_targets=True).get("rows") or []:
+            got = _norm(row.get("text"))
+            if got != want and not (len(stem) >= _TRUNC - 3 and got.startswith(stem)):
+                continue
+            out = ["  the READ prints it as one row, built from %d separate text"
+                   " draws: %s" % (len(row.get("parts") or [row.get("text")]),
+                                   " | ".join(repr(p) for p in
+                                              (row.get("parts") or [row["text"]])))]
+            if row.get("own"):
+                out.append("  the part that belongs to the button is %r; the rest"
+                           " is a separate label sitting on the same line"
+                           % row["own"])
+            out.append("  it resolves to %s, so click() takes it as printed"
+                       % (row.get("_tid") or "NOTHING ACTIONABLE"))
+            return out
+    return []
 
 
 def _fmt(r):
@@ -297,6 +478,154 @@ def clickable_texts(payload):
     return sorted(set(out))
 
 
+def free_actionables(payload):
+    """Every actionable element carrying no text, numbered as the read prints them.
+
+    Rows: index, kind, rect, centre, `_tid`. This is the only handle on a
+    text-free button -- the storyteller portraits are three of them -- and the
+    ids are per-capture, so the caller must click from the SAME payload.
+    """
+    sl = slim(payload=payload, full=True, keep_targets=True)
+    return [i for s in sl["surfaces"] for i in s["textFree"]["items"]]
+
+
+def targeter_state():
+    """Find.Targeter as the game reports it. -> (state, why_not).
+
+    `state` is `{"active": bool, "source": <label or None>, "caster": <pawn
+    thingId or None>}` from `home/status`'s ui block, or None with a reason in
+    `why_not` -- an older DLL has no such field, and saying so beats printing
+    "no targeter" for a thing that was never read.
+
+    This is THE read that the window-stack diff cannot do. A targeter opens no
+    window: `modalOpen`, the window list and `_signature` are all blind to it.
+    """
+    try:
+        r = rim.game("home/status", {"colonists": False, "threats": False},
+                     strict=False)
+    except Exception as e:
+        return None, "home/status did not answer (%s: %s)" % (type(e).__name__, e)
+    if not isinstance(r, dict):
+        return None, "home/status returned %s, not an object" % type(r).__name__
+    block = r.get("ui")
+    if not isinstance(block, dict):
+        return None, "home/status returned no ui block"
+    state = block.get("targeter")
+    if not isinstance(state, dict):
+        return None, ("this bridge build's home/status has no ui.targeter field."
+                      " Install the current HomeBridge.BridgeTools.dll"
+                      " (rimworld\\companion\\INSTALL.md) and the targeter"
+                      " becomes readable")
+    return state, None
+
+
+def targeter_line(state, why_not=None):
+    """One human line for a targeter state, for `ui.py targeter` and for a click."""
+    if state is None:
+        return "targeter: NOT READ -- %s" % (why_not or "no reason given")
+    if not state.get("active"):
+        return ("targeter: closed -- nothing on the map is waiting for a target"
+                " click.")
+    who = state.get("caster")
+    return ("targeter: OPEN -- %s%s. The map is in placement mode, and a raw map"
+            " click is swallowed by it -- `python order.py deploy <x> <z> --do`"
+            " is the route that places. `python ui.py targeter --cancel` closes"
+            " it (by clearing the selection)."
+            % (state.get("source") or "unnamed targeting command",
+               (", caster %s" % who) if who else ""))
+
+
+_CANCEL_SETTLE = 0.4
+
+
+def cancel_targeter():
+    """Close an open targeter and read it back. -> (ok, text).
+
+    **Deselecting the caster is the cancel that works.** Live on Threadneedle
+    2026-09-11, with the targeter confirmed open by `ui.targeter`: a synthetic
+    Escape (SendInput) left it standing, and so did a synthetic right-click on
+    the map. Neither reaches `Targeter.ProcessInputEvents`, which is the only
+    place `KeyBindingDefOf.Cancel.KeyDownEvent` and the right-button test are
+    read. `Targeter.ConfirmStillValid` runs on the same pass and calls
+    `StopTargeting()` the instant the caster stops being selected, so
+    `rimworld/clear_selection` closes it deterministically.
+
+    **It costs the selection**, which is said out loud rather than left to be
+    discovered by the next gizmo read. A `Command_Target` that recorded no
+    caster at all has nothing to deselect -- `ConfirmStillValid` returns early
+    when both `caster` and `targetingSource` are null -- so the real Escape is
+    still tried after, and reported honestly either way.
+
+    The state is read FIRST because Escape with no targeter open opens the game
+    MENU, which force-pauses.
+    """
+    state, why = targeter_state()
+    if state is None:
+        return False, ("ui.py targeter --cancel REFUSED: the targeter could not"
+                       " be read, so there is nothing to confirm against and"
+                       " Escape with nothing targeting opens the game MENU."
+                       " NOTHING WAS CLEARED OR PRESSED. %s" % (why or ""))
+    if not state.get("active"):
+        return True, ("targeter: already closed; nothing to cancel. NOTHING WAS"
+                      " CLEARED OR PRESSED (clearing the selection and pressing"
+                      " Escape both cost something when there is no targeter).")
+    label = state.get("source") or "unnamed targeting command"
+    who = state.get("caster")
+    lost = ("  The selection is now EMPTY -- the caster was %s; reselect it"
+            " before the next gizmo read (`pick.select_pawn(%r)`, or `python"
+            " pick.py selection` to look)." % (who, who) if who else
+            "  The selection is now EMPTY; reselect before the next gizmo read"
+            " (`python pick.py selection` to look).")
+
+    try:
+        rim.game("rimworld/clear_selection", {}, strict=False)
+    except Exception as e:
+        cleared = "rimworld/clear_selection did not answer (%s: %s)" % (
+            type(e).__name__, e)
+    else:
+        cleared = None
+    time.sleep(_CANCEL_SETTLE)
+
+    after, why2 = targeter_state()
+    if after is None:
+        return False, ("cleared the selection, but the targeter could not be read"
+                       " back (%s). Check it: python ui.py targeter" % (why2 or ""))
+    if not after.get("active"):
+        return True, ("cancelled the targeter (%s): cleared the selection and"
+                      " ConfirmStillValid closed it." % label + lost)
+
+    # Still open: either clear_selection failed, or this targeter has no caster
+    # to lose. Try the real key, and say that it is the long shot.
+    tail = ("" if cleared is None else "  (%s)" % cleared)
+    mod = mouse()
+    if mod is None:
+        return False, ("%s is STILL open after clearing the selection%s, and the"
+                       " real-keyboard fallback is not available (%s). A"
+                       " targeter with no caster cannot be deselected out of."
+                       % (label, tail, _MOUSE_ERR or "click.py did not load"))
+    try:
+        mod.key("esc")
+    except Exception as e:
+        return False, ("%s is STILL open after clearing the selection%s, and the"
+                       " Escape fallback raised %s: %s."
+                       % (label, tail, type(e).__name__, e))
+    time.sleep(_CANCEL_SETTLE)
+    last, why3 = targeter_state()
+    if last is None:
+        return False, ("cleared the selection and pressed Escape at %s, but the"
+                       " targeter could not be read back (%s). Check it: python"
+                       " ui.py targeter" % (label, why3 or ""))
+    if last.get("active"):
+        return False, ("%s is STILL open: clearing the selection did not close it"
+                       " and a synthetic Escape does not reach"
+                       " Targeter.ProcessInputEvents%s. Nothing left here reaches"
+                       " it -- a HUMAN keypress at the window does, and so does"
+                       " selecting something else."
+                       % (last.get("source") or label, tail))
+    return True, ("cancelled the targeter (%s): the selection clear did not take"
+                  " but Escape did." % label + lost)
+
+
 def _signature(payload=None):
     """What is on screen, as things that survive a re-capture.
 
@@ -320,12 +649,18 @@ class Clicked(int):
     than reading as success-in-general.
     """
 
-    def __new__(cls, ok, opened=(), closed=(), verified=True):
+    def __new__(cls, ok, opened=(), closed=(), verified=True, via="bridge",
+                targeter=None, targeter_note=None, note=None):
         o = int.__new__(cls, 1 if ok else 0)
         o.ok = bool(ok)
         o.opened = list(opened)
         o.closed = list(closed)
         o.verified = bool(verified)
+        # "bridge" = rimworld/click_ui_target, "mouse" = a real click.py click.
+        o.via = via
+        o.targeter = targeter
+        o.targeter_note = targeter_note
+        o.note = note
         return o
 
     def line(self):
@@ -336,20 +671,41 @@ class Clicked(int):
             bits.append("closed " + "; ".join(self.closed))
         if self.opened:
             bits.append("opened " + "; ".join(self.opened))
-        return " / ".join(bits) or ("nothing opened or closed -- the click landed"
-                                    " inside whatever was already on screen")
+        state = self.targeter
+        if state is not None and state.get("active"):
+            bits.append("TARGETER OPEN -- %s; next: `python order.py deploy"
+                        " <x> <z> --do` places it -- a raw map click is SWALLOWED"
+                        " (the targeter stays open and no job starts). `python"
+                        " ui.py targeter --cancel` closes it, by clearing the"
+                        " selection."
+                        % (state.get("source") or "unnamed targeting command"))
+        if bits:
+            return " / ".join(bits)
+        if state is not None:
+            # Both halves checked, both empty. The old line said only the first
+            # half and read as "the click worked, probably".
+            return ("nothing opened or closed AND no targeter -- the click landed"
+                    " inside whatever was already on screen")
+        tail = ("; the targeter was not read (%s)" % self.targeter_note
+                if self.targeter_note else "")
+        return ("nothing opened or closed -- the click landed inside whatever was"
+                " already on screen" + tail)
 
     def __repr__(self):
         return "Clicked(%s, %s)" % ("success" if self.ok else "unconfirmed",
                                     self.line())
 
 
-def click(text, exact=True, settle=0.6, surface=None, verify=True):
+def click(text, exact=True, settle=0.6, surface=None, verify=True, path=None):
     """Click the element carrying `text`. TEXT FIRST, surface as a keyword.
 
     Returns a `Clicked` -- truthy on success, carrying the surfaces that opened
-    and closed across the click, so a caller never has to take "success: true"
-    on faith. `verify=False` skips the read-back capture.
+    and closed across the click AND the targeter state when that is the only
+    thing the click could have changed, so a caller never has to take
+    "success: true" on faith. `verify=False` skips the read-back capture.
+
+    `path` is "bridge" or "mouse"; by default an element on the gizmo bar goes
+    by the real mouse and everything else by the bridge (see the module head).
     """
     if surface is None and isinstance(text, str) and text.startswith(_SURFACE_IDS):
         raise ValueError(
@@ -359,7 +715,7 @@ def click(text, exact=True, settle=0.6, surface=None, verify=True):
             % ("<the text>", text, text))
     raw = layout(surface)
     els = [e for s in (raw.get("surfaces") or []) for e in (s.get("elements") or [])]
-    tid = find(text, exact, els=els)
+    tid = find(text, exact, els=els, payload=raw)
     if not tid:
         # Name the labels that DID match. "no clickable element for 'E'" beside
         # a list containing 'E' reads as a contradiction; the truth is narrower
@@ -378,25 +734,260 @@ def click(text, exact=True, settle=0.6, surface=None, verify=True):
         raise LookupError(
             "no clickable UI element for %r%s. NOTHING WAS CLICKED. `python "
             "ui.py --probe %r` prints every element within 40px of it. The %d "
-            "clickable text(s) on %s: %s%s"
+            "clickable text(s) on %s: %s%s%s"
             % (text, detail, text, len(opts),
                ("surface " + surface) if surface else "screen",
                shown or "(none -- nothing on screen is clickable by text)",
-               "  ...+%d more" % (len(opts) - 40) if len(opts) > 40 else ""))
+               "  ...+%d more" % (len(opts) - 40) if len(opts) > 40 else "",
+               _free_hint(raw)))
+    element, home = _locate(raw, tid)
+    return _fire(tid, raw, surface, settle, verify, element=element, home=home,
+                 path=path)
+
+
+def _free_hint(payload):
+    """The tail of a refusal: what to press when the button carries no text."""
+    free = free_actionables(payload)
+    if not free:
+        return ""
+    first = free[0]
+    return ("  %d element(s) here carry NO text and cannot be reached by it -- "
+            "the storyteller portraits are that shape. `python ui.py click "
+            "--index N` clicks one (0-%d; [0] is a %s centred at %g,%g), `python "
+            "ui.py click --rect x,y,w,h` clicks one by its rectangle, and "
+            "`python click.py %g %g` is a real mouse click at that point."
+            % (len(free), len(free) - 1, first["kind"], first["centre"][0],
+               first["centre"][1], first["centre"][0], first["centre"][1]))
+
+
+# The gizmo bar's surface, under both names the payload uses for it
+# (`surfaceTargetId` is hyphenated, `surfaceKind` is not).
+_GIZMO_SURFACE = ("selection-gizmos", "selection_gizmos")
+
+
+def _locate(raw, tid):
+    """The element carrying `tid`, and the surface row it sits on."""
+    for s in (raw.get("surfaces") or []):
+        for e in (s.get("elements") or []):
+            if e.get("targetId") == tid:
+                return e, s
+    return None, None
+
+
+def _is_gizmo(home):
+    """Is this surface the selected-thing gizmo bar?"""
+    if not home:
+        return False
+    return (home.get("surfaceKind") in _GIZMO_SURFACE
+            or str(home.get("surfaceTargetId") or "").split(":")[0] in _GIZMO_SURFACE)
+
+
+# RimWorld draws its UI in its OWN coordinate space: `UI.screenWidth` is
+# `Screen.width / Prefs.UIScale`, and every rect in a `get_ui_layout` capture --
+# `rect` and `screenRect` alike -- is in that space, not in OS pixels. On this
+# machine the window is 4096x2160 and the UI space is 1638.4x864, a scale of
+# 2.5, so the gizmo bar's own rect says y=740 for a button the real mouse has to
+# be told is at y=1850. Live 2026-09-12: `ui.py click "Deploy turret"` handed
+# `_centre`'s 643,777 straight to `click.py`, the real mouse clicked bare map in
+# the top-left quarter of the screen, the selection was cleared and the read-back
+# said `closed RimWorld.MainTabWindow_Inspect` -- no targeter, no error, and the
+# 2026-09-08 turret-pack trap wearing a different hat. The bridge path is
+# unaffected (it takes a targetId, not a pixel); only the real mouse needs this.
+#
+# The scale is not in any payload, so it is MEASURED off the `selection_gizmos`
+# surface, which `GizmoGridDrawer` draws at (0, 0, UI.screenWidth,
+# UI.screenHeight) -- the one surface in a capture that is the whole screen.
+# Both axes must agree, or nothing is clicked: a wrong scale is a click on the
+# map, which is exactly the failure this exists to stop.
+_SCALE_TOL = 0.02
+# Prefs.UIScale's own list. A measured ratio that is not one of these did not
+# come off a full-screen surface, whatever its aspect ratio looks like: a
+# 432x230 inspect pane measures 9.48 and is within 1% on both axes.
+_UI_SCALES = (1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 3.5, 4.0)
+
+
+def _ui_scale(surface):
+    """OS pixels per UI unit, measured off a full-screen surface. -> float|None.
+
+    `surface` is the capture's own surface dict for the element being clicked.
+    None means it could not be measured and no pixel may be computed from it.
+    """
+    r = (surface or {}).get("screenRect") or (surface or {}).get("rect") or {}
+    w, h = r.get("width") or 0, r.get("height") or 0
+    if r.get("x") or r.get("y") or w <= 0 or h <= 0:
+        return None
+    sx, sy = SCREEN[0] / float(w), SCREEN[1] / float(h)
+    if sx <= 0 or abs(sx - sy) / sx > _SCALE_TOL:
+        return None
+    # Snap to the setting the game actually offers: the rect is an int and
+    # 4096/1638 is 2.5006, which would put a click half a pixel out at the
+    # bottom of the screen and, more to the point, hides a bad measurement.
+    near = min(_UI_SCALES, key=lambda c: abs(c - sx))
+    return near if abs(near - sx) / near <= _SCALE_TOL else None
+
+
+def _centre(element, scale=1.0):
+    """The screen pixel at the middle of an element, or None.
+
+    `scale` converts RimWorld's UI units to OS pixels; see `_ui_scale`.
+    """
+    r = element.get("screenRect") if element else None
+    if not r or not r.get("width") or not r.get("height"):
+        return None
+    return (int(round((r["x"] + r["width"] / 2.0) * scale)),
+            int(round((r["y"] + r["height"] / 2.0) * scale)))
+
+
+def _fire(tid, raw, surface, settle, verify, element=None, home=None, path=None):
+    """Click one per-capture targetId and read the screen back. -> Clicked.
+
+    Two ways in. The bridge path (`rimworld/click_ui_target`) is the default
+    and the only one for anything inside a window. The mouse path is a real
+    `click.py` click at the element's own rectangle, used for the gizmo bar
+    because a synthetic click there leaves the OS cursor behind and a targeter
+    draws itself at the cursor -- see the module head. `path` forces either.
+    """
+    scale = _ui_scale(home)
+    point = _centre(element, scale) if scale else None
+    on_gizmo = _is_gizmo(home)
+    if on_gizmo and scale is None and _centre(element) is not None:
+        # Refuse rather than click at the UI coordinate: on a scaled UI that
+        # pixel is somewhere else entirely, and on the gizmo bar "somewhere
+        # else" is the map. Falling back to the bridge is not the answer either
+        # -- it fires the gizmo without moving the cursor, which is the trap
+        # the real-mouse path exists to avoid.
+        return Clicked(False, verified=False, via="none", note=(
+            "NOTHING WAS CLICKED. The real-mouse path needs the UI-to-pixel"
+            " scale and it could not be measured off the %r surface (its rect"
+            " is %r, which is not the whole %dx%d screen). A gizmo is never"
+            " clicked at an unscaled UI coordinate -- that lands on the map."
+            % ((home or {}).get("surfaceTargetId"),
+               (home or {}).get("screenRect") or (home or {}).get("rect"),
+               SCREEN[0], SCREEN[1])))
+    want = path or ("mouse" if (on_gizmo and point) else "bridge")
+    note = None
+    if want == "mouse" and point is None:
+        note = ("the real-mouse path needs a screenRect and this element has"
+                " none; the bridge click was sent instead")
+        want = "bridge"
+
     before = _signature(raw if surface is None else None) if verify else None
-    r = rim.game("rimworld/click_ui_target", {"targetId": tid})
+    via, ok = "bridge", None
+    if want == "mouse":
+        mod = mouse()
+        if mod is None:
+            note = ("the real-mouse path could not load (%s); the bridge click"
+                    " was sent instead" % (_MOUSE_ERR or "click.py did not load"))
+        else:
+            try:
+                mod.click(point[0], point[1])
+                via, ok = "mouse", True
+            except Exception as e:
+                # A focus refusal on the GIZMO bar is not a reason to fall back:
+                # the bridge fires the gizmo without moving the OS cursor, and a
+                # targeting gizmo then opens pointed at wherever the cursor was
+                # parked -- the 2026-09-08 trap. Refuse and say so.
+                if type(e).__name__ == "FocusRefused" and on_gizmo:
+                    return Clicked(False, verified=False, via="none", note=(
+                        "NOTHING WAS CLICKED. The real mouse is the only path"
+                        " for a gizmo -- a bridge click fires it without moving"
+                        " the cursor, and a targeting gizmo then opens wherever"
+                        " the cursor was left. %s" % e))
+                note = ("the real mouse could not click %d,%d (%s: %s); the"
+                        " bridge click was sent instead"
+                        % (point[0], point[1], type(e).__name__, e))
+    if via == "bridge":
+        r = rim.game("rimworld/click_ui_target", {"targetId": tid})
+        ok = r.get("success") if isinstance(r, dict) else r
     time.sleep(settle)
-    ok = r.get("success") if isinstance(r, dict) else r
     if not verify:
-        return Clicked(ok, verified=False)
+        return Clicked(ok, verified=False, via=via, note=note)
     try:
         after = _signature()
     except Exception:
-        return Clicked(ok, verified=False)
+        return Clicked(ok, verified=False, via=via, note=note)
     b, a = list(before), list(after)
     closed = [x for x in b if x not in a]
     opened = [x for x in a if x not in b]
-    return Clicked(ok, opened, closed)
+    # The targeter is the only other thing a click can change, and it is the
+    # only one a window diff cannot see. Read it when the diff came back empty,
+    # and always for a gizmo -- that is where targeting commands live.
+    state, why = None, None
+    if on_gizmo or not (opened or closed):
+        state, why = targeter_state()
+    return Clicked(ok, opened, closed, via=via, note=note, targeter=state,
+                   targeter_note=why)
+
+
+def click_index(index, surface=None, settle=0.6, verify=True):
+    """Click the Nth TEXT-FREE actionable, numbered as the read prints them.
+
+    The only bridge route to a button that draws an image and no label. The
+    capture that numbers them is the capture that clicks, so the index cannot
+    go stale between reading and pressing -- but it can differ from an EARLIER
+    read, so the return says what was pressed.
+    """
+    raw = layout(surface)
+    free = free_actionables(raw)
+    if not free:
+        raise LookupError(
+            "no text-free actionable element is on screen. NOTHING WAS CLICKED."
+            " `python ui.py` lists what is there; a button carrying text is"
+            " clicked by that text.")
+    if not 0 <= index < len(free):
+        raise LookupError(
+            "--index %d: there are %d text-free actionable element(s) on screen,"
+            " numbered 0-%d. NOTHING WAS CLICKED. `python ui.py` lists them with"
+            " their rectangles." % (index, len(free), len(free) - 1))
+    item = free[index]
+    element, home = _locate(raw, item["_tid"])
+    got = _fire(item["_tid"], raw, surface, settle, verify, element=element,
+                home=home)
+    got.target = item
+    return got
+
+
+_RECT_TOL = 2.0
+
+
+def click_rect(x, y, width=None, height=None, surface=None, settle=0.6, verify=True):
+    """Click the actionable element AT a rectangle, or the smallest one over a point.
+
+    Four numbers are a rectangle, matched against `screenRect` within a couple
+    of pixels. Two are a screen point, and the smallest actionable containing it
+    wins. Read and click share one capture; ids do not survive a re-read.
+    """
+    raw = layout(surface)
+    els = [e for s in (raw.get("surfaces") or []) for e in (s.get("elements") or [])
+           if e.get("actionable") and e.get("screenRect") and e.get("targetId")]
+    if width is None or height is None:
+        point = {"x": x, "y": y, "width": 0, "height": 0}
+        hits = [e for e in els if _holds(_rect(e), point)]
+        what = "point %g,%g" % (x, y)
+    else:
+        want = {"x": x, "y": y, "width": width, "height": height}
+        hits = [e for e in els
+                if all(abs(_rect(e)[k] - want[k]) <= _RECT_TOL
+                       for k in ("x", "y", "width", "height"))]
+        if not hits:
+            hits = [e for e in els if _inside(want, _rect(e))]
+        what = "rect %g,%g,%g,%g" % (x, y, width, height)
+    if not hits:
+        raise LookupError(
+            "no actionable UI element at %s. NOTHING WAS CLICKED. `python ui.py`"
+            " lists the text-free elements with their rectangles; `python "
+            "click.py %g %g` is a real mouse click at that point instead."
+            % (what, x, y))
+    best = min(hits, key=lambda e: _rect(e)["width"] * _rect(e)["height"])
+    element, home = _locate(raw, best["targetId"])
+    got = _fire(best["targetId"], raw, surface, settle, verify, element=element,
+                home=home)
+    r = _rect(best)
+    got.target = {"kind": best.get("kind"), "rect": [r["x"], r["y"],
+                                                     r["width"], r["height"]],
+                  "centre": [r["x"] + r["width"] / 2, r["y"] + r["height"] / 2],
+                  "matched": what}
+    return got
 
 
 def row_toggle(text, col=0, surface=None):
@@ -459,8 +1050,12 @@ def _inside(outer, inner_rect):
             outer["y"] <= cy <= outer["y"] + outer["height"])
 
 
-def slim_surface(s, full=False):
-    """One surface's raw dict -> the reader's view. Pure; no bridge calls."""
+def slim_surface(s, full=False, keep_targets=False):
+    """One surface's raw dict -> the reader's view. Pure; no bridge calls.
+
+    `keep_targets` leaves each row's `_tid` and each text-free element's `_tid`
+    on the output, for a caller clicking out of the same capture it read.
+    """
     els = list(s.get("elements") or [])
     srect = s.get("screenRect") or s.get("rect") or {}
     notes = []
@@ -507,6 +1102,7 @@ def slim_surface(s, full=False):
         if a is None:
             row = {"text": rec["text"], "act": False, "role": None, "checked": None,
                    "disabled": None, "toggles": [], "dupes": rec["dupes"],
+                   "parts": [rec["text"]], "own": None, "_tid": None,
                    "_rect": _rect(rec["el"])}
             rows.append(row)
             continue
@@ -515,11 +1111,13 @@ def slim_surface(s, full=False):
         if row is None:
             row = {"text": rec["text"], "act": True, "role": a.get("kind"),
                    "checked": a.get("isChecked"), "disabled": a.get("disabled"),
-                   "toggles": [], "dupes": rec["dupes"], "_rect": _rect(a)}
+                   "toggles": [], "dupes": rec["dupes"], "parts": [rec["text"]],
+                   "own": None, "_tid": a.get("targetId"), "_rect": _rect(a)}
             by_act[key] = row
             rows.append(row)
         else:
             row["text"] += " " + rec["text"]
+            row["parts"].append(rec["text"])
             row["dupes"] += rec["dupes"]
 
     # (A labelled actionable -- `checkbox_labeled` and friends -- needs no case of
@@ -536,7 +1134,12 @@ def slim_surface(s, full=False):
             pc = prev["_rect"]["y"] + prev["_rect"]["height"] / 2
             rc = row["_rect"]["y"] + row["_rect"]["height"] / 2
             if abs(pc - rc) <= _ROW_TOL and prev["_rect"]["x"] <= row["_rect"]["x"]:
+                # `own` is the row before a neighbour was folded in, so a reader
+                # -- and find() -- can still address the button on its own.
+                if prev["own"] is None:
+                    prev["own"] = prev["text"]
                 prev["text"] += "  " + row["text"]
+                prev["parts"].extend(row["parts"])
                 prev["dupes"] += row["dupes"]
                 continue
         merged.append(row)
@@ -581,6 +1184,8 @@ def slim_surface(s, full=False):
             row["text"] = row["text"][:_TRUNC] + "...(+%d chars)" % (len(row["text"]) - _TRUNC)
             trunc += 1
         row.pop("_rect")
+        if not keep_targets:
+            row.pop("_tid")
         # Prune the falsey keys: absent means no, and `checked: null` is not the
         # same as absent -- it is the indeterminate a parent checkbox reports, so
         # that one key survives when the element is a checkbox at all.
@@ -590,7 +1195,15 @@ def slim_surface(s, full=False):
         for k in ("role", "toggles"):
             if not row[k]:
                 del row[k]
-        if row["checked"] is None and row.get("role") != "checkbox":
+        if len(row["parts"]) < 2:
+            del row["parts"]
+        if row["own"] is None:
+            del row["own"]
+        # A radio row keeps `checked` even when it is null: the layout carries no
+        # chosen flag for `Widgets.RadioButtonLabeled`, and "not reported" is a
+        # thing a reader has to be told, not a key to drop.
+        if row["checked"] is None and row.get("role") not in ("checkbox",
+                                                              "radio_button"):
             del row["checked"]
 
     scroll = []
@@ -610,6 +1223,18 @@ def slim_surface(s, full=False):
     for a in free:
         freekinds[a.get("kind")] = freekinds.get(a.get("kind"), 0) + 1
     freerows = len({round(_cy(a) / _ROW_TOL) for a in free})
+    # The rects, not just the count: a text-free button has no other handle, and
+    # a bare "3 elements carry no text" left the storyteller portraits unclickable.
+    freeitems = []
+    for a in sorted(free, key=lambda e: (round(_rect(e)["y"]), _rect(e)["x"])):
+        r = _rect(a)
+        item = {"kind": a.get("kind"),
+                "rect": [r["x"], r["y"], r["width"], r["height"]],
+                "centre": [r["x"] + r["width"] / 2, r["y"] + r["height"] / 2],
+                "checked": a.get("isChecked"), "disabled": bool(a.get("disabled"))}
+        if keep_targets:
+            item["_tid"] = a.get("targetId")
+        freeitems.append(item)
 
     if dupes:
         notes.append("%d duplicate text draws collapsed (same text within %gpx)"
@@ -627,7 +1252,8 @@ def slim_surface(s, full=False):
            "kind": s.get("surfaceKind"), "type": s.get("type"),
            "elements": s.get("elementCount"), "actionable": s.get("actionableElementCount"),
            "rows": rows, "scroll": scroll,
-           "textFree": {"count": len(free), "kinds": freekinds, "rows": freerows},
+           "textFree": {"count": len(free), "kinds": freekinds, "rows": freerows,
+                        "items": freeitems},
            "hidden": notes}
     sem = s.get("semanticDetails") or {}
     if sem.get("tabs"):
@@ -636,15 +1262,25 @@ def slim_surface(s, full=False):
     return out
 
 
-def slim(surface=None, payload=None, full=False):
+def slim(surface=None, payload=None, full=False, keep_targets=False):
     """Reader's view of one surface (or of everything on screen).
 
     Returns {capture, surfaces:[...]}. Pass `payload` to re-slim a layout you
     already fetched (that is how the self-measure below avoids a second call).
+
+    Text-free elements are numbered ACROSS surfaces, in the order they print,
+    because `click --index` takes one number and the screen is one screen.
     """
     raw = payload if payload is not None else layout(surface)
-    return {"capture": raw.get("captureId"),
-            "surfaces": [slim_surface(s, full) for s in (raw.get("surfaces") or [])]}
+    out = {"capture": raw.get("captureId"),
+           "surfaces": [slim_surface(s, full, keep_targets)
+                        for s in (raw.get("surfaces") or [])]}
+    n = 0
+    for s in out["surfaces"]:
+        for item in s["textFree"]["items"]:
+            item["index"] = n
+            n += 1
+    return out
 
 
 def render(sl, raw_bytes=None):
@@ -697,13 +1333,42 @@ def render(sl, raw_bytes=None):
             if row.get("offscreen"):
                 line += "  ~offsurface"
             L.append(line)
+        # A row can be a button plus a separate label that happens to sit on the
+        # same line -- a difficulty name beside a storyteller. Say which rows and
+        # which half is the button; both forms click.
+        joined = [r for r in s["rows"] if r.get("own")]
+        if joined:
+            L.append("  MERGED %d of %d rows put a button and a separate label on"
+                     " one line. The button half of each: %s%s. Either form"
+                     " clicks."
+                     % (len(joined), len(s["rows"]),
+                        ", ".join(repr(r["own"]) for r in joined[:8]),
+                        "  ...+%d more" % (len(joined) - 8) if len(joined) > 8
+                        else ""))
+        if any(r.get("role") == "radio_button" and r.get("checked") is None
+               for r in s["rows"]):
+            L.append("  RADIO rows read [?]: no chosen flag was reported by"
+                     " this bridge build. Update the bridge or use"
+                     " `python see.py` for the highlight.")
         tf = s["textFree"]
         if tf["count"]:
             L.append("  TEXT-FREE %d actionable elements carry no text (%s) on %d rows"
-                     " -- not reachable by text; screenshot the surface (PLAYBOOK 5b)"
+                     " -- not reachable by text. Click one by number:"
+                     " `python ui.py click --index N`"
                      % (tf["count"],
                         ", ".join("%s x%d" % kv for kv in sorted(tf["kinds"].items())),
                         tf["rows"]))
+            for item in tf["items"][:12]:
+                L.append("    [%d] %-14s%s x=%g y=%g w=%g h=%g  centre %g,%g%s"
+                         % (item["index"], item["kind"],
+                            {True: " [x]", False: " [ ]"}.get(item.get("checked"), ""),
+                            item["rect"][0],
+                            item["rect"][1], item["rect"][2], item["rect"][3],
+                            item["centre"][0], item["centre"][1],
+                            "  DISABLED" if item["disabled"] else ""))
+            if len(tf["items"]) > 12:
+                L.append("    ...+%d more (--json for all)"
+                         % (len(tf["items"]) - 12))
         for n in s["hidden"]:
             L.append("  HIDDEN " + n)
     L.append("")
@@ -713,7 +1378,9 @@ def render(sl, raw_bytes=None):
              " rect, scroll first   . = text only")
     L.append("ACT IN A FRESH CAPTURE: every targetId regenerates per get_ui_layout"
              " (PLAYBOOK 5a), so ids are not carried here; click/row_toggle re-read"
-             " and match the text above.")
+             " and match the text above. A row printed above clicks by the text as"
+             " printed, joins and all; a TEXT-FREE element clicks by --index or"
+             " --rect, both of which re-read too.")
     body = "\n".join(L)
     head = "UI SLIM  capture %s  surfaces %d" % (sl.get("capture"), len(sl["surfaces"]))
     if raw_bytes:
@@ -757,7 +1424,9 @@ def print_main_tabs():
                  (t.get("label") or t.get("defName") or "?")
                  + ("" if kind else
                     "  -- a toggle, not a tab window: open_main_tab cannot open"
-                    " it and it has no clickable ui-element id"),
+                    " it and it has no clickable ui-element id")
+                 + ("  -- FORCE-PAUSES the game while open" if _force_pauses(t)
+                    else ""),
                  "  [OPEN over the map -- `python ui.py close`]"
                  if t.get("isOpen") else ""))
 
@@ -772,6 +1441,28 @@ def print_main_tabs():
 
 OPEN_TOOL = "rimworld/open_main_tab"
 CLOSE_TOOL = "rimworld/close_main_tab"
+
+# Main tab windows that set `forcePause`: while one is open the clock is held,
+# and supervised play's watcher stops on any force pause. Matched as a substring
+# of the tab's `type`. The list is the warning BEFORE the read; the check after
+# it is the fact, and it catches anything not named here.
+FORCE_PAUSE_TABS = ("MainTabWindow_Menu",)
+
+RESTART_LINE = "python play.py start"
+
+
+def _force_pauses(row):
+    t = ((row or {}).get("type") or "")
+    return any(name in t for name in FORCE_PAUSE_TABS)
+
+
+def _clock_state():
+    """The clock, or None when clock.py could not answer. Never raises."""
+    try:
+        import clock
+        return clock.state()
+    except Exception:
+        return None
 
 
 def _tab_row(name):
@@ -830,7 +1521,21 @@ def read_tab(name, full=False, close=True):
 
     `close=False` leaves it standing -- the only way a tab should ever be left
     over the map, and then deliberately.
+
+    Some tab windows force-pause the game -- Menu does, twice on 2026-09-07 --
+    and supervised play stops on any force pause, silently. So this warns before
+    it opens one, and afterwards checks whether the service is still there and
+    whether the clock is still running, printing the line that restarts it.
     """
+    row = _tab_row(name)
+    label = (row or {}).get("label") or name
+    warn = _force_pauses(row)
+    alive = supervised_play_alive()
+    if warn:
+        print("   ~~ %s FORCE-PAUSES the game while it is open%s. Opening it now;"
+              " it is closed again after the read and the clock is checked then."
+              % (label, " and supervised play stops on any force pause"
+                        if alive else ""))
     opened = open_tab(name)
     if isinstance(opened, dict) and opened.get("success") is False:
         raise RuntimeError("open_main_tab %r refused: %s"
@@ -841,11 +1546,35 @@ def read_tab(name, full=False, close=True):
                       raw_bytes=len(json.dumps(raw, separators=(",", ":"))))
     finally:
         shut = close_tab(name) if close else None
+    _report_pause(label, warn, alive)
     if not close:
         return text, None
     ok = bool(isinstance(shut, dict) and shut.get("success")
               and not _open_tab_name(shut))
     return text, ok
+
+
+def _report_pause(label, warn, alive):
+    """Say what opening this tab cost the clock, or nothing when it cost nothing.
+
+    The service check is a disk read and catches ANY tab that force-pauses, named
+    in FORCE_PAUSE_TABS or not; the clock read is the second opinion and is only
+    paid for a tab already known to hold it.
+    """
+    if alive and supervised_play_alive() is False:
+        print("   !! supervised play STOPPED while %s was open -- the watcher"
+              " stops on any force pause, and nothing restarts it: %s"
+              % (label, RESTART_LINE))
+        return
+    if not warn:
+        return
+    st = _clock_state()
+    if st is None:
+        print("   ~~ %s force-pauses, and the clock could not be read after it"
+              " closed. Check it: python status.py" % label)
+    elif st.get("state") == "paused":
+        print("   !! the clock is STOPPED now (%s). %s"
+              % (st.get("why") or "reason unread", RESTART_LINE))
 
 
 def selection():
@@ -864,25 +1593,90 @@ def selection():
                         o.get("id") or "no id") for o in rows[:6])
 
 
-def _do_click(text, surface):
+def _do_click(text, surface, path=None):
     """One click from the command line, with its read-back. -> exit code."""
     try:
-        result = click(text, surface=surface)
+        result = click(text, surface=surface, path=path)
     except Exception as e:
         # A refusal is not a crash: the message names the condition and lists
         # what could have been clicked instead. NOTHING WAS CLICKED is in it.
         print("ui.py click REFUSED -- %s: %s" % (type(e).__name__, e))
         return 1
     print("clicked %r%s: %s"
-          % (text, (" on " + surface) if surface else "",
-             "success" if result.ok else "the bridge did not confirm success"))
+          % (text, (" on " + surface) if surface else "", _verdict(result)))
+    if result.note:
+        print("  !! %s" % result.note)
     print("  read back: %s" % result.line())
     return 0 if result.ok else 1
 
 
+def _verdict(result):
+    """How the click was delivered, and whether it was confirmed."""
+    if result.via == "mouse":
+        return "the REAL MOUSE clicked it (the gizmo bar goes that way)"
+    if result.via == "none":
+        return "NOTHING WAS CLICKED"
+    return "success" if result.ok else "the bridge did not confirm success"
+
+
+def _do_geometry_click(kind, value, surface):
+    """`click --index N` / `click --rect x,y[,w,h]`. -> exit code."""
+    try:
+        if kind == "index":
+            result = click_index(int(value), surface=surface)
+        else:
+            nums = [float(n) for n in str(value).replace(" ", "").split(",") if n]
+            if len(nums) not in (2, 4):
+                print("python ui.py click --rect x,y,w,h   (or --rect x,y for a"
+                      " point: the smallest actionable over it wins)")
+                return 1
+            result = click_rect(*nums, surface=surface)
+    except ValueError as e:
+        print("ui.py click --%s REFUSED -- %s" % (kind, e))
+        return 1
+    except Exception as e:
+        print("ui.py click --%s REFUSED -- %s: %s" % (kind, type(e).__name__, e))
+        return 1
+    t = getattr(result, "target", None) or {}
+    print("clicked the %s at x=%g y=%g w=%g h=%g (centre %g,%g): %s"
+          % (t.get("kind") or "element", t.get("rect", [0, 0, 0, 0])[0],
+             t.get("rect", [0, 0, 0, 0])[1], t.get("rect", [0, 0, 0, 0])[2],
+             t.get("rect", [0, 0, 0, 0])[3], t.get("centre", [0, 0])[0],
+             t.get("centre", [0, 0])[1], _verdict(result)))
+    if result.note:
+        print("  !! %s" % result.note)
+    print("  read back: %s" % result.line())
+    return 0 if result.ok else 1
+
+
+def _path_flag(flags):
+    """`--bridge` / `--pixel` -> the click path to force, or None for the default."""
+    if "--bridge" in flags:
+        return "bridge"
+    if "--pixel" in flags:
+        return "mouse"
+    return None
+
+
+def _take_option(argv, flag):
+    """Pull `--flag value` (or `--flag=value`) out of argv. -> (value, rest)."""
+    for i, a in enumerate(argv):
+        if a == flag:
+            return (argv[i + 1] if i + 1 < len(argv) else ""), argv[:i] + argv[i + 2:]
+        if a.startswith(flag + "="):
+            return a[len(flag) + 1:], argv[:i] + argv[i + 1:]
+    return None, argv
+
+
 def main():
-    args = [a for a in sys.argv[1:] if not a.startswith("--")]
-    flags = {a for a in sys.argv[1:] if a.startswith("--")}
+    argv = sys.argv[1:]
+    geom = None
+    for name in ("index", "rect"):
+        got, argv = _take_option(argv, "--" + name)
+        if got is not None:
+            geom = (name, got)
+    args = [a for a in argv if not a.startswith("--")]
+    flags = {a for a in argv if a.startswith("--")}
     surface = args[0] if args else None
     # Every other instrument's CLI opens with this and ui.py did not. A read
     # that runs before the MCP handshake is the shape the "silent no-op from
@@ -896,6 +1690,21 @@ def main():
         return 1
     # Accept the natural surface-first form used by the rest of this module's
     # API: `ui.py <surface> click <text>`, plus `ui.py click <text>`.
+    if geom is not None:
+        # A text-free button has no text to click by; --index and --rect are the
+        # two handles the layout does give.
+        i = args.index("click") if "click" in args else len(args)
+        return _do_geometry_click(geom[0], geom[1], args[0] if i > 0 else None)
+    if args and args[0] == "targeter":
+        if "--cancel" in flags:
+            # cancel_targeter reads the state itself; reading it here too
+            # would put a round trip between the look and the keypress.
+            ok, text = cancel_targeter()
+            print(text)
+            return 0 if ok else 1
+        state, why = targeter_state()
+        print(targeter_line(state, why))
+        return 0 if state is not None else 1
     if "click" in args:
         i = args.index("click")
         click_surface = args[0] if i > 0 else None
@@ -903,7 +1712,7 @@ def main():
         if not click_text:
             print("python ui.py [surface] click <visible text>")
             return 1
-        return _do_click(click_text, click_surface)
+        return _do_click(click_text, click_surface, path=_path_flag(flags))
     if "--click" in flags:
         if not args:
             print("python ui.py --click <visible text>")
@@ -911,7 +1720,7 @@ def main():
         # Keep the command-line path exactly aligned with the public Python API:
         # capture a fresh layout, resolve the visible text, and click its
         # per-capture target id.  Previously "OK" was mistaken for a surface id.
-        return _do_click(args[0], None)
+        return _do_click(args[0], None, path=_path_flag(flags))
     if args and args[0] in ("close", "tab"):
         name = " ".join(args[1:]) or None
         if args[0] == "close" or "--close" in flags:

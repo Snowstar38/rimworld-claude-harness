@@ -1,4 +1,5 @@
 using System;
+using System.Globalization;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
@@ -497,14 +498,53 @@ namespace HomeBridge.BridgeTools
             return d != null && d.TryGetValue(key, out v) && v is bool && (bool)v;
         }
 
-        /// <summary>A double out of a payload dictionary; absent or another type
-        /// reads as 0.</summary>
+        /// <summary>
+        /// A double out of a payload dictionary. **Every boxed numeric answers**
+        /// — int, long, float, double, decimal and the smaller integer types —
+        /// because a payload row stores a COUNT as a boxed <c>int</c> and a
+        /// FRACTION as a boxed <c>double</c>, and the old <c>is double</c> test
+        /// read every count back as zero.
+        ///
+        /// That was live, not theoretical. <c>BillCommon.IngredientRows</c> reads
+        /// <c>excludedUnreachable</c> and <c>excludedByFilter</c> back off the row
+        /// it has just built; both are ints, so both read as 0, so the
+        /// "NO ROUTE from this bench's interaction cell" line and the
+        /// "filter excludes N on map" line could never be emitted. On 2026-09-12 a
+        /// row carried <c>excludedUnreachable: 1</c> and <c>blockedBy</c> carried
+        /// only the missing-count line.
+        ///
+        /// A missing key, a null, a non-numeric value (bool, char and string
+        /// included, deliberately — reading a bool back as 1.0 would turn a
+        /// mis-keyed lookup into a plausible number) and a conversion that throws
+        /// all read as 0. This never throws.
+        /// </summary>
         internal static double Num(Dictionary<string, object> d, string key)
         {
             object v;
-            if (d != null && d.TryGetValue(key, out v) && v is double)
-                return (double)v;
-            return 0.0;
+            if (d == null || !d.TryGetValue(key, out v) || v == null)
+                return 0.0;
+            // The three shapes this codebase actually stores, unboxed directly so
+            // the common path costs no Convert call.
+            if (v is double) return (double)v;
+            if (v is int) return (int)v;
+            if (v is float) return (float)v;
+            if (!IsNumericBox(v)) return 0.0;
+            var convertible = v as IConvertible;
+            if (convertible == null) return 0.0;
+            try { return convertible.ToDouble(CultureInfo.InvariantCulture); }
+            catch { return 0.0; }
+        }
+
+        /// <summary>Whether a boxed value is one of the numeric primitives, and
+        /// nothing else. <c>bool</c>, <c>char</c>, <c>string</c> and
+        /// <c>DateTime</c> are all <c>IConvertible</c> and are all excluded on
+        /// purpose: <see cref="Num"/> answering 1.0 for <c>true</c> would hide a
+        /// wrong key behind a number that looks read.</summary>
+        private static bool IsNumericBox(object v)
+        {
+            return v is sbyte || v is byte || v is short || v is ushort
+                || v is int || v is uint || v is long || v is ulong
+                || v is float || v is double || v is decimal;
         }
 
         // ------------------------------------------------------------------

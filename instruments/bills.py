@@ -12,6 +12,16 @@
   python bills.py delete <bench> <index> --do
   python bills.py move <bench> <index> --to 0 --do
   python bills.py move <bench> <index> --up --do
+  python bills.py allow <bench> <index> <Def[,Def]> --do
+  python bills.py only <bench> <index> <Def[,Def]> --do
+  python bills.py disallow <bench> <index> <Def[,Def]> --do
+
+  python bills.py <bench> --forever --do               # its ONLY bill
+  python bills.py "<recipe>" --forever --do            # the one bench queueing it
+
+  The bench may come before the verb instead: `bills.py <bench> set 1 --target
+  30 --do` and `bills.py set <bench> 1 --target 30 --do` are the same call. A
+  word that is neither is REFUSED naming the verbs; it never becomes a listing.
 
   options: --forever | --repeat N | --target N [--unpause N] [--pause on|off]
            --allow X,Y  --only X,Y  --disallow X,Y  --radius N  --skill MIN-MAX
@@ -35,7 +45,7 @@ is said at the moment of adding, not discovered a day later.
 
 The numbers come from the map, not from the bill: for each ingredient slot,
 every spawned haulable the recipe's filter AND the bill's own filter allow,
-unforbidden, inside the bill's ingredient search radius of the bench.
+unforbidden, reachable, inside the bill's ingredient search radius of the bench.
 
   needed / available / shortfall     shortfall == max(0, needed - available)
   availableTotal                     every allowed def summed
@@ -51,8 +61,15 @@ ingredient slot from one def unless the recipe allows mixing, so five rice and
 five corn do not cook a meal that wants ten of something -- and `availableTotal`
 beside it is what makes that visible instead of puzzling.
 
-Not modelled: reachability, reservation, and a pawn's own forbidden rules. A
-thing behind a locked door counts here and does not count to the game.
+A stack with no route from the bench's interaction cell is SUBTRACTED and shown
+as `{N unreachable}`; a stack somebody has already claimed is shown as
+`{N reserved}` and left IN the count, because the claimant is usually fetching
+it for this bill. Not modelled: a pawn's own forbidden rules.
+
+Every count is one tick's worth and says its scope -- `map-wide` or `within N
+cells`. A stack a pawn is CARRYING is despawned and is in no count at all, so
+two readings seconds apart can differ by a haul in flight; the listing header
+prints the tick both should be compared at.
 
 ## Naming a bench
 
@@ -83,16 +100,36 @@ with 98 pemmican in existence is all three numbers doing their job.
 
 ## The writes
 
-`add` / `set` / `delete` / `move` are DRY RUNS until `--do`, the same convention
-`pawns.py set`, `zones.py` and `research.py set` use. A real write reports the
-before, the after READ BACK from the bill stack, and what changed. `allow` and
-`allow`, `only`, and `disallow` are bounded by the recipe's own fixed ingredient
+`add` / `set` / `delete` / `move` / `allow` / `only` / `disallow` are DRY RUNS
+until `--do`, the same convention `pawns.py set`, `zones.py` and `research.py
+set` use. A real write reports the before, the after READ BACK from the bill
+stack, what it ASKED for, and what changed. A write that lands and changes
+nothing prints `WROTE NOTHING:` and names the field the bill still disagrees on
+-- an unchanged bill sheet is not an answer.
+
+`allow`, `only` and `disallow` are bounded by the recipe's own fixed ingredient
 filter. `allow` adds entries; `only` clears existing allowances and makes the
 named defs/categories the complete whitelist; `disallow` removes entries. A name
-outside it refuses the whole call rather than half-applying a filter.
+outside it refuses the whole call rather than half-applying a filter. They are
+verbs and flags alike: `bills.py <bench> allow 0 Corpse_Human --do` is
+`bills.py set <bench> 0 --allow Corpse_Human --do`.
 
 A real write selects the bench and opens its Bills tab while the change lands,
-then closes it. `--no-watch` skips that; the write is identical either way.
+scrolls a real `add` to the new bill at the bottom of the stack, then closes it.
+`--no-watch` skips that; the write is identical either way.
+
+## A write with no verb
+
+An option is an intention to change something, so a call that carries one and no
+verb is a `set` whose bill has not been named yet -- never a listing. `bills.py
+<bench> --forever --do` applies to that bench's ONE bill; a bench with several
+REFUSES with them numbered and the exact `bills.py set <bench> <n> ... --do`
+line per bill. A positional that is not a bench is looked up as a queued bill
+(every word of it must appear in the bill's label, its recipe, or its bench's
+name), so `bills.py "steel stonecutter" --forever --do` resolves to the one
+bench cutting steel blocks -- or refuses naming every bench that matched.
+**A `--do` that reaches no write says `WROTE NOTHING` and why.** A bill sheet
+printed instead is the failure a caller cannot see.
 """
 import json
 import re
@@ -192,11 +229,8 @@ def recipes(bench):
 def write(action, bench, do=False, watch=True, **kw):
     """add / set / delete / move. A dry run unless do=True.
 
-    2026-09-07: `bills.py recipes 128,139` accepted a bare cell and
-    `bills.py add 128,139 ...` refused it (`no bill giver matches bench
-    '128,139'`), because only `recipes` went through `_resolve_bench`. Every
-    verb takes the same bench forms now; a bench answers to the cell its
-    listing row prints, whichever verb is asking.
+    Every verb takes the same bench forms, bare cell included: a bench answers
+    to the cell its listing row prints, whichever verb is asking.
     """
     spec, refused = _resolve_bench(bench)
     if refused:
@@ -270,11 +304,35 @@ def _finished(bill):
     return cfg.get("repeatMode") == "RepeatCount" and count is not None and count <= 0
 
 
+def _scope(ing):
+    """What the counts on this row cover. None for a payload that does not say
+    -- a scope guessed at is worse than a scope missing."""
+    if ing.get("radiusUnlimited"):
+        return "map-wide"
+    radius = ing.get("searchRadius")
+    return None if radius is None else "within %s cells" % radius
+
+
 def _ing_line(ing, indent=8):
     mark = "   " if ing.get("satisfied") else "!! "
-    bits = "%s%s%s  need %s, have %s" % (
+    scope = _scope(ing)
+    bits = "%s%s%s  need %s, have %s%s" % (
         " " * indent, mark, _noun(ing),
-        _num(ing.get("needed")), _num(ing.get("available")))
+        _num(ing.get("needed")), _num(ing.get("available")),
+        " %s" % scope if scope else "")
+    if ing.get("excludedReserved"):
+        # Someone got there first. Still counted: they are usually fetching it
+        # for this bill.
+        bits += "  {%d reserved}" % ing["excludedReserved"]
+    # Two independent facts, and they were an `elif`: the scan can confirm N
+    # unreachable AND still run out of its call budget before asking about the
+    # rest. Suppressing the caveat because something WAS found prints a partial
+    # answer as a complete one -- the "0 unreachable means not known, not all
+    # reachable" failure `reachabilityChecked` exists to prevent.
+    if ing.get("excludedUnreachable"):
+        bits += "  {%d unreachable, not counted}" % ing["excludedUnreachable"]
+    if ing.get("reachabilityChecked") is False:
+        bits += "  {reachability NOT checked}"
     if ing.get("shortfall"):
         bits += "  SHORT %s" % ing["shortfall"]
     total = ing.get("availableTotal")
@@ -333,7 +391,12 @@ def _reasons(bill):
         elif ing.get("needed") is None or ing.get("available") is None:
             other.append("missing %s (counts NOT READ)" % noun)
         else:
-            other.append("missing %s (%s/%s)" % (noun, ing["available"], ing["needed"]))
+            # The scope rides with the number, so two readings of one bill can
+            # be compared without knowing its radius.
+            scope = _scope(ing)
+            other.append("missing %s (%s/%s%s)" % (
+                noun, ing["available"], ing["needed"],
+                " %s" % scope if scope else ""))
     return forbidden + other + reasons
 
 
@@ -444,8 +507,10 @@ def print_bench(b, verbose=True):
 def show(r):
     benches = r.get("benches") or []
     att = r.get("attention") or {}
-    print("BENCHES: %d in scope, %d bill giver(s) on the map. %d haulable stack(s) scanned."
-          % (len(benches), r.get("benchesOnMap", len(benches)), r.get("ingredientsScanned", 0)))
+    tick = r.get("countedAtTick")
+    print("BENCHES: %d in scope, %d bill giver(s) on the map. %d haulable stack(s) scanned%s."
+          % (len(benches), r.get("benchesOnMap", len(benches)), r.get("ingredientsScanned", 0),
+             " at tick %s" % tick if tick is not None else ""))
     note = (r.get("notes") or {}).get("ingredientScanFailed")
     if note:
         print("!! THE INGREDIENT SCAN FAILED: %s" % note)
@@ -490,6 +555,44 @@ def show_recipes(r):
     return 0
 
 
+def _nothing_changed(w, applied):
+    """The loud line for a write that moved nothing, and why.
+
+    A bill sheet printed unchanged is the failure shape a caller cannot see:
+    `optionsNotApplied` is the tool comparing what was asked against the bill
+    read back, so a field that did not take is named here rather than inferred.
+    """
+    predicted = bool(w.get("afterIsPredicted"))
+    # A prediction has no read-back, so it can never name a field that did not
+    # take -- only that the change is a no-op.
+    missed = [] if predicted else [str(m) for m in (w.get("optionsNotApplied") or [])]
+    asked = w.get("requestedOptions") or {}
+    lead = "NOTHING WOULD CHANGE" if predicted else (
+        "WROTE NOTHING" if applied else "NOTHING CHANGED")
+    if missed:
+        return ("%s: %s. The call reached the bill and the field did not take. "
+                "Re-read with `python bills.py <bench>`; if it still disagrees, "
+                "the installed DLL is older than this script."
+                % (lead, "; ".join(missed)))
+    action = w.get("action")
+    if action == "move":
+        return ("%s: the stack came back in the same order. Either the bill already "
+                "sat at that position or the reorder did not take -- this line does "
+                "not know which. `python bills.py <bench>` prints the order."
+                % lead)
+    if action in ("add", "delete"):
+        count = (w.get("after") or {}).get("billCount")
+        return ("%s: the stack still holds %s bill(s), so the %s did not land. "
+                "Re-read with `python bills.py <bench>`."
+                % (lead, "?" if count is None else count, action))
+    if asked:
+        return ("%s: the bill already holds every value asked for (%s), so there "
+                "was nothing to change."
+                % (lead, ", ".join("%s=%s" % (k, v) for k, v in sorted(asked.items()))))
+    return ("%s: no field was asked for and nothing moved. "
+            "`python bills.py --help` lists the options." % lead)
+
+
 def print_write(r):
     """The write reply. Returns the process exit code."""
     if not r.get("success"):
@@ -517,6 +620,9 @@ def print_write(r):
              r.get("_askedBench") or w.get("requestedBench")))
     if w.get("resolvedRecipe"):
         print("recipe:    %s" % w["resolvedRecipe"])
+    asked = w.get("requestedOptions") or {}
+    if asked:
+        print("asked:     %s" % ", ".join("%s=%s" % (k, v) for k, v in sorted(asked.items())))
     print("before:    %d bill(s): %s"
           % (before.get("billCount", 0),
              ", ".join(b.get("label") or "?" for b in (before.get("bills") or [])) or "none"))
@@ -525,24 +631,32 @@ def print_write(r):
              ", ".join(b.get("label") or "?" for b in (after.get("bills") or [])) or "none",
              "PREDICTED -- nothing was written" if w.get("afterIsPredicted")
              else "read back from the bill stack"))
-    for c in w.get("changed") or []:
+    changed = w.get("changed") or []
+    for c in changed:
         print("changed:   %s" % c)
-    if not w.get("changed"):
+    if not changed:
         print("changed:   nothing")
     print("applied:   %s" % r.get("applied"))
-    w = r.get("watch") or {}
-    if w.get("shown"):
+    if not changed:
+        print(_nothing_changed(w, bool(r.get("applied"))))
+    watch = r.get("watch") or {}
+    if watch.get("shown"):
         print("watch:     %s open on the bench, closes in %s s"
-              % (w.get("inspectTab") or w.get("mainTab") or "inspect pane",
-                 w.get("closesAfterSeconds")))
-        if w.get("cameraMoved"):
+              % (watch.get("inspectTab") or watch.get("mainTab") or "inspect pane",
+                 watch.get("closesAfterSeconds")))
+        if watch.get("scrolledToNewBill"):
+            print("watch:     Bills tab scrolled to the new bill at the bottom")
+        elif watch.get("scrollNote"):
+            print("watch:     the tab was NOT scrolled (%s); the new bill is at the "
+                  "bottom of the stack" % watch["scrollNote"])
+        if watch.get("cameraMoved"):
             try:
                 import camlock
                 camlock.claim("hands", "watch")
             except Exception:
                 pass
     else:
-        print("watch:     skipped (%s)" % (w.get("reason") or "not shown"))
+        print("watch:     nothing shown (%s)" % (watch.get("reason") or "not shown"))
 
     bill = after.get("bill")
     if bill:
@@ -550,11 +664,6 @@ def print_write(r):
         print(_verdict_line(bill, indent=0))
         for ing in bill.get("ingredients") or []:
             print(_ing_line(ing, indent=2))
-
-    watch = r.get("watch") or {}
-    if not watch.get("shown"):
-        print("")
-        print("watch:     nothing shown (%s)" % watch.get("reason"))
     return 0
 
 
@@ -694,6 +803,61 @@ def _bench_and_rest(words):
     return words[0], list(words[1:])
 
 
+VERBS = ("recipes", "add", "set", "delete", "move", "allow", "only", "disallow")
+
+# `allow 0 X` is `set 0 --allow X`: one bill-config write, named the way the
+# tab's own filter buttons are.
+FILTER_VERBS = ("allow", "only", "disallow")
+
+USAGE = {
+    "recipes": 'bills.py recipes <bench>',
+    "add": 'bills.py add <bench> "<recipe>" [options] [--do]',
+    "set": "bills.py set <bench> <index> [options] [--do]",
+    "delete": "bills.py delete <bench> <index> [--do]",
+    "move": "bills.py move <bench> <index> --to N|--up|--down [--do]",
+    "allow": "bills.py allow <bench> <index> <Def[,Def]> [--do]",
+    "only": "bills.py only <bench> <index> <Def[,Def]> [--do]",
+    "disallow": "bills.py disallow <bench> <index> <Def[,Def]> [--do]",
+}
+
+ORDERS = ("Both orders parse: `bills.py set <bench> 1 --target 30 --do` and "
+          "`bills.py <bench> set 1 --target 30 --do`.")
+
+
+def _verbs_line():
+    return "verbs: %s. %s" % (", ".join(sorted(VERBS)), ORDERS)
+
+
+def _split_verb(positional):
+    """(verb, bench, rest, refusal).
+
+    The verb may come before the bench or after it. A first word that is
+    neither a verb nor a bench followed by one is REFUSED naming the verbs --
+    an unread verb must never fall through to the listing, which prints a bill
+    sheet that looks like an answer.
+    """
+    if not positional:
+        return None, None, [], None
+    if positional[0] in VERBS:
+        bench, rest = _bench_and_rest(positional[1:])
+        return positional[0], bench, rest, None
+    bench, rest = _bench_and_rest(positional)
+    if not rest:
+        return None, bench, [], None
+    if rest[0] in VERBS:
+        return rest[0], bench, list(rest[1:]), None
+    return None, bench, rest, (
+        "%r is not a bills.py verb, so nothing was read and nothing was written."
+        "\n  %s"
+        "\n  With no verb, `bills.py <bench>` lists that bench." % (rest[0], _verbs_line()))
+
+
+def _unconsumed(verb, extra):
+    return ("bills.py %s did not use %s, so nothing was read and nothing was written."
+            "\n  usage: %s"
+            "\n  %s" % (verb, " ".join(repr(w) for w in extra), USAGE[verb], _verbs_line()))
+
+
 def _positionals(argv):
     out, skip = [], False
     for i, a in enumerate(argv):
@@ -709,6 +873,162 @@ def _positionals(argv):
     return out
 
 
+# ------------------------------------------- a write that named no bill
+
+# 2026-09-08, Threadneedle: `bills.py <bench> --forever --do` printed the bench's
+# bill sheet and wrote nothing, silently -- the sheet looks like an answer, so
+# the turn moved on believing the bill was now Forever. The day-68 pass taught
+# both orders to parse, but a call with NO verb at all still fell through to the
+# listing. An option is an intention to change something; it can only ever end in
+# a write or a refusal.
+
+def _quote(word):
+    return '"%s"' % word if " " in str(word) else str(word)
+
+
+def _flag_words(argv):
+    """The argv words that are flags or flag VALUES -- the complement of
+    `_positionals`, so a suggested command echoes what the caller typed."""
+    out, take = [], False
+    for a in argv:
+        if take:
+            out.append(a)
+            take = False
+        elif a in VALUED:
+            out.append(a)
+            take = True
+        elif a.startswith("--"):
+            out.append(a)
+    return out
+
+
+def _set_line(bench, index, argv):
+    """The exact line to type. Paste-ready, including the flags already given."""
+    return ("python bills.py set %s %s %s"
+            % (_quote(bench), index, " ".join(_flag_words(argv)))).rstrip()
+
+
+def _name(row):
+    return "%s %s [%s]" % (row.get("label") or row.get("defName") or "?",
+                           _pos(row), row.get("thingId"))
+
+
+def _bill_line(bill):
+    flags = [k.upper() for k in ("suspended", "paused") if bill.get(k)]
+    return "[%s] %s%s   %s" % (bill.get("index"), bill.get("label") or "?",
+                               ("  " + ", ".join(flags)) if flags else "",
+                               bill.get("repeatInfo") or "")
+
+
+def _refusal(text):
+    return {"success": False, "error": text, "candidates": []}
+
+
+def _words_match(needle, *fields):
+    """Every word of `needle` appears somewhere in `fields`, in any order.
+
+    A substring match is too tight for how a bill is actually named out loud:
+    "steel stonecutter" is the bench's word and the material's word, and the
+    bill's own label is "Make steel blocks". All-words-present matches that and
+    still cannot match two unrelated bills by accident -- and where it does
+    match two, the caller is shown both rather than one being picked.
+    """
+    hay = " ".join(str(f or "") for f in fields).lower()
+    words = [w for w in re.split(r"\s+", str(needle or "").strip().lower()) if w]
+    return bool(words) and all(w in hay for w in words)
+
+
+def _bills_matching(reply, needle):
+    """[(bench row, bill row)] for every queued bill `needle` could name."""
+    hits = []
+    for b in (reply or {}).get("benches") or []:
+        for bill in b.get("bills") or []:
+            if _words_match(needle, bill.get("label"), bill.get("recipe"),
+                            b.get("label"), b.get("defName")):
+                hits.append((b, bill))
+    return hits
+
+
+def _implicit_write(bench, argv):
+    """Which bill a verb-less `bills.py <name> --forever --do` means.
+
+    (bench spec to write to, bill index, a note to print, refusal or None).
+    Nothing here guesses: one bill is applied to, several are printed numbered
+    with the line to type, and none at all says so.
+    """
+    if not bench:
+        return None, None, None, _refusal(
+            "an option was given with no bench and no verb, so nothing was written."
+            "\n  usage: %s\n  %s" % (USAGE["set"], _verbs_line()))
+    if not _options(argv):
+        return None, None, None, _refusal(
+            "--do was given with no verb and no option, so there was nothing to write."
+            "\n  usage: %s\n  %s" % (USAGE["set"], _verbs_line()))
+
+    try:
+        r = state(bench=bench)
+    except Exception as e:
+        # A bench name the tool throws on is still worth trying as a recipe; a
+        # bridge that is really down raises again on the whole-map read below,
+        # where main()'s handler says NO BILL DATA WAS READ.
+        r = {"success": False, "error": "%s: %s" % (type(e).__name__, e)}
+    benches = (r.get("benches") or []) if isinstance(r, dict) else []
+    if isinstance(r, dict) and r.get("success") and len(benches) == 1:
+        row = benches[0]
+        if row.get("billStackUnreadable"):
+            return None, None, None, _refusal(
+                "%s's bill stack could not be READ, so no bill could be named. "
+                "That is NOT 'no bills'." % _name(row))
+        rows = row.get("bills") or []
+        if not rows:
+            return None, None, None, _refusal(
+                "%s has no bills at all, so there is nothing to set."
+                "\n  Add one:  python bills.py add %s \"<recipe>\" %s"
+                % (_name(row), _quote(bench), " ".join(_flag_words(argv))))
+        if len(rows) == 1:
+            index = rows[0].get("index")
+            return bench, index, (
+                "resolved:  no verb given, and %s has one bill -- this is "
+                "`bills.py set %s %s`\n           %s"
+                % (_name(row), _quote(bench), index, _bill_line(rows[0]))), None
+        lines = ["%s has %d bills, so a call with no verb names none of them. "
+                 "Nothing was written. Pick one:" % (_name(row), len(rows))]
+        for b in rows:
+            lines.append("   %s" % _bill_line(b))
+            lines.append("       %s" % _set_line(bench, b.get("index"), argv))
+        return None, None, None, _refusal("\n".join(lines))
+
+    # Not a bench. The word is very often the RECIPE -- that is the other half of
+    # this bug: `bills.py "<recipe>" --forever --do` was refused because the
+    # positional is read as the bench.
+    hits = _bills_matching(state(), bench)
+    if len(hits) == 1:
+        row, bill = hits[0]
+        spec = row.get("thingId") or bench
+        return spec, bill.get("index"), (
+            "resolved:  %r is not a bench; it is a bill on %s -- this is "
+            "`bills.py set %s %s`\n           %s"
+            % (bench, _name(row), _quote(spec), bill.get("index"),
+               _bill_line(bill))), None
+    if hits:
+        lines = ["%r names %d queued bills, on %d bench(es). Nothing was written. "
+                 "Pick one:" % (bench, len(hits),
+                                len({id(b) for b, _ in hits}))]
+        for row, bill in hits:
+            lines.append("   %s  on %s" % (_bill_line(bill), _name(row)))
+            lines.append("       %s"
+                         % _set_line(row.get("thingId") or bench,
+                                     bill.get("index"), argv))
+        return None, None, None, _refusal("\n".join(lines))
+
+    why = (r or {}).get("error") if isinstance(r, dict) else None
+    return None, None, None, _refusal(
+        "%r is neither a bench nor a bill queued on one, so nothing was written.%s"
+        "\n  `python bills.py` lists every bench with its bills and ThingIDs."
+        "\n  usage: %s" % (bench, ("\n  the bench lookup said: %s" % why) if why
+                           else "", USAGE["set"]))
+
+
 def main():
     argv = sys.argv[1:]
     if "--help" in argv or "-h" in argv:
@@ -720,38 +1040,54 @@ def main():
     watch = "--no-watch" not in argv
     check_flags(argv)
     positional = _positionals(argv)
-    verb = positional[0] if positional else None
+    verb, bench, rest, refusal = _split_verb(positional)
+    if refusal:
+        print("REFUSED: %s" % refusal)
+        return 1
 
+    args, note = {}, None
     try:
         rim.init()
         if verb == "recipes":
-            if len(positional) < 2:
-                print("usage: bills.py recipes <bench>")
+            if not bench:
+                print("usage: %s" % USAGE["recipes"])
                 return 1
-            r = recipes(_bench_spec(positional[1:]))
-        elif verb in ("add", "set", "delete", "move"):
-            if len(positional) < 2:
-                print("usage: bills.py %s <bench> ..." % verb)
+            if rest:
+                print("REFUSED: %s" % _unconsumed(verb, rest))
+                return 1
+            r = recipes(bench)
+        elif verb:
+            if not bench:
+                print("usage: %s" % USAGE[verb])
                 return 1
             args = _options(argv)
-            # The bench takes the same forms every verb takes, bare cell
-            # included; `_bench_and_rest` says how many words it cost so the
-            # recipe behind it is never truncated or padded.
-            bench, rest = _bench_and_rest(positional[1:])
-            args["bench"] = bench
+            action = "set" if verb in FILTER_VERBS else verb
             if verb == "add":
                 if not rest:
-                    print('usage: bills.py add <bench> "<recipe>" [options] [--do]')
+                    print("usage: %s" % USAGE["add"])
                     return 1
                 args["recipe"] = " ".join(rest)
             else:
                 if not rest:
-                    print("usage: bills.py %s <bench> <index> [options] [--do]" % verb)
+                    print("usage: %s" % USAGE[verb])
                     return 1
                 try:
                     args["index"] = int(rest[0])
                 except ValueError:
                     print("index must be a whole number, got %r" % rest[0])
+                    return 1
+                names = rest[1:]
+                if verb in FILTER_VERBS:
+                    if not names:
+                        print("usage: %s" % USAGE[verb])
+                        return 1
+                    if args.get(verb):
+                        print("REFUSED: %s was given twice, as the verb and as --%s. "
+                              "Nothing was sent to the game." % (verb, verb))
+                        return 1
+                    args[verb] = ",".join(n.strip(",") for n in names if n.strip(","))
+                elif names:
+                    print("REFUSED: %s" % _unconsumed(verb, names))
                     return 1
                 if verb == "move":
                     to = _int_opt(argv, "--to")
@@ -766,10 +1102,22 @@ def main():
                         return 1
             # Through write(), so the CLI and the import API resolve a bench
             # by exactly the same code.
-            r = write(verb, args.pop("bench"), do=do, watch=watch, **args)
+            r = write(action, bench, do=do, watch=watch, **args)
+        elif _options(argv) or do:
+            # An option -- or a bare --do -- is an intention to CHANGE something.
+            # It ends in a write or in a refusal, never in a bill sheet.
+            spec, index, note, refused = _implicit_write(bench, argv)
+            if refused:
+                if as_json:
+                    print(json.dumps(refused, indent=1))
+                    return 1
+                print("%s: %s" % ("WROTE NOTHING" if do else "REFUSED",
+                                  refused["error"]))
+                return 1
+            verb, args = "set", dict(_options(argv), index=index)
+            r = write("set", spec, do=do, watch=watch, **args)
         else:
-            r = state(bench=_bench_spec(positional) if positional else None,
-                      all_factions="--all" in argv)
+            r = state(bench=bench, all_factions="--all" in argv)
     except Exception as e:
         print("bills.py FAILED -- NO BILL DATA WAS READ.")
         print("%s: %s" % (type(e).__name__, e))
@@ -778,9 +1126,15 @@ def main():
 
     if as_json:
         print(json.dumps(r, indent=1))
-        return 0
+        # The document is the output; the EXIT CODE is the only thing a script
+        # chaining on this can read without parsing. Returning 0 on a refusal
+        # made `--json` the one spelling that could not tell a refused write
+        # from a done one -- every other path here returns 1.
+        return 0 if r.get("success") is not False else 1
 
-    if verb in ("add", "set", "delete", "move"):
+    if verb and verb != "recipes":
+        if note:
+            print(note)
         code = print_write(r)
         if args.get("allow"):
             print("allow is additive; a def already allowed changes nothing. "

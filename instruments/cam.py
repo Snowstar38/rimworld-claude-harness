@@ -163,7 +163,8 @@ def _centre(s):
 
 
 def map_size():
-    """(w, h), cached on disk per save -- rim.map_size() is a ~20-call binary search.
+    """(w, h), cached on disk per save -- rim.map_size() is one bridge call with the
+    companion loaded and a ~20-call binary search without it.
 
     Keyed by the save name, so loading a different colony re-probes instead of
     inheriting the last map's bounds. A cache that could be silently wrong about

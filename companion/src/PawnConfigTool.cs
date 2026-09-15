@@ -1495,7 +1495,9 @@ namespace HomeBridge.BridgeTools
                 + "followFieldwork, allowedArea (by name; \"none\" clears it), master, and -- for animals -- training "
                 + "(training=\"Obedience=on,Release=off\", the Animals tab's tick boxes, which cascade the way the tab does), "
                 + "slaughter and releaseToWild (the two Animals tab designations, on/off, mutually exclusive the way the game's own "
-                + "designators make them). nickname renames the pawn: on a colonist only the nick between the first and last "
+                + "designators make them), and -- for a WILD animal -- hunt and tame (on/off, what Designator_Hunt and "
+                + "Designator_Tame put on the ANIMAL rather than on a cell, so an animal that has walked since it was read is "
+                + "still reached). nickname renames the pawn: on a colonist only the nick between the first and last "
                 + "name changes, an animal or a mech is renamed outright. Every field the caller names gets a before "
                 + "and an after; on a real run the after is READ BACK from the game, never the value that was asked for. A value the "
                 + "game will not accept is REFUSED with the reason -- a disabled work type, an out-of-range priority, an unknown area "
@@ -1503,14 +1505,15 @@ namespace HomeBridge.BridgeTools
                 + "work/schedule/settings/relations/animals:true.",
             ResultDescription =
                 "success, dryRun, applied, pawn{name,thingId}, fields[] (one row per field named: field, requested, before, after, "
-                + "changed, refused, reason; plus cascades[] on a training row, alsoRemoved[] on a designation row, and "
+                + "changed, refused, reason; plus cascades[] on a training row, alsoRemoved[] on a designation row -- on a "
+                + "hunt/tame row that is EVERY designation RemoveAllDesignationsOn cleared -- and "
                 + "{name, nick} as before/after on a nickname row), changed[] "
                 + "(English sentences), refused[], before{work,schedule,settings,animals} and "
                 + "after{...} as the same blocks home/list_pawns emits, afterIsPredicted (true on a dry run), options{} (the areas "
                 + "and enum values this pawn will accept) and notes.")]
         [ToolResponse("dryRun", "boolean", "True = nothing was written. Defaults to TRUE; a caller must pass dryRun:false deliberately.", Always = true)]
         [ToolResponse("applied", "boolean", "True only when at least one field was actually written to the game. False on every dry run.", Always = true)]
-        [ToolResponse("fields", "array", "One row per field the caller named: field, requested, before, after, changed, refused, reason. A field that is absent here was never asked for. A drop row adds item (what was identified), carried (every item the pawn holds) and droppedAt (the cell it landed on, null when nothing was dropped).", Always = true)]
+        [ToolResponse("fields", "array", "One row per field the caller named: field, requested, before, after, changed, refused, reason. A field that is absent here was never asked for. A drop row adds item (what was identified), carried (every item the pawn holds) and droppedAt (the cell it landed on, null when nothing was dropped). A slaughter/releaseToWild row adds alsoRemoved[] naming the one opposite designation cleared; a hunt/tame row adds the same key naming EVERY designation cleared, because both of those designators call RemoveAllDesignationsOn before adding.", Always = true)]
         [ToolResponse("refused", "array", "Every field this tool would not write, with the reason. Empty means nothing was refused - a refusal is never a silent skip.", Always = true)]
         [ToolResponse("before", "object", "work{}, schedule{}, settings{} and animals{} as they were, built by the same reader home/list_pawns uses. animals{} says applies:false on a humanlike rather than going missing.", Always = true)]
         [ToolResponse("after", "object", "The same four blocks after the writes. On a real run they are READ BACK from the game; on a dry run they are the predicted result and afterIsPredicted is true.", Always = true)]
@@ -1533,6 +1536,8 @@ namespace HomeBridge.BridgeTools
             [ToolParameter(Description = "Animal training, as \"TrainableDefName=on/off\" pairs, comma separated: \"Obedience=on,Release=off\". The names are the defNames home/list_pawns animals{}.training.trainables[].name returns (Tameness, Obedience, Release...). This is the Animals tab's tick box: it calls SetWantedRecursive, so turning one ON also turns its prerequisites on and turning one OFF turns everything depending on it off -- every def that will move is named in the field row's cascades[], on a dry run too. A trainable this animal cannot be assigned is REFUSED with RimWorld's own reason, in both directions, because that is the box the tab draws disabled. A pawn with no training tracker (every humanlike) is refused outright.")] string training = null,
             [ToolParameter(Description = "Mark or unmark this animal for slaughter: \"on\" or \"off\". Omit to leave it alone. Does what Designator_Slaughter does minus the sound and the popup, INCLUDING clearing any release-to-wild designation on the same animal (the game never leaves both standing). Refused for a non-animal, an animal that is not ours, a dead one, one in an aggressive mental state, or a non-flesh race. Already-marked is a no-op row, not a second designation -- a double add is a Log.Error, which pauses the colony.")] string slaughter = null,
             [ToolParameter(Description = "Mark or unmark this animal for release to the wild: \"on\" or \"off\". Omit to leave it alone. The mirror of slaughter, and clears a slaughter designation the same way. Additionally refused when RaceProps.canReleaseToWild is false for the race.")] string releaseToWild = null,
+            [ToolParameter(Description = "Mark or unmark a WILD animal to be HUNTED: \"on\" or \"off\". Omit to leave it alone. Does what Designator_Hunt does minus the sound, the mouse icon and the no-hunters-available warning. The designation hangs on the ANIMAL, not on a cell, so this reaches an animal that has walked since it was read. Designator_Hunt.DesignateThing calls RemoveAllDesignationsOn FIRST, so turning hunt ON clears EVERY other designation on that animal -- tame included -- and the field row names them in alsoRemoved[]. Refused for a non-animal, a prisoner in a prison cell, an animal belonging to a humanlike faction (ours included -- our animals are slaughtered, not hunted) and a dead one. Already-marked is a no-op row, not a second designation.")] string hunt = null,
+            [ToolParameter(Description = "Mark or unmark a WILD animal to be TAMED: \"on\" or \"off\". Omit to leave it alone. Does what Designator_Tame does minus the sound, the mouse icon and the manhunter/handler-skill warnings. Like hunt it hangs on the ANIMAL and clears EVERY other designation on it when turned ON. Refused for a non-animal, one belonging to a humanlike faction, a dead one, a Wildness stat of 1.0 or more, and anything else TameUtility.CanTame rejects (a dryad, an animal with Scaria). Already-marked is a no-op row.")] string tame = null,
             [ToolParameter(Description = "Drop ONE item this pawn is carrying -- worn apparel, the wielded weapon, or something in the pack -- named by a case-insensitive substring of its label or by its exact ThingID. The drop is direct, so it lands IMMEDIATELY even on a paused game, and the item is left UNFORBIDDEN. A substring matching more than one carried item is refused with every match named; the field row's carried[] lists everything the pawn holds. Refused for a pawn that is not ours, a dead one, locked apparel, a quest lodger's bonded gear and anything with destroyOnDrop.")] string drop = null,
             [ToolParameter(Description = "Rename this pawn: the nickname the game shows. On a colonist with a first/nick/last name only the NICK is replaced, keeping the first and last name; an animal or a mech, which has a single name, is renamed outright. 1 to 32 characters, non-whitespace. Omit to leave the name alone. Refused for a pawn that is not ours.")] string nickname = null,
             [ToolParameter(Description = "TRUE by default. Read the before, plan every write and return it WITHOUT touching the game. Pass false to actually apply it.", DefaultValue = true)] bool dryRun = true,
@@ -1543,7 +1548,7 @@ namespace HomeBridge.BridgeTools
                 await PawnConfigCore(
                     ctx, cancellationToken, pawn, work, schedule, medCare, hostilityResponse,
                     selfTend, followDrafted, followFieldwork, allowedArea, master,
-                    training, slaughter, releaseToWild, drop, nickname, dryRun, watch, watchSeconds).ConfigureAwait(false),
+                    training, slaughter, releaseToWild, hunt, tame, drop, nickname, dryRun, watch, watchSeconds).ConfigureAwait(false),
                 ctx, typeof(HomePawnConfigTools), ToolName);
         }
 
@@ -1563,6 +1568,8 @@ namespace HomeBridge.BridgeTools
             string training,
             string slaughter,
             string releaseToWild,
+            string hunt,
+            string tame,
             string drop,
             string nickname,
             bool dryRun,
@@ -1582,7 +1589,7 @@ namespace HomeBridge.BridgeTools
                 var planned = await ctx.MainThread
                     .InvokeAsync(() => Run(pawn, work, schedule, medCare, hostilityResponse, selfTend,
                                            followDrafted, followFieldwork, allowedArea, master,
-                                           training, slaughter, releaseToWild, drop, nickname, true),
+                                           training, slaughter, releaseToWild, hunt, tame, drop, nickname, true),
                                  cancellationToken)
                     .ConfigureAwait(false);
                 Stamp(planned, Watch.Skipped("dry run"));
@@ -1595,7 +1602,7 @@ namespace HomeBridge.BridgeTools
             var pass = await ctx.MainThread
                 .InvokeAsync(() => Pass1(ctx, pawn, work, schedule, medCare, hostilityResponse, selfTend,
                                          followDrafted, followFieldwork, allowedArea, master,
-                                         training, slaughter, releaseToWild, drop, nickname, watch),
+                                         training, slaughter, releaseToWild, hunt, tame, drop, nickname, watch),
                              cancellationToken)
                 .ConfigureAwait(false);
 
@@ -1619,7 +1626,7 @@ namespace HomeBridge.BridgeTools
                 {
                     var reply = Run(pawn, work, schedule, medCare, hostilityResponse, selfTend,
                                     followDrafted, followFieldwork, allowedArea, master,
-                                    training, slaughter, releaseToWild, drop, nickname, false);
+                                    training, slaughter, releaseToWild, hunt, tame, drop, nickname, false);
                     Stamp(reply, session == null ? Watch.Skipped(reason) : Watch.Finish(session, watchSeconds));
                     return reply;
                 }, cancellationToken)
@@ -1651,6 +1658,7 @@ namespace HomeBridge.BridgeTools
                                          string followDraftedSpec, string followFieldworkSpec,
                                          string areaSpec, string masterSpec,
                                          string trainingSpec, string slaughterSpec, string releaseToWildSpec,
+                                         string huntSpec, string tameSpec,
                                          string dropSpec, string nicknameSpec, bool wantWatch)
         {
             Map map;
@@ -1675,7 +1683,7 @@ namespace HomeBridge.BridgeTools
             var refused = new List<object>();
             PlanAll(target, map, everyone, workSpec, scheduleSpec, medCareSpec, hostilitySpec, selfTendSpec,
                     followDraftedSpec, followFieldworkSpec, areaSpec, masterSpec,
-                    trainingSpec, slaughterSpec, releaseToWildSpec, dropSpec, nicknameSpec, true,
+                    trainingSpec, slaughterSpec, releaseToWildSpec, huntSpec, tameSpec, dropSpec, nicknameSpec, true,
                     fields, changes, refused);
 
             if (fields.Count == 0)
@@ -1685,7 +1693,7 @@ namespace HomeBridge.BridgeTools
 
             var view = ChooseView(target, workSpec, scheduleSpec, medCareSpec, hostilitySpec, selfTendSpec,
                                   followDraftedSpec, followFieldworkSpec, areaSpec, masterSpec,
-                                  trainingSpec, slaughterSpec, releaseToWildSpec, dropSpec, nicknameSpec);
+                                  trainingSpec, slaughterSpec, releaseToWildSpec, huntSpec, tameSpec, dropSpec, nicknameSpec);
             if (view == null)
                 return new Pass1Result { SkipReason = "no tab covers these fields" };
 
@@ -1701,6 +1709,7 @@ namespace HomeBridge.BridgeTools
                                   string followDraftedSpec, string followFieldworkSpec,
                                   string areaSpec, string masterSpec,
                                   string trainingSpec, string slaughterSpec, string releaseToWildSpec,
+                                  string huntSpec, string tameSpec,
                                   string dropSpec, string nicknameSpec, bool dryRun)
         {
             Map map;
@@ -1724,7 +1733,7 @@ namespace HomeBridge.BridgeTools
             var refused = new List<object>();
             var applied = PlanAll(target, map, everyone, workSpec, scheduleSpec, medCareSpec, hostilitySpec,
                                   selfTendSpec, followDraftedSpec, followFieldworkSpec, areaSpec, masterSpec,
-                                  trainingSpec, slaughterSpec, releaseToWildSpec, dropSpec, nicknameSpec, dryRun,
+                                  trainingSpec, slaughterSpec, releaseToWildSpec, huntSpec, tameSpec, dropSpec, nicknameSpec, dryRun,
                                   fields, changes, refused);
 
             // The after. On a real run this is a fresh read of the game, so a
@@ -1765,7 +1774,8 @@ namespace HomeBridge.BridgeTools
                         { "workPriorityScale", "0 = never do this job. 1 is the most urgent, 4 the least. With manualPriorities false the Work tab is a checkbox grid and any request above 0 is applied as 3, which is what clicking the box does." },
                         { "readSide", "The matching read is home/list_pawns with work:true / schedule:true / settings:true / relations:true / animals:true. before{} and after{} here are those very blocks, from the same builders." },
                         { "trainingCascades", "training= calls Pawn_TrainingTracker.SetWantedRecursive, which is what the Animals tab's checkbox calls. Turning a trainable ON turns every prerequisite ON; turning one OFF turns everything that depends on it OFF. Each training row names the defs it will move in cascades[], on a dry run as well as a real one, and on a real run any def the cascade moved that the caller did not name gets its own line in changed[]." },
-                        { "designationsExclude", "slaughter and releaseToWild are mutually exclusive: setting either one ON clears the other, exactly as Designator_Slaughter.DesignateThing and Designator_ReleaseAnimalToWild.DesignateThing do. The field row's alsoRemoved[] names what was cleared. Setting a designation that is already set is a NO-OP row (changed:false), never a second AddDesignation -- that call is a Verse.Log.Error, which pauses the colony." }
+                        { "designationsExclude", "slaughter and releaseToWild are mutually exclusive: setting either one ON clears the other, exactly as Designator_Slaughter.DesignateThing and Designator_ReleaseAnimalToWild.DesignateThing do. The field row's alsoRemoved[] names what was cleared. Setting a designation that is already set is a NO-OP row (changed:false), never a second AddDesignation -- that call is a Verse.Log.Error, which pauses the colony." },
+                        { "designationsWild", "hunt and tame are the WILD pair and are written the same way, but their exclusion is TOTAL: Designator_Hunt.DesignateThing and Designator_Tame.DesignateThing both call DesignationManager.RemoveAllDesignationsOn(t) before adding, so turning either ON removes EVERY designation standing on that animal -- the field row's alsoRemoved[] names each one by defName. hunt and tame both ON in one call is refused rather than resolved. An animal of ours can be slaughtered but never hunted or tamed, and a wild one the reverse, so the two pairs cannot collide on one pawn." }
                     } }
             };
 
@@ -1780,7 +1790,8 @@ namespace HomeBridge.BridgeTools
                                     string workSpec, string scheduleSpec, string medCareSpec, string hostilitySpec,
                                     string selfTendSpec, string followDraftedSpec, string followFieldworkSpec,
                                     string areaSpec, string masterSpec, string trainingSpec,
-                                    string slaughterSpec, string releaseToWildSpec, string dropSpec,
+                                    string slaughterSpec, string releaseToWildSpec,
+                                    string huntSpec, string tameSpec, string dropSpec,
                                     string nicknameSpec, bool dryRun,
                                     List<object> fields, List<object> changes, List<object> refused)
         {
@@ -1827,6 +1838,33 @@ namespace HomeBridge.BridgeTools
                 applied |= PlanDesignation(target, "releaseToWild", releaseDef, slaughterDef, releaseToWildSpec, dryRun,
                                            fields, changes, refused);
 
+            // Hunt and Tame are the WILD half of the same tab. They do not
+            // exclude one named opposite the way slaughter and releaseToWild
+            // do: Designator_Hunt.DesignateThing and Designator_Tame.
+            // DesignateThing both call RemoveAllDesignationsOn(t) FIRST, so
+            // turning either ON clears everything standing on that animal.
+            // Asking for both ON in one call therefore cannot mean anything --
+            // whichever ran second would be the only one left -- so it is
+            // refused rather than silently resolved.
+            var huntDef = BridgeCommon.Try<DesignationDef>(() => DesignationDefOf.Hunt, null);
+            var tameDef = BridgeCommon.Try<DesignationDef>(() => DesignationDefOf.Tame, null);
+            var bothOn = WantsOn(huntSpec) && WantsOn(tameSpec);
+            if (bothOn)
+            {
+                const string clash = "hunt and tame were both asked for ON in one call. Designator_Hunt and Designator_Tame both call "
+                    + "DesignationManager.RemoveAllDesignationsOn first, so the second one would erase the first and the animal would "
+                    + "carry only one of them. Send one call per designation, or pick one.";
+                Refuse(fields, refused, "hunt", huntSpec.Trim(), null, clash);
+                Refuse(fields, refused, "tame", tameSpec.Trim(), null, clash);
+            }
+            else
+            {
+                if (!string.IsNullOrEmpty(tameSpec))
+                    applied |= PlanWildDesignation(target, "tame", tameDef, tameSpec, dryRun, fields, changes, refused);
+                if (!string.IsNullOrEmpty(huntSpec))
+                    applied |= PlanWildDesignation(target, "hunt", huntDef, huntSpec, dryRun, fields, changes, refused);
+            }
+
             // ----------------------------------------------------------- gear
             if (!string.IsNullOrEmpty(dropSpec))
                 applied |= PlanDrop(target, dropSpec, dryRun, fields, changes, refused);
@@ -1872,6 +1910,7 @@ namespace HomeBridge.BridgeTools
                                        string followDraftedSpec, string followFieldworkSpec,
                                        string areaSpec, string masterSpec,
                                        string trainingSpec, string slaughterSpec, string releaseToWildSpec,
+                                       string huntSpec, string tameSpec,
                                        string dropSpec, string nicknameSpec)
         {
             var work = Pairs(workSpec);
@@ -1881,10 +1920,15 @@ namespace HomeBridge.BridgeTools
             var training = Pairs(trainingSpec) + One(slaughterSpec) + One(releaseToWildSpec)
                            + One(masterSpec) + One(followDraftedSpec) + One(followFieldworkSpec);
 
+            // A wild animal draws no Training tab and sits in no Animals row:
+            // what a player looking at a hunt or a tame mark sees is the animal
+            // itself, selected, with the camera on it. That is the whole view.
+            var wild = One(huntSpec) + One(tameSpec);
+
             var gear = One(dropSpec);
             var bio = One(nicknameSpec);
 
-            var total = work + schedule + assign + health + gear + bio + training;
+            var total = work + schedule + assign + health + gear + bio + training + wild;
             if (total == 0)
                 return null;
 
@@ -1896,6 +1940,7 @@ namespace HomeBridge.BridgeTools
             if (gear > best) best = gear;
             if (bio > best) best = bio;
             if (training > best) best = training;
+            if (wild > best) best = wild;
 
             if (work == best)
                 return new View { MainTabName = "Work", Note = Covers("the Work tab", work, total, name) };
@@ -1932,6 +1977,16 @@ namespace HomeBridge.BridgeTools
                         : Covers(name + "'s " + nameTab.Name.Replace("ITab_Pawn_", "") + " tab", bio, total, name)
                 };
             }
+            if (wild == best)
+                return new View
+                {
+                    Target = target,
+                    InspectTab = null,
+                    Camera = true,
+                    Note = "Selected " + name + " with the camera on them. A wild animal draws no Animals tab row and no "
+                           + "Training tab, so the hunt/tame mark is watched on the animal itself, which is where the "
+                           + "designator puts it."
+                };
             return new View
             {
                 Target = target,
@@ -2880,6 +2935,243 @@ namespace HomeBridge.BridgeTools
                                 ? " (and cleared " + string.Join(", ", alsoRemoved.Select(x => Show(x)).ToArray()) + ")"
                                 : ""));
             return applied;
+        }
+
+        /// <summary>True only for a spec that parses as ON. An absent or
+        /// unparseable spec is not "on" -- that is handled where it is planned,
+        /// with a reason.</summary>
+        private static bool WantsOn(string spec)
+        {
+            bool want;
+            return !string.IsNullOrEmpty(spec) && TryParseOnOff(spec, out want) && want;
+        }
+
+        /// <summary>
+        /// Add or remove one of the two WILD designations - Hunt or Tame -
+        /// doing what the designator does minus the sound, the mouse icon and
+        /// the warning messages it throws afterwards.
+        ///
+        /// ## Why this is not PlanDesignation
+        ///
+        /// `PlanDesignation` handles the two Animals-tab designations that sit
+        /// on OUR animals, and their exclusion names ONE opposite. Hunt and Tame
+        /// are the reverse in both halves:
+        ///
+        /// * **Who they accept.** `Designator_Hunt.CanDesignateThing` wants a
+        ///   pawn that `AnimalOrWildMan()`, is not `IsPrisonerInPrisonCell()`,
+        ///   and whose `Faction` is null or a faction whose def is not
+        ///   `humanlikeFaction`. `Designator_Tame` defers to
+        ///   `TameUtility.CanTame`: `AnimalOrWildMan()`, the same faction test,
+        ///   `GetStatValue(StatDefOf.Wildness) &lt; 1f`, not a dryad and no
+        ///   Scaria. Our own animals fail both, which is why slaughter and hunt
+        ///   can never collide on one pawn.
+        /// * **What they clear.** Both `DesignateThing` bodies open with
+        ///   `Map.designationManager.RemoveAllDesignationsOn(t)` and only then
+        ///   add. So turning either ON clears EVERY designation on the animal,
+        ///   not one named opposite. Each one cleared is named in `alsoRemoved`.
+        ///
+        /// The rest is `PlanDesignation`'s contract exactly: the presence check
+        /// happens HERE because `DesignationManager.AddDesignation` answers a
+        /// double-add with `Verse.Log.Error`, which calls `TickManager.Pause()`;
+        /// an already-marked animal is a no-op row (`changed:false`), never a
+        /// second add.
+        ///
+        /// What is deliberately NOT done: `FinalizeDesignationSucceeded` on both
+        /// designators throws `Messages.Message` warnings - no hunters
+        /// available, this kind goes manhunter, no handler skilled enough - and
+        /// `TameUtility.ShowDesignationWarnings` reads `Faction.OfPlayer`, which
+        /// is the hazard this whole file is written around. The designation is
+        /// what the caller asked for; the toast is not.
+        /// </summary>
+        private static bool PlanWildDesignation(Pawn pawn, string field, DesignationDef def, string spec, bool dryRun,
+                                                List<object> fields, List<object> changes, List<object> refused)
+        {
+            if (string.IsNullOrEmpty(spec))
+                return false;
+
+            if (def == null)
+            {
+                Refuse(fields, refused, field, spec.Trim(), null,
+                    "The DesignationDef this field writes was not found in this build's DefDatabase. Nothing was attempted.");
+                return false;
+            }
+
+            bool want;
+            if (!TryParseOnOff(spec, out want))
+            {
+                Refuse(fields, refused, field, spec.Trim(), null,
+                    "\"" + spec.Trim() + "\" is not on/off. Accepted: on, off, true, false, yes, no, 1, 0.");
+                return false;
+            }
+
+            var beforeValue = PawnSettingsRead.DesignationOnSafe(pawn, def) != null;
+
+            Map map = null;
+            try { map = pawn.MapHeld; }
+            catch { map = null; }
+            var manager = map != null ? BridgeCommon.Try<DesignationManager>(() => map.designationManager, null) : null;
+            if (manager == null)
+            {
+                Refuse(fields, refused, field, want, beforeValue,
+                    "This pawn is not held by any map, so there is no designation manager to write to. The designator keys off "
+                    + "MapHeld too -- the write would have gone nowhere silently.");
+                return false;
+            }
+
+            if (want)
+            {
+                string why;
+                if (!CanDesignateWild(pawn, field, out why))
+                {
+                    Refuse(fields, refused, field, want, beforeValue, why);
+                    return false;
+                }
+            }
+
+            var alsoRemoved = new List<object>();
+            object afterValue = want;
+            var applied = false;
+
+            if (want == beforeValue)
+            {
+                // Nothing to do, and saying so is the answer. A second
+                // AddDesignation is the Log.Error that pauses the colony.
+                afterValue = beforeValue;
+            }
+            else if (!dryRun)
+            {
+                try
+                {
+                    if (want)
+                    {
+                        foreach (var name in OtherDesignationsOn(pawn, def))
+                            alsoRemoved.Add(name);
+                        manager.RemoveAllDesignationsOn(pawn);
+                        manager.AddDesignation(new Designation(pawn, def));
+                    }
+                    else
+                    {
+                        var existing = PawnSettingsRead.DesignationOnSafe(pawn, def);
+                        if (existing != null)
+                            manager.RemoveDesignation(existing);
+                    }
+                    applied = true;
+                }
+                catch
+                {
+                    Refuse(fields, refused, field, want, beforeValue,
+                        "Writing the designation threw. Re-read animals{}.designations before trusting anything.");
+                    return false;
+                }
+                afterValue = PawnSettingsRead.DesignationOnSafe(pawn, def) != null;
+            }
+            else if (want)
+            {
+                // Dry run: what RemoveAllDesignationsOn would take is part of
+                // the plan and must be in it.
+                foreach (var name in OtherDesignationsOn(pawn, def))
+                    alsoRemoved.Add(name);
+            }
+
+            var changed = !Equals(beforeValue, afterValue);
+            var row = RecordRow(field, want, beforeValue, afterValue, changed,
+                want == beforeValue
+                    ? "Already " + (want ? "marked" : "unmarked") + " -- nothing was written. A second AddDesignation is a "
+                      + "Verse.Log.Error, which pauses the colony."
+                    : null);
+            row["alsoRemoved"] = alsoRemoved;
+            fields.Add(row);
+            if (changed)
+                changes.Add(field + ": " + Show(beforeValue) + " -> " + Show(afterValue)
+                            + (alsoRemoved.Count > 0
+                                ? " (and cleared " + string.Join(", ", alsoRemoved.Select(x => Show(x)).ToArray()) + ")"
+                                : ""));
+            return applied;
+        }
+
+        /// <summary>Every designation standing on this pawn EXCEPT the one about
+        /// to be added, by defName -- what `RemoveAllDesignationsOn` will take.
+        /// Never throws; an unreadable list contributes nothing.</summary>
+        private static List<string> OtherDesignationsOn(Pawn pawn, DesignationDef def)
+        {
+            var names = new List<string>();
+            try
+            {
+                var map = pawn.MapHeld;
+                var manager = map != null ? map.designationManager : null;
+                if (manager == null)
+                    return names;
+                var all = manager.AllDesignationsOn(pawn);
+                if (all == null)
+                    return names;
+                for (var i = 0; i < all.Count; i++)
+                {
+                    var d = all[i];
+                    if (d == null || d.def == null || d.def == def)
+                        continue;
+                    var name = BridgeCommon.SafeString(() => d.def.defName);
+                    if (!string.IsNullOrEmpty(name) && !names.Contains(name))
+                        names.Add(name);
+                }
+            }
+            catch { }
+            return names;
+        }
+
+        /// <summary>The designator's own CanDesignateThing, check by check, so a
+        /// refusal says which gate closed rather than "no".</summary>
+        private static bool CanDesignateWild(Pawn pawn, string field, out string reason)
+        {
+            reason = null;
+            var tame = string.Equals(field, "tame", StringComparison.Ordinal);
+
+            if (!BridgeCommon.Try(() => pawn.AnimalOrWildMan(), false))
+            {
+                reason = "Only an animal (or a wild man) can be " + (tame ? "tamed" : "hunted")
+                       + ": Pawn.AnimalOrWildMan() is false, and that is the designator's first test.";
+                return false;
+            }
+            if (BridgeCommon.Try(() => pawn.Dead, false))
+            {
+                reason = "This animal is dead. A corpse is butchered, not " + (tame ? "tamed" : "hunted")
+                       + " -- the designation goes on a living pawn.";
+                return false;
+            }
+            var faction = BridgeCommon.Try<Faction>(() => pawn.Faction, null);
+            if (faction != null && BridgeCommon.Try(() => faction.def != null && faction.def.humanlikeFaction, false))
+            {
+                reason = "This animal belongs to \"" + BridgeCommon.SafeString(() => faction.Name)
+                       + "\", a humanlike faction, and both designators require pawn.Faction == null or a faction whose def is "
+                       + "not humanlikeFaction. If it is OURS, the write you want is slaughter -- "
+                       + "home/pawn_config {pawn, slaughter:\"on\", dryRun:false} -- not hunt.";
+                return false;
+            }
+            if (!tame)
+            {
+                if (BridgeCommon.Try(() => pawn.IsPrisonerInPrisonCell(), false))
+                {
+                    reason = "This pawn is a prisoner standing in a prison cell, which Designator_Hunt refuses outright.";
+                    return false;
+                }
+                return true;
+            }
+
+            var wildness = BridgeCommon.TryN(() => pawn.GetStatValue(StatDefOf.Wildness));
+            if (wildness != null && wildness.Value >= 1f)
+            {
+                reason = "This animal's Wildness stat is " + wildness.Value.ToString("0.##")
+                       + "; TameUtility.CanTame requires it under 1.0. Nothing tames a 100% wild animal -- hunting is the only "
+                       + "option the game offers for it.";
+                return false;
+            }
+            if (!BridgeCommon.Try(() => TameUtility.CanTame(pawn), false))
+            {
+                reason = "TameUtility.CanTame says no for this animal, and the checks above passed -- so the gate is one of the "
+                       + "two this bridge has no read for: it is a dryad (RaceProps.animalType), or it is carrying Scaria, the "
+                       + "disease that makes an animal untameable. The Animals tab draws no tame box for either.";
+                return false;
+            }
+            return true;
         }
 
         // ================================================================ gear

@@ -138,5 +138,108 @@ class ZonePositionalTests(unittest.TestCase):
         self.assertIn("Growing zone 1", text)
 
 
+def zone(label, id, cells, listed=None):
+    return {"label": label, "id": id, "type": "Zone_Stockpile",
+            "listedCellCount": len(cells) if listed is None else listed,
+            "gridCellCount": len(cells) if listed is None else listed,
+            "cells": [{"x": x, "z": z} for x, z in cells],
+            "gridCells": [{"x": x, "z": z} for x, z in cells]}
+
+
+CREATED = {"success": True, "tool": "home/zone_cells", "op": "create",
+           "dryRun": True, "changed": True,
+           "zone": {"label": "Pantry", "id": None, "type": "Zone_Stockpile"},
+           "cells": [], "changes": [], "zonesRemoved": [], "presetDefinition": {},
+           "filter": None, "watch": {"shown": False, "reason": "dry run"}}
+
+
+class CreateOverlapTests(unittest.TestCase):
+    """`create` took cells off a standing zone without saying so."""
+
+    def run_cli(self, argv, zones_on_map):
+        calls = []
+
+        def game(tool, args=None, strict=True):
+            calls.append((tool, args))
+            if tool == "home/list_zones":
+                return {"success": True, "zoneCount": len(zones_on_map),
+                        "zones": zones_on_map}
+            return CREATED
+
+        with mock.patch.object(zones.rim, "game", side_effect=game), \
+             mock.patch.object(zones.rim, "init"), \
+             mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            code = zones.main(argv)
+        return code, out.getvalue(), calls
+
+    def test_an_overlap_refuses_and_writes_nothing(self):
+        existing = zone("Pantry", 4, [(113, 140), (114, 140)], listed=8)
+        code, text, calls = self.run_cli(
+            ["create", "stockpile", "Meals", "113", "140", "2", "2"], [existing])
+        self.assertEqual(1, code)
+        self.assertIn("CREATE REFUSED", text)
+        self.assertIn("Pantry (id 4): 2 cell(s)", text)
+        self.assertIn("--merge", text)
+        self.assertEqual([], [t for t, _ in calls if t == "home/zone_cells"])
+
+    def test_merge_takes_them_and_says_which(self):
+        existing = zone("Pantry", 4, [(113, 140), (114, 140)], listed=8)
+        code, text, calls = self.run_cli(
+            ["create", "stockpile", "Meals", "113", "140", "2", "2", "--merge"],
+            [existing])
+        self.assertIn(code, (0, None))
+        self.assertIn("TAKING 2 cell(s)", text)
+        self.assertIn("it keeps 6 cell(s)", text)
+        self.assertEqual(1, len([t for t, _ in calls if t == "home/zone_cells"]))
+
+    def test_emptying_a_zone_needs_the_louder_flag(self):
+        existing = zone("Pantry", 4, [(113, 140), (114, 140)])
+        code, text, _ = self.run_cli(
+            ["create", "stockpile", "Meals", "113", "140", "2", "2", "--merge"],
+            [existing])
+        self.assertEqual(1, code)
+        self.assertIn("that is EVERY cell it has", text)
+        self.assertIn("--replace", text)
+
+    def test_replace_goes_through(self):
+        existing = zone("Pantry", 4, [(113, 140), (114, 140)])
+        code, text, calls = self.run_cli(
+            ["create", "stockpile", "Meals", "113", "140", "2", "2", "--replace"],
+            [existing])
+        self.assertIn(code, (0, None))
+        self.assertEqual(1, len([t for t, _ in calls if t == "home/zone_cells"]))
+
+    def test_no_overlap_asks_for_no_flag(self):
+        existing = zone("Pantry", 4, [(200, 200)])
+        code, text, calls = self.run_cli(
+            ["create", "stockpile", "Meals", "113", "140", "2", "2"], [existing])
+        self.assertIn(code, (0, None))
+        self.assertNotIn("REFUSED", text)
+        self.assertEqual(1, len([t for t, _ in calls if t == "home/zone_cells"]))
+
+
+class UsageInsteadOfATracebackTests(unittest.TestCase):
+    """`zones.py create` with no arguments died on an IndexError."""
+
+    def usage(self, argv):
+        with mock.patch.object(zones.rim, "init"), \
+             mock.patch.object(zones.rim, "game") as game, \
+             mock.patch("sys.stdout", new_callable=io.StringIO):
+            with self.assertRaises(SystemExit) as caught:
+                zones.main(argv)
+        game.assert_not_called()
+        return str(caught.exception)
+
+    def test_create_with_no_arguments_prints_its_usage(self):
+        self.assertIn("zones.py create <stockpile|growing>", self.usage(["create"]))
+
+    def test_create_with_a_type_and_no_label_prints_its_usage(self):
+        self.assertIn("zones.py create", self.usage(["create", "stockpile"]))
+
+    def test_add_and_delete_say_what_they_need(self):
+        self.assertIn("zones.py add", self.usage(["add"]))
+        self.assertIn("zones.py delete", self.usage(["delete"]))
+
+
 if __name__ == "__main__":
     unittest.main()

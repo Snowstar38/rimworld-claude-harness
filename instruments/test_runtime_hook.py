@@ -5,7 +5,7 @@ import runtime_hook as h
 class Hooks(unittest.TestCase):
  def setUp(self):
   self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
-  self.patches=[patch.object(h,'STATE',Path(self.temp.name)),patch.object(h.runtime_binding,'load',return_value={'session_id':'s'}),patch.object(h.runtime_binding,'alive',return_value=True),patch.object(h.runtime_binding,'NOTE',Path(self.temp.name)/'note.json'),patch.object(h.runtime_binding,'rebind_if_stale',return_value=(False,'live'))]
+  self.patches=[patch.object(h,'STATE',Path(self.temp.name)),patch.object(h.runtime_binding,'load',return_value={'session_id':'s'}),patch.object(h.runtime_binding,'alive',return_value=True),patch.object(h.runtime_binding,'NOTE',Path(self.temp.name)/'note.json'),patch.object(h.runtime_binding,'rebind_if_stale',return_value=(False,'live')),patch.object(h,'overlay_phase_core')]
   for p in self.patches:p.start();self.addCleanup(p.stop)
   self.d={'session_id':'s','agent_id':'hands','hook_event_name':'SubagentStop'}
  def test_stop_releases_child_without_blocking(self):
@@ -77,7 +77,7 @@ class Recovery(unittest.TestCase):
  def setUp(self):
   self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
   self.dir=Path(self.temp.name)
-  self.patches=[patch.object(h,'STATE',self.dir),patch.object(h.runtime_binding,'load',return_value={'session_id':'s'}),patch.object(h.runtime_binding,'alive',return_value=True),patch.object(h.runtime_binding,'NOTE',Path(self.temp.name)/'note.json'),patch.object(h.runtime_binding,'rebind_if_stale',return_value=(False,'live'))]
+  self.patches=[patch.object(h,'STATE',self.dir),patch.object(h.runtime_binding,'load',return_value={'session_id':'s'}),patch.object(h.runtime_binding,'alive',return_value=True),patch.object(h.runtime_binding,'NOTE',Path(self.temp.name)/'note.json'),patch.object(h.runtime_binding,'rebind_if_stale',return_value=(False,'live')),patch.object(h,'overlay_phase_core')]
   for p in self.patches:p.start();self.addCleanup(p.stop)
   self.d={'session_id':'s','agent_id':'hands','hook_event_name':'SubagentStop'}
  def stream(self,**state):(self.dir/'stream.json').write_text(json.dumps(state))

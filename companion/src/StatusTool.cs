@@ -161,10 +161,10 @@ namespace HomeBridge.BridgeTools
         [ToolResponse("messages", "array", "The live transient messages, newest first: id, text, messageType, startingTick, ageTicks, startingFrame, ageSeconds, expired, lookTarget. This channel evaporates 13 REAL seconds after it appears and nothing can recover it afterwards. Empty array when none are live.", Always = true)]
         [ToolResponse("alerts", "array", "Active alerts, loudest first: label, priority, type, active, targetCount, targetsTruncated, targets[] ({name,thingId,defName,kind,position}) naming the culprits, and explanation (null unless explanations:true). Empty array when nothing is alerting.", Always = true)]
         [ToolResponse("colonists", "array", "One compact row per free colonist spawned on the current map: name, thingId, position, dead, downed, drafted, inBed, job, mood, breakRisk, healthPct, needsTend, bleeding, mentalState, plus needs{} and hediffs[] under colonistDetail:true. EMPTY ARRAY when colonists:false was passed - blocks.colonists says which case this is.", Always = true)]
-        [ToolResponse("threats", "object", "FOUR lists, none of them a subset of another. hostileCount + hostiles[] (name, kindDef, faction, position, hostileReason, job, downed, predator, manhunterOnDamageChance, distanceToNearestColonist); huntingPredators[] + huntersIgnored[] with the reason each hunt was not counted (a tame predator's hunt and a wild predator eating wildlife are both excluded); wildPredatorsNearCount + wildPredatorsNear[], every non-player, non-hostile, non-hunting pawn whose Verse.RaceProperties.predator is TRUE within predatorRadius of a colonist, hostileReason 'predator_near' -- the wild boar fifteen cells away that no other list mentions; and downedNearCount + downedNear[], downed non-colonist non-player pawns in the same radius, hostileReason 'downed', because a manhunter that goes down loses its mental state and silently leaves hostiles[]. predatorRadius echoes the radius used. A downed predator is in BOTH new lists; the row's downed field tells them apart. Never null; an empty object's counts are 0, and blocks.threats says whether it was read at all.", Always = true)]
-        [ToolResponse("ui", "object", "mainTabOpen, mainTabDefName, mainTabLabel, selectedCount, selectedFirstLabel, modalOpen, modalWindow (the type name of the dialog absorbing map input, or null), windowsForcePause, anyWindowAbsorbingAllInput, nonImmediateDialogWindowOpen, windowCount and windows[] ({type,layer,title,forcePause,absorbInputAroundWindow}). modalOpen is the check move.blocking_window() does by hand.", Always = true)]
-        [ToolResponse("counts", "object", "letterCount, letterChoiceCount, messageCount, alertCount, loudAlertCount (High or Critical), colonistCount, downedCount, hostileCount, huntingPredatorCount, wildPredatorsNearCount and downedNearCount. The one-line summary, so a brief caller reads eleven numbers instead of seven arrays. The last two are NOT folded into hostileCount: nothing in them is fighting yet, and hostileCount 0 has to keep meaning what it means.", Always = true)]
-        [ToolResponse("blocks", "object", "What was actually asked for: colonists, threats, explanations, colonistDetail and predatorRadius. An empty colonists[] means something different under each, and predatorRadius 0 means wildPredatorsNear[] and downedNear[] were switched off, not empty.", Always = true)]
+        [ToolResponse("threats", "object", "THREE lists, none of them a subset of another. hostileCount + hostiles[] (name, kindDef, faction, position, hostileReason, job, downed, predator, manhunterOnDamageChance, distanceToNearestColonist); huntingPredators[] + huntersIgnored[] with the reason each hunt was not counted (a tame predator's hunt and a wild predator eating wildlife are both excluded); and downedNearCount + downedNear[], downed non-colonist non-player pawns in the same radius, hostileReason 'downed', because a manhunter that goes down loses its mental state and silently leaves hostiles[]. predatorRadius echoes the radius used. Never null; an empty object's counts are 0, and blocks.threats says whether it was read at all.", Always = true)]
+        [ToolResponse("ui", "object", "mainTabOpen, mainTabDefName, mainTabLabel, selectedCount, selectedFirstLabel, modalOpen, modalWindow (the type name of the dialog absorbing map input, or null), windowsForcePause, anyWindowAbsorbingAllInput, nonImmediateDialogWindowOpen, windowCount and windows[] ({type,layer,title,forcePause,absorbInputAroundWindow}). modalOpen is the check move.blocking_window() does by hand. targeter{active,source,caster} is Find.Targeter: active true means a map click is being read as a target (a Deploy turret gizmo, any Command_VerbTarget or Command_Target), source is the gizmo/verb label, caster the pawn thingId or null. A targeter opens NO window, so a window diff cannot see it.", Always = true)]
+        [ToolResponse("counts", "object", "letterCount, letterChoiceCount, messageCount, alertCount, loudAlertCount (High or Critical), colonistCount, downedCount, hostileCount, huntingPredatorCount and downedNearCount. The one-line summary, so a brief caller reads ten numbers instead of six arrays. The last one is NOT folded into hostileCount: nothing in them is fighting yet, and hostileCount 0 has to keep meaning what it means.", Always = true)]
+        [ToolResponse("blocks", "object", "What was actually asked for: colonists, threats, explanations, colonistDetail and predatorRadius. An empty colonists[] means something different under each, and predatorRadius 0 means downedNear[] was switched off, not empty.", Always = true)]
         [ToolResponse("skipped", "array", "One entry per thing that could not be read, naming the field and the reason. Empty array = everything answered. A null anywhere above is accounted for here.", Always = true)]
         [ToolResponse("unknownArguments", "array", "Every argument key the caller sent that this tool does not declare, sorted, case-sensitively. Empty array = every key was recognised. The host's own _rimBridgeTimeoutMs is never listed.", Always = true)]
         [ToolResponse("unknownArgumentsWarning", "string", "Present only when unknownArguments is non-empty, or when the caller's raw keys could not be read at all - in which case the empty unknownArguments means 'not known', not 'nothing unknown'.", Nullable = true)]
@@ -175,7 +175,7 @@ namespace HomeBridge.BridgeTools
             [ToolParameter(Description = "Include threats{}. TRUE by default. Pass false to skip the whole-map pawn walk when only the notification channels matter.", DefaultValue = true)] bool threats = true,
             [ToolParameter(Description = "Add each alert's explanation prose. Off by default: it is the largest single thing in the payload and the label plus targets[] usually says enough.", DefaultValue = false)] bool explanations = false,
             [ToolParameter(Description = "Add needs{} (every need on a 0..1 scale, with the mental-break thresholds) and hediffs[] (the label and severity word the game shows) to every colonist row. Off by default.", DefaultValue = false)] bool colonistDetail = false,
-            [ToolParameter(Description = "Cell radius around any colonist for threats{} wildPredatorsNear[] and downedNear[] -- the two lists that catch what hostiles[] and huntingPredators[] structurally cannot: a wild predator that has not started hunting yet, and a manhunter that went DOWN and therefore stopped being hostile. Chebyshev distance, the same measure as distanceToNearestColonist. 0 disables both lists. Ignored when threats:false.", DefaultValue = 30)] int predatorRadius = 30)
+            [ToolParameter(Description = "Cell radius around any colonist for threats{} downedNear[], which catches a manhunter that went DOWN and therefore stopped being hostile. Chebyshev distance, the same measure as distanceToNearestColonist. 0 disables the list. Ignored when threats:false.", DefaultValue = 30)] int predatorRadius = 30)
         {
             return BridgeCommon.WithUnknownArguments(
                 await StatusCore(ctx, cancellationToken, colonists, threats, explanations, colonistDetail, predatorRadius)
@@ -899,8 +899,6 @@ namespace HomeBridge.BridgeTools
                 { "huntingPredatorCount", 0 },
                 { "huntingPredators", new List<object>() },
                 { "huntersIgnored", new List<object>() },
-                { "wildPredatorsNearCount", 0 },
-                { "wildPredatorsNear", new List<object>() },
                 { "downedNearCount", 0 },
                 { "downedNear", new List<object>() },
                 { "predatorRadius", 0 }
@@ -943,7 +941,6 @@ namespace HomeBridge.BridgeTools
             var hostiles = new List<object>();
             var hunters = new List<object>();
             var ignored = new List<object>();
-            var nearPredators = new List<object>();
             var nearDowned = new List<object>();
             var hostileCount = 0;
             var hunterCount = 0;
@@ -969,15 +966,12 @@ namespace HomeBridge.BridgeTools
                 var job = BridgeCommon.SafeString(() => pawn.CurJobDef != null ? pawn.CurJobDef.defName : null);
                 if (!string.Equals(job, "PredatorHunt", StringComparison.OrdinalIgnoreCase))
                 {
-                    // Neither hostile nor hunting, so neither of the two lists
-                    // above will ever mention it -- and that is exactly the gap
-                    // the 2026-09-04 run fell into. Two cheap third-and-fourth
-                    // lists close it, both bounded by predatorRadius so an
-                    // untouched map costs one distance compare per pawn.
+                    // Neither hostile nor hunting. Only a downed pawn within
+                    // predatorRadius is listed from here.
                     if (predatorRadius <= 0 || !nearest.HasValue || nearest.Value > predatorRadius)
                         continue;
                     if (IsPlayerFactionPawn(pawn))
-                        continue;   // our own tame warg is not a thing to warn about
+                        continue;
 
                     // A manhunter that goes DOWN loses its mental state, so
                     // IsHostile stops being true and it silently leaves
@@ -987,12 +981,6 @@ namespace HomeBridge.BridgeTools
                         && nearDowned.Count < MaxHostiles)
                         nearDowned.Add(DescribeThreatPawn(pawn, "downed", nearest));
 
-                    // The game's own flag, not a list of defNames. A DOWNED
-                    // predator appears in BOTH lists on purpose: the row carries
-                    // downed, so neither list has to be read as the other's
-                    // complement.
-                    if (SafePredator(pawn) && nearPredators.Count < MaxHostiles)
-                        nearPredators.Add(DescribeThreatPawn(pawn, "predator_near", nearest));
                     continue;
                 }
 
@@ -1032,10 +1020,7 @@ namespace HomeBridge.BridgeTools
                 { "huntingPredatorCount", hunterCount },
                 { "huntingPredators", hunters },
                 { "huntersIgnored", ignored },
-                // A THIRD and a FOURTH list, deliberately outside hostileCount
-                // and huntingPredatorCount: nothing in here is attacking yet.
-                { "wildPredatorsNearCount", nearPredators.Count },
-                { "wildPredatorsNear", nearPredators },
+                // Outside hostileCount on purpose: nothing in here is attacking yet.
                 { "downedNearCount", nearDowned.Count },
                 { "downedNear", nearDowned },
                 { "predatorRadius", predatorRadius }
@@ -1297,7 +1282,189 @@ namespace HomeBridge.BridgeTools
 
             block["selectedCount"] = selected.Count;
             block["selectedFirstLabel"] = selected.Count == 0 ? null : SelectableLabel(selected[0]);
+            block["targeter"] = TargeterBlock(skipped);
             return block;
+        }
+
+        /// <summary>
+        /// Find.Targeter, as {active, source, caster}. The one piece of screen
+        /// state nothing in the stack could see.
+        ///
+        /// A gizmo that opens a targeter -- "Deploy turret" on a turret pack,
+        /// any Command_VerbTarget, any Command_Target -- opens NO window, so a
+        /// window-stack diff (the bridge's own `changed` flag, and ui.py's
+        /// surface signature) reads identical before and after and the click
+        /// reports "nothing opened or closed". The targeter was open the whole
+        /// time. Live 2026-09-08, Threadneedle turns 12-17.
+        ///
+        /// Hazards:
+        /// * `Find.Targeter` is `((UIRoot_Play)UIRoot).mapUI.targeter` -- a HARD
+        ///   CAST that throws InvalidCastException outside a play UI root. Read
+        ///   through BridgeCommon.Try, never bare.
+        /// * `Targeter.caster` is PRIVATE and is the only caster a
+        ///   Command_Target leaves behind (that overload sets targetingSource
+        ///   to null), so it is reached by reflection. A Command_VerbTarget
+        ///   goes the other way: targetingSource IS the Verb and CasterPawn is
+        ///   the wearer.
+        /// * `Command.LabelCap` is virtual and a subclass may compute it; the
+        ///   plain `defaultLabel` FIELD is read first for that reason.
+        /// </summary>
+        private static Dictionary<string, object> TargeterBlock(List<object> skipped)
+        {
+            var block = new Dictionary<string, object>(StringComparer.Ordinal)
+            {
+                { "active", false },
+                { "source", null },
+                { "caster", null }
+            };
+
+            var targeter = BridgeCommon.Try(() => Find.Targeter, (Targeter)null);
+            if (targeter == null)
+            {
+                skipped.Add(Skip("ui.targeter", "Find.Targeter is not readable here (no play UI root); active is false because it was not read."));
+                return block;
+            }
+
+            var active = BridgeCommon.Try(() => targeter.IsTargeting, false);
+            block["active"] = active;
+            if (!active)
+                return block;
+
+            var source = BridgeCommon.Try(() => targeter.targetingSource, (ITargetingSource)null)
+                         ?? BridgeCommon.Try(() => targeter.targetingSourceParent, (ITargetingSource)null);
+
+            string label = null;
+            Pawn caster = null;
+
+            if (source != null)
+            {
+                label = TargetingSourceLabel(source);
+                caster = BridgeCommon.Try(() => source.CasterPawn, (Pawn)null);
+            }
+
+            if (label == null)
+                label = TargeterDelegateLabel(targeter);
+            if (caster == null)
+                caster = TargeterPrivateCaster(targeter);
+
+            block["source"] = label;
+            block["caster"] = caster == null ? null : BridgeCommon.SafeString(() => caster.GetUniqueLoadID());
+            return block;
+        }
+
+        /// <summary>The gizmo text for a verb-shaped targeting source: the verb's
+        /// own label, which is exactly what CompApparelVerbOwner copies into the
+        /// gizmo's defaultLabel.</summary>
+        private static string TargetingSourceLabel(ITargetingSource source)
+        {
+            var verb = BridgeCommon.Try(() => source.GetVerb, (Verb)null);
+            if (verb != null)
+            {
+                var castAbility = verb as Verb_CastAbility;
+                if (castAbility != null)
+                {
+                    var abilityLabel = BridgeCommon.SafeString(
+                        () => castAbility.ability == null || castAbility.ability.def == null
+                            ? null
+                            : castAbility.ability.def.LabelCap);
+                    if (!string.IsNullOrWhiteSpace(abilityLabel))
+                        return abilityLabel;
+                }
+
+                var verbLabel = BridgeCommon.SafeString(
+                    () => verb.verbProps == null ? null : verb.verbProps.label);
+                if (!string.IsNullOrWhiteSpace(verbLabel))
+                    return BridgeCommon.SafeString(() => verbLabel.CapitalizeFirst()) ?? verbLabel;
+            }
+
+            return BridgeCommon.SafeString(() => source.GetType().Name);
+        }
+
+        /// <summary>
+        /// The label for a targeter opened by Command_Target, which leaves
+        /// targetingSource null and keeps the gizmo only inside its callbacks.
+        /// `onUpdateAction` is the reliable one: Command_Target passes its own
+        /// `Update` METHOD GROUP, so the delegate's Target is the gizmo itself.
+        /// </summary>
+        private static string TargeterDelegateLabel(Targeter targeter)
+        {
+            for (var i = 0; i < TargeterDelegateFields.Length; i++)
+            {
+                var field = BridgeCommon.PrivateInstanceField(typeof(Targeter), TargeterDelegateFields[i]);
+                if (field == null)
+                    continue;
+                var del = BridgeCommon.Try(() => field.GetValue(targeter) as Delegate, (Delegate)null);
+                var label = DelegateOwnerLabel(del);
+                if (label != null)
+                    return label;
+            }
+            return null;
+        }
+
+        private static readonly string[] TargeterDelegateFields =
+        {
+            "onUpdateAction", "highlightAction", "onGuiAction", "action"
+        };
+
+        /// <summary>The name of whatever object owns a targeter callback: the
+        /// gizmo if the delegate closed over one, else the declaring type.</summary>
+        private static string DelegateOwnerLabel(Delegate del)
+        {
+            if (del == null)
+                return null;
+
+            var owner = OwningGizmo(BridgeCommon.Try(() => del.Target, (object)null));
+            var command = owner as Command;
+            if (command != null)
+            {
+                var plain = BridgeCommon.SafeString(() => command.defaultLabel);
+                if (!string.IsNullOrWhiteSpace(plain))
+                    return BridgeCommon.SafeString(() => plain.CapitalizeFirst()) ?? plain;
+                var cap = BridgeCommon.SafeString(() => command.LabelCap);
+                if (!string.IsNullOrWhiteSpace(cap))
+                    return cap;
+            }
+            if (owner != null)
+                return BridgeCommon.SafeString(() => owner.GetType().Name);
+
+            var declaring = BridgeCommon.Try(
+                () => del.Method == null ? null : del.Method.DeclaringType, (Type)null);
+            return declaring == null ? null : BridgeCommon.SafeString(() => declaring.Name);
+        }
+
+        /// <summary>A delegate target is either the gizmo itself (a method group
+        /// or a lambda that captured only `this`) or a compiler display class
+        /// holding it in a field. Both shapes are unwrapped here; nothing else
+        /// is followed.</summary>
+        private static Gizmo OwningGizmo(object target)
+        {
+            var direct = target as Gizmo;
+            if (direct != null)
+                return direct;
+            if (target == null)
+                return null;
+
+            var fields = BridgeCommon.Try(
+                () => target.GetType().GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic),
+                new FieldInfo[0]);
+            for (var i = 0; i < fields.Length; i++)
+            {
+                var index = i;
+                var held = BridgeCommon.Try(() => fields[index].GetValue(target) as Gizmo, (Gizmo)null);
+                if (held != null)
+                    return held;
+            }
+            return null;
+        }
+
+        /// <summary>`Targeter.caster` is private and is the only pawn a
+        /// Command_Target-opened targeter records.</summary>
+        private static Pawn TargeterPrivateCaster(Targeter targeter)
+        {
+            var field = BridgeCommon.PrivateInstanceField(typeof(Targeter), "caster");
+            if (field == null)
+                return null;
+            return BridgeCommon.Try(() => field.GetValue(targeter) as Pawn, (Pawn)null);
         }
 
         private static bool IsNonBlockingWindowType(string type)
@@ -1386,7 +1553,6 @@ namespace HomeBridge.BridgeTools
                 { "huntingPredatorCount", threats.ContainsKey("huntingPredatorCount") ? threats["huntingPredatorCount"] : 0 },
                 // Separate numbers on purpose. Rolling these into hostileCount
                 // would make "hostileCount 0" stop meaning "nobody is fighting".
-                { "wildPredatorsNearCount", threats.ContainsKey("wildPredatorsNearCount") ? threats["wildPredatorsNearCount"] : 0 },
                 { "downedNearCount", threats.ContainsKey("downedNearCount") ? threats["downedNearCount"] : 0 }
             };
         }
@@ -1404,7 +1570,8 @@ namespace HomeBridge.BridgeTools
                 ["alertTargets"] = "Culprit names come from targets[], never from the prose. targetCount 0 with culpritsReadable true is map-wide; culpritsReadable false could not name anyone.",
                 ["letterChoices"] = "choiceCount > 0 is NOT 'somebody must decide': an announcement gets a dialog too, buttons Close / Jump to location. Read the choice texts or shouldAutomaticallyOpenLetter.",
                 ["modalOpen"] = "From the window LIST, not the focused window: the letter stack is a Super-layer ImmediateWindow and takes the focus field while a modal sits open under it.",
-                ["colonistScope"] = "Free colonists spawned on the CURRENT map (Pawn.IsFreeColonist). Prisoners and slaves are not colonists here."
+                ["colonistScope"] = "Free colonists spawned on the CURRENT map (Pawn.IsFreeColonist). Prisoners and slaves are not colonists here.",
+                ["targeter"] = "ui.targeter.active true means the next map click is consumed as a target, not as a selection. It opens no window, so modalOpen and the window list are both blind to it."
             };
 
             if (!wantExplanations)

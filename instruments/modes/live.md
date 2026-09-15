@@ -14,8 +14,9 @@ forbidden here is repairing the instrument, never questioning it.
 **Your context is the session's budget, and every fork inherits it.** A read you
 take into the Core is paid again by every turn after it. So do not read the game,
 do not open the overlay feed, do not reconstruct what happened from logs or
-transcripts — ask Hands and take the 300 tokens. The Core narrates, decides and
-verifies. It does not gather, and it does not drive.
+transcripts — ask Hands and take the 300 tokens. **Hands narrates; Core does not.** Core decides, verifies and posts the goals
+and the handback card. One turn has one voice: if Core has something for the
+stream mid-turn, it messages Hands and Hands decides whether to say it.
 
 **Dead air with the game paused is the failure state.** Thirty to sixty seconds
 of a frozen picture in silence reads as a crash. The game runs while you think,

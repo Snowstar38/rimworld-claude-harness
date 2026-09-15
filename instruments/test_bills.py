@@ -1,5 +1,6 @@
 """Offline regressions for bills.py formatting, on faked home/bills payloads."""
 import io
+import json
 import os
 import sys
 import unittest
@@ -292,6 +293,308 @@ class FlagTests(unittest.TestCase):
                                                 "rifle"]))
 
 
+class VerbOrderTests(unittest.TestCase):
+    """`bills.py <bench> set 1 --target 30 --do` printed a bill sheet and wrote
+    nothing: the bench sat where the verb was looked for."""
+
+    def test_the_verb_may_follow_the_bench(self):
+        self.assertEqual(("set", "ElectricStove123", ["1"], None),
+                         bills._split_verb(["ElectricStove123", "set", "1"]))
+
+    def test_the_verb_may_lead(self):
+        self.assertEqual(("set", "ElectricStove123", ["1"], None),
+                         bills._split_verb(["set", "ElectricStove123", "1"]))
+
+    def test_a_bench_first_cell_still_costs_only_its_own_words(self):
+        self.assertEqual(("set", "120,140", ["1"], None),
+                         bills._split_verb(["120,", "140", "set", "1"]))
+
+    def test_allow_parses_after_the_bench(self):
+        self.assertEqual(("allow", "T1", ["0", "Corpse_Human"], None),
+                         bills._split_verb(["T1", "allow", "0", "Corpse_Human"]))
+
+    def test_a_bare_bench_is_still_a_listing(self):
+        verb, bench, rest, refusal = bills._split_verb(["ElectricStove123"])
+        self.assertIsNone(verb)
+        self.assertEqual("ElectricStove123", bench)
+        self.assertEqual([], rest)
+        self.assertIsNone(refusal)
+
+    def test_nothing_at_all_is_still_the_whole_map(self):
+        self.assertEqual((None, None, [], None), bills._split_verb([]))
+
+    def test_an_unrecognised_verb_is_refused_and_names_the_verbs(self):
+        verb, bench, rest, refusal = bills._split_verb(["T1", "sett", "1"])
+        self.assertIsNone(verb)
+        self.assertIsNotNone(refusal)
+        self.assertIn("'sett'", refusal)
+        for word in bills.VERBS:
+            self.assertIn(word, refusal)
+        self.assertIn("nothing was read", refusal)
+
+    def test_an_unconsumed_argument_names_the_verbs_too(self):
+        text = bills._unconsumed("set", ["Corpse_Human"])
+        self.assertIn("'Corpse_Human'", text)
+        self.assertIn("bills.py set <bench> <index>", text)
+        for word in bills.VERBS:
+            self.assertIn(word, text)
+
+
+class WriteDispatchTests(unittest.TestCase):
+    """What main() actually sends for each order and each verb."""
+
+    def run_cli(self, argv):
+        sent = []
+
+        def fake_call(args):
+            sent.append(args)
+            if args.get("action") == "list" and "bench" not in args:
+                return {"action": "list", "success": True, "benches": [bench_row()]}
+            return {"action": args["action"], "success": True,
+                    "benches": [bench_row()], "applied": not args.get("dryRun"),
+                    "write": {"action": args["action"], "before": {}, "after": {},
+                              "changed": ["targetCount 80 -> 30"],
+                              "requestedOptions": {}, "optionsNotApplied": []},
+                    "watch": {"shown": False, "reason": "test"}}
+
+        with mock.patch.object(bills, "call", fake_call), \
+                mock.patch.object(bills.rim, "init", lambda *a, **k: None), \
+                mock.patch.object(sys, "argv", ["bills.py"] + argv), \
+                mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            code = bills.main()
+        return code, sent, out.getvalue()
+
+    def test_a_refused_write_exits_non_zero_under_json_too(self):
+        """Every other path returns 1 for success:false -- print_write, the
+        listing refusal, and the implicit-write refusal, which was special-cased
+        by hand. The general --json path returned 0, so a scripted caller could
+        not tell a refused write from a done one."""
+        sent = []
+
+        def fake_call(args):
+            sent.append(args)
+            if args.get("action") == "list" and "bench" not in args:
+                return {"action": "list", "success": True,
+                        "benches": [bench_row()]}
+            return {"action": args["action"], "success": False,
+                    "error": "index 99 is out of range for this bench"}
+
+        with mock.patch.object(bills, "call", fake_call), \
+                mock.patch.object(bills.rim, "init", lambda *a, **k: None), \
+                mock.patch.object(sys, "argv",
+                                  ["bills.py", "ElectricStove123", "set", "99",
+                                   "--target", "30", "--do", "--json"]), \
+                mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            code = bills.main()
+        body = json.loads(out.getvalue())
+        self.assertIs(False, body["success"])
+        self.assertEqual(1, code)
+
+    def test_bench_first_set_target_sends_the_write(self):
+        code, sent, text = self.run_cli(
+            ["ElectricStove123", "set", "1", "--target", "30", "--do"])
+        self.assertEqual(0, code)
+        self.assertEqual("set", sent[-1]["action"])
+        self.assertEqual(30, sent[-1]["targetCount"])
+        self.assertEqual(1, sent[-1]["index"])
+        self.assertFalse(sent[-1]["dryRun"])
+        self.assertNotIn("BENCHES:", text)
+
+    def test_verb_first_set_target_sends_the_same_write(self):
+        _, sent, _ = self.run_cli(
+            ["set", "ElectricStove123", "1", "--target", "30", "--do"])
+        self.assertEqual(30, sent[-1]["targetCount"])
+        self.assertEqual(1, sent[-1]["index"])
+
+    def test_bench_first_add_sends_the_recipe(self):
+        _, sent, _ = self.run_cli(
+            ["ElectricStove123", "add", "Simple", "meal", "--target", "12", "--do"])
+        self.assertEqual("add", sent[-1]["action"])
+        self.assertEqual("Simple meal", sent[-1]["recipe"])
+        self.assertEqual(12, sent[-1]["targetCount"])
+
+    def test_allow_as_a_verb_is_a_set_with_the_filter_names(self):
+        _, sent, _ = self.run_cli(
+            ["ElectricStove123", "allow", "0", "Corpse_Human", "--do"])
+        self.assertEqual("set", sent[-1]["action"])
+        self.assertEqual(0, sent[-1]["index"])
+        self.assertEqual("Corpse_Human", sent[-1]["allow"])
+
+    def test_disallow_takes_several_names(self):
+        _, sent, _ = self.run_cli(
+            ["only", "ElectricStove123", "0", "Meat_Squirrel,Meat_Deer", "--do"])
+        self.assertEqual("Meat_Squirrel,Meat_Deer", sent[-1]["only"])
+
+    def test_an_unknown_verb_writes_and_reads_nothing(self):
+        code, sent, text = self.run_cli(["ElectricStove123", "sett", "1", "--do"])
+        self.assertEqual(1, code)
+        self.assertEqual([], sent)
+        self.assertIn("REFUSED", text)
+        self.assertNotIn("BENCHES:", text)
+
+    def test_a_trailing_word_on_set_is_refused_not_swallowed(self):
+        code, sent, text = self.run_cli(
+            ["ElectricStove123", "set", "1", "Corpse_Human", "--do"])
+        self.assertEqual(1, code)
+        self.assertEqual([], sent)
+        self.assertIn("REFUSED", text)
+
+
+class NothingChangedTests(unittest.TestCase):
+    """A bill sheet printed unchanged is the failure a caller cannot see."""
+
+    def test_a_field_that_did_not_take_is_named_loudly(self):
+        text = bills._nothing_changed(
+            {"requestedOptions": {"targetCount": 30},
+             "optionsNotApplied": ["targetCount 30 asked for, the bill reads 80"]},
+            True)
+        self.assertTrue(text.startswith("WROTE NOTHING:"))
+        self.assertIn("the bill reads 80", text)
+        self.assertIn("python bills.py <bench>", text)
+
+    def test_an_already_correct_bill_says_so_instead_of_alarming(self):
+        text = bills._nothing_changed(
+            {"requestedOptions": {"targetCount": 30}, "optionsNotApplied": []}, True)
+        self.assertIn("already holds every value asked for", text)
+        self.assertIn("targetCount=30", text)
+
+    def test_an_add_that_left_the_count_alone_says_it_did_not_land(self):
+        text = bills._nothing_changed(
+            {"action": "add", "after": {"billCount": 3},
+             "requestedOptions": {}, "optionsNotApplied": []}, True)
+        self.assertIn("still holds 3 bill(s)", text)
+        self.assertIn("the add did not land", text)
+
+    def test_a_move_to_where_it_already_is_is_not_alarming(self):
+        text = bills._nothing_changed(
+            {"action": "move", "requestedOptions": {}, "optionsNotApplied": []}, True)
+        self.assertIn("same order", text)
+        self.assertIn("does not know which", text)
+
+    def test_a_dry_run_says_would_and_never_blames_a_field(self):
+        text = bills._nothing_changed(
+            {"afterIsPredicted": True, "requestedOptions": {"targetCount": 30},
+             "optionsNotApplied": ["targetCount 30 asked for, the bill reads 80"]},
+            False)
+        self.assertTrue(text.startswith("NOTHING WOULD CHANGE:"))
+        self.assertNotIn("did not take", text)
+
+    def test_the_write_printer_prints_the_ask_and_the_loud_line(self):
+        r = {"success": True, "applied": True,
+             "benches": [bench_row()],
+             "write": {"action": "set", "before": {"billCount": 1, "bills": []},
+                       "after": {"billCount": 1, "bills": []},
+                       "changed": [],
+                       "requestedOptions": {"targetCount": 30},
+                       "optionsNotApplied":
+                           ["targetCount 30 asked for, the bill reads 80"]},
+             "watch": {"shown": False, "reason": "watch:false"}}
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            bills.print_write(r)
+        text = out.getvalue()
+        self.assertIn("asked:     targetCount=30", text)
+        self.assertIn("changed:   nothing", text)
+        self.assertIn("WROTE NOTHING:", text)
+
+    def test_a_write_that_moved_something_prints_no_loud_line(self):
+        r = {"success": True, "applied": True,
+             "benches": [bench_row()],
+             "write": {"action": "set", "before": {"billCount": 1, "bills": []},
+                       "after": {"billCount": 1, "bills": []},
+                       "changed": ["targetCount 80 -> 30"],
+                       "requestedOptions": {"targetCount": 30},
+                       "optionsNotApplied": []},
+             "watch": {"shown": False, "reason": "watch:false"}}
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            bills.print_write(r)
+        text = out.getvalue()
+        self.assertIn("changed:   targetCount 80 -> 30", text)
+        self.assertNotIn("WROTE NOTHING", text)
+
+
+class ScopeAndReachTests(unittest.TestCase):
+    """One bill read 4/15 and 14/15 seconds apart with nothing saying what
+    either number covered."""
+
+    def test_an_unlimited_radius_is_labelled_map_wide(self):
+        ing = corpse_ingredient(available=4, needed=15, shortfall=11,
+                                radiusUnlimited=True, searchRadius=None)
+        self.assertIn("map-wide", bills._ing_line(ing))
+        self.assertIn("(4/15 map-wide)", "; ".join(bills._reasons(bill(ingredients=[ing]))))
+
+    def test_a_limited_radius_names_its_cells(self):
+        ing = corpse_ingredient(available=4, needed=15, shortfall=11,
+                                radiusUnlimited=False, searchRadius=24)
+        self.assertIn("within 24 cells", bills._ing_line(ing))
+        self.assertIn("(4/15 within 24 cells)",
+                      "; ".join(bills._reasons(bill(ingredients=[ing]))))
+
+    def test_a_payload_without_the_scope_keys_says_nothing_about_scope(self):
+        text = bills._ing_line(corpse_ingredient())
+        self.assertNotIn("map-wide", text)
+        self.assertNotIn("cells", text)
+        self.assertEqual(["missing corpses (0/1)"],
+                         bills._reasons(bill(ingredients=[corpse_ingredient()])))
+
+    def test_reserved_stacks_are_told_and_still_counted(self):
+        ing = corpse_ingredient(available=3, needed=1, shortfall=0, satisfied=True,
+                                excludedReserved=2)
+        self.assertIn("{2 reserved}", bills._ing_line(ing))
+
+    def test_unreachable_stacks_say_they_are_not_counted(self):
+        ing = corpse_ingredient(excludedUnreachable=6)
+        self.assertIn("{6 unreachable, not counted}", bills._ing_line(ing))
+
+    def test_an_unchecked_reachability_is_not_reported_as_all_reachable(self):
+        ing = corpse_ingredient(excludedUnreachable=0, reachabilityChecked=False)
+        self.assertIn("{reachability NOT checked}", bills._ing_line(ing))
+
+    def test_a_partial_scan_says_both_what_it_found_and_what_it_missed(self):
+        """The two facts are independent: the scan can confirm 6 unreachable
+        AND run out of its call budget before asking about the rest
+        (BillCommon.cs: reachabilityChecked = reachAnswered == reachAsked).
+        An `elif` printed the 6 as if it were the whole answer -- the exact
+        "0 unreachable means not known, not all reachable" failure the field
+        exists to prevent."""
+        ing = corpse_ingredient(excludedUnreachable=6, reachabilityChecked=False)
+        line = bills._ing_line(ing)
+        self.assertIn("{6 unreachable, not counted}", line)
+        self.assertIn("NOT checked", line)
+
+    def test_the_listing_header_prints_the_tick_the_counts_were_taken_at(self):
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            bills.show({"benches": [], "benchesOnMap": 0, "ingredientsScanned": 12,
+                        "countedAtTick": 987654, "attention": {}})
+        self.assertIn("at tick 987654", out.getvalue())
+
+
+class ScrollTests(unittest.TestCase):
+    def test_a_scrolled_tab_is_reported(self):
+        r = {"success": True, "applied": True, "benches": [bench_row()],
+             "write": {"action": "add", "before": {}, "after": {},
+                       "changed": ["billCount 1 -> 2"], "requestedOptions": {},
+                       "optionsNotApplied": []},
+             "watch": {"shown": True, "inspectTab": "ITab_Bills",
+                       "closesAfterSeconds": 8, "scrolledToNewBill": True}}
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            bills.print_write(r)
+        self.assertIn("scrolled to the new bill", out.getvalue())
+
+    def test_a_tab_that_would_not_scroll_says_where_the_bill_is(self):
+        r = {"success": True, "applied": True, "benches": [bench_row()],
+             "write": {"action": "add", "before": {}, "after": {},
+                       "changed": ["billCount 1 -> 2"], "requestedOptions": {},
+                       "optionsNotApplied": []},
+             "watch": {"shown": True, "inspectTab": "ITab_Bills",
+                       "closesAfterSeconds": 8, "scrolledToNewBill": False,
+                       "scrollNote": "this bench has no ITab_Bills"}}
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            bills.print_write(r)
+        text = out.getvalue()
+        self.assertIn("NOT scrolled", text)
+        self.assertIn("bottom of the stack", text)
+
+
 class RottenIngredientTests(unittest.TestCase):
     """Six SKELETONS were reported as "forbidden -- unforbid them"."""
 
@@ -307,6 +610,194 @@ class RottenIngredientTests(unittest.TestCase):
     def test_a_genuinely_forbidden_stack_still_says_unforbid(self):
         ing = corpse_ingredient(excludedForbidden=3)
         self.assertIn("unforbid them", "; ".join(bills._reasons(bill(ingredients=[ing]))))
+
+
+def queued(index=0, label="Make stone blocks", recipe="StonecuttingSandstone", **kw):
+    row = {"index": index, "label": label, "recipe": recipe, "repeatInfo": "1x",
+           "suspended": False, "paused": False}
+    row.update(kw)
+    return row
+
+
+class VerblessWriteTests(unittest.TestCase):
+    """2026-09-08, Threadneedle: `bills.py <bench> --forever --do` printed the
+    bench's bill sheet and WROTE NOTHING, silently -- and a sheet reads as an
+    answer. An option is an intention to change something; it ends in a write or
+    in a refusal, never in a listing."""
+
+    def run_cli(self, argv, benches):
+        sent = []
+
+        def fake_call(args):
+            sent.append(dict(args))
+            if args.get("action") == "list":
+                rows = benches
+                if args.get("bench"):
+                    rows = [b for b in benches
+                            if args["bench"] in (b.get("thingId"), b.get("label"))]
+                    if not rows:
+                        return {"action": "list", "success": False, "benches": [],
+                                "error": "no bill giver matches %r" % args["bench"]}
+                return {"action": "list", "success": True, "benches": rows}
+            return {"action": args["action"], "success": True,
+                    "benches": [benches[0]], "applied": not args.get("dryRun"),
+                    "write": {"action": args["action"], "before": {}, "after": {},
+                              "changed": ["repeatMode RepeatCount -> Forever"],
+                              "requestedOptions": {}, "optionsNotApplied": []},
+                    "watch": {"shown": False, "reason": "test"}}
+
+        with mock.patch.object(bills, "call", fake_call), \
+                mock.patch.object(bills.rim, "init", lambda *a, **k: None), \
+                mock.patch.object(sys, "argv", ["bills.py"] + argv), \
+                mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            code = bills.main()
+        return code, [a for a in sent if a.get("action") != "list"], out.getvalue()
+
+    def stonecutter(self, *rows, **kw):
+        return bench_row(thingId="TableStonecutter1", defName="TableStonecutter",
+                         label="stonecutter's table",
+                         position={"x": 138, "z": 127}, bills=list(rows), **kw)
+
+    # --- the bench form -------------------------------------------------
+
+    def test_one_bill_and_a_mode_flag_is_a_set_on_that_bill(self):
+        code, sent, text = self.run_cli(
+            ["TableStonecutter1", "--forever", "--do"],
+            [self.stonecutter(queued())])
+        self.assertEqual(0, code)
+        self.assertEqual(1, len(sent))
+        self.assertEqual("set", sent[0]["action"])
+        self.assertEqual(0, sent[0]["index"])
+        self.assertEqual("Forever", sent[0]["repeatMode"])
+        self.assertFalse(sent[0]["dryRun"])
+        self.assertIn("resolved:", text)
+        self.assertIn("has one bill", text)
+        self.assertNotIn("BENCHES:", text)
+
+    def test_without_do_it_is_still_a_dry_run_of_that_set(self):
+        code, sent, text = self.run_cli(
+            ["TableStonecutter1", "--forever"], [self.stonecutter(queued())])
+        self.assertEqual(0, code)
+        self.assertTrue(sent[0]["dryRun"])
+        self.assertIn("DRY RUN", text)
+
+    def test_several_bills_refuse_with_the_numbered_list_and_the_line_to_type(self):
+        code, sent, text = self.run_cli(
+            ["TableStonecutter1", "--forever", "--do"],
+            [self.stonecutter(queued(), queued(1, "Make granite blocks"))])
+        self.assertEqual(1, code)
+        self.assertEqual([], sent)
+        self.assertIn("WROTE NOTHING", text)
+        self.assertIn("[0] Make stone blocks", text)
+        self.assertIn("[1] Make granite blocks", text)
+        self.assertIn("python bills.py set TableStonecutter1 1 --forever --do", text)
+        self.assertNotIn("BENCHES:", text)
+
+    def test_a_bench_with_no_bills_says_so_and_names_add(self):
+        code, sent, text = self.run_cli(
+            ["TableStonecutter1", "--forever", "--do"], [self.stonecutter()])
+        self.assertEqual(1, code)
+        self.assertEqual([], sent)
+        self.assertIn("WROTE NOTHING", text)
+        self.assertIn("no bills at all", text)
+        self.assertIn("python bills.py add TableStonecutter1 ", text)
+
+    def test_an_unreadable_bill_stack_is_not_reported_as_no_bills(self):
+        code, _, text = self.run_cli(
+            ["TableStonecutter1", "--suspend", "--do"],
+            [self.stonecutter(billStackUnreadable=True)])
+        self.assertEqual(1, code)
+        self.assertIn("could not be READ", text)
+        self.assertNotIn("no bills at all", text)
+
+    # --- the recipe form ------------------------------------------------
+
+    def test_a_recipe_resolves_to_the_one_bench_queueing_it(self):
+        code, sent, text = self.run_cli(
+            ["steel stonecutter", "--forever", "--do"],
+            [self.stonecutter(queued(label="Make steel blocks")),
+             bench_row(thingId="ElectricStove123",
+                       bills=[queued(label="Simple meal")])])
+        self.assertEqual(0, code)
+        self.assertEqual("TableStonecutter1", sent[0]["bench"])
+        self.assertEqual(0, sent[0]["index"])
+        self.assertEqual("Forever", sent[0]["repeatMode"])
+        self.assertIn("is not a bench; it is a bill on stonecutter's table", text)
+
+    def test_a_recipe_on_two_benches_refuses_naming_both(self):
+        code, sent, text = self.run_cli(
+            ["blocks", "--forever", "--do"],
+            [self.stonecutter(queued(label="Make stone blocks")),
+             bench_row(thingId="TableStonecutter2", label="stonecutter's table",
+                       bills=[queued(label="Make granite blocks")])])
+        self.assertEqual(1, code)
+        self.assertEqual([], sent)
+        self.assertIn("WROTE NOTHING", text)
+        self.assertIn("TableStonecutter1", text)
+        self.assertIn("TableStonecutter2", text)
+        self.assertNotIn("BENCHES:", text)
+
+    def test_a_word_that_is_neither_writes_nothing_and_prints_no_sheet(self):
+        code, sent, text = self.run_cli(
+            ["bolt-action rifle", "--forever", "--do"],
+            [self.stonecutter(queued())])
+        self.assertEqual(1, code)
+        self.assertEqual([], sent)
+        self.assertIn("WROTE NOTHING", text)
+        self.assertIn("neither a bench nor a bill", text)
+        self.assertNotIn("BENCHES:", text)
+
+    # --- nothing to write at all ----------------------------------------
+
+    def test_an_option_with_no_bench_refuses_before_any_call(self):
+        code, sent, text = self.run_cli(["--forever", "--do"],
+                                        [self.stonecutter(queued())])
+        self.assertEqual(1, code)
+        self.assertEqual([], sent)
+        self.assertIn("WROTE NOTHING", text)
+        self.assertIn("no bench", text)
+
+    def test_a_bare_do_on_a_bench_is_not_a_listing(self):
+        code, sent, text = self.run_cli(["TableStonecutter1", "--do"],
+                                        [self.stonecutter(queued())])
+        self.assertEqual(1, code)
+        self.assertEqual([], sent)
+        self.assertIn("WROTE NOTHING", text)
+        self.assertIn("nothing to write", text)
+        self.assertNotIn("BENCHES:", text)
+
+    def test_a_plain_bench_with_no_option_is_still_the_listing(self):
+        code, sent, text = self.run_cli(["TableStonecutter1"],
+                                        [self.stonecutter(queued())])
+        self.assertEqual(0, code)
+        self.assertEqual([], sent)
+        self.assertIn("BENCHES:", text)
+
+
+class SuggestedLineTests(unittest.TestCase):
+    """The refusal has to be paste-ready, or it is just a complaint."""
+
+    def test_the_line_echoes_every_flag_the_caller_typed(self):
+        self.assertEqual(
+            "python bills.py set stove 2 --target 30 --pause on --do",
+            bills._set_line("stove", 2,
+                            ["stove", "--target", "30", "--pause", "on", "--do"]))
+
+    def test_a_bench_with_a_space_is_quoted(self):
+        self.assertIn('set "butcher spot" 0',
+                      bills._set_line("butcher spot", 0, ["--forever"]))
+
+    def test_a_flag_value_is_never_mistaken_for_a_positional(self):
+        self.assertEqual(["--target", "30", "--do"],
+                         bills._flag_words(["stove", "--target", "30", "--do"]))
+
+    def test_every_word_must_appear_but_order_does_not_matter(self):
+        self.assertTrue(bills._words_match(
+            "steel stonecutter", "Make steel blocks", "StonecuttingSteel",
+            "stonecutter's table"))
+        self.assertFalse(bills._words_match(
+            "steel stove", "Make steel blocks", "", "stonecutter's table"))
+        self.assertFalse(bills._words_match("  ", "Make steel blocks"))
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@
 
   python see.py                       # base, normal base zoom
   python see.py 118 144 --zoom 24      # optional cell and zoom (smaller = closer)
+  python see.py 118,144                # the comma form, same cell
   python see.py --zoom 24              # base with a wider view
 
 Prints the image path. Open it with Read/view_image; a path alone is not vision.
@@ -62,6 +63,25 @@ def _fresh_file(path, started):
         "folder is NOT this frame and is not being returned." % (path, path.parent))
 
 
+def _entry_scene():
+    """Whether RimWorld is showing its immediate-mode entry scene.
+
+    The entry scene has no map camera.  In particular, set_camera_zoom throws
+    a NullReferenceException there, even though take_screenshot still works.
+    A failed probe is treated as "unknown" so ordinary map captures retain
+    their existing camera safety checks.
+    """
+    try:
+        state = rim.game("rimworld/get_screen_targets", {}, strict=False)
+    except Exception:
+        return False
+    if isinstance(state, dict) and isinstance(state.get("targets"), dict):
+        state = state["targets"]
+    ui = state.get("uiState") if isinstance(state, dict) else None
+    return isinstance(ui, dict) and (
+        ui.get("programState") == "Entry" or ui.get("inEntryScene") is True)
+
+
 def capture(x=None, z=None, zoom=None):
     if (x is None) != (z is None):
         raise ValueError("Supply both x and z, or neither for base.")
@@ -72,6 +92,14 @@ def capture(x=None, z=None, zoom=None):
         x, z, source = cam.base_cell()
     else:
         source = "explicit coordinates"
+    if _entry_scene():
+        started = time.time()
+        path = _fresh_file(Path(cam.shoot("hands-view-" + uuid.uuid4().hex)).resolve(),
+                           started)
+        print("Entry scene; camera centre/zoom unavailable")
+        print("IMAGE: %s" % path)
+        print("Open this image with Read (or view_image) NOW and inspect it yourself.")
+        return str(path)
     camlock.claim("hands", "see.py: capture at %d,%d" % (x, z))
     _success(cam.set_zoom(zoom), "set zoom")
     _success(cam.jump_to(x, z), "centre camera")
@@ -92,13 +120,32 @@ def capture(x=None, z=None, zoom=None):
     return str(path)
 
 
+def cells(tokens):
+    """`118 144` or `118,144` -> [118, 144]. Both forms, one cell.
+
+    Every other instrument here takes one of the two and refuses the other, so
+    the form a turn types is a coin flip. Raises ValueError on anything else.
+    """
+    out = []
+    for t in tokens:
+        for part in str(t).split(","):
+            part = part.strip()
+            if part:
+                out.append(int(part))
+    return out
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("coords", nargs="*", type=int, metavar="CELL")
+    parser.add_argument("coords", nargs="*", metavar="CELL")
     parser.add_argument("--zoom", type=float)
     args = parser.parse_args()
+    try:
+        args.coords = cells(args.coords)
+    except ValueError:
+        parser.error("coordinates must be whole numbers: `see.py x z` or `see.py x,z`")
     if len(args.coords) not in (0, 2):
-        parser.error("give x z, or no coordinates to centre on base")
+        parser.error("give x z or x,z, or no coordinates to centre on base")
     try:
         rim.init()
         capture(*(args.coords or [None, None]), zoom=args.zoom)

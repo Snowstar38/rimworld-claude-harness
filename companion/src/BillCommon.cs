@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using RimWorld;
 using Verse;
+using Verse.AI;
 
 namespace HomeBridge.BridgeTools
 {
@@ -50,9 +51,29 @@ namespace HomeBridge.BridgeTools
     ///
     /// ## What it does not reproduce
     ///
-    /// Reachability, reservation and the pawn's own forbidden rules, all of which
-    /// need a pawn. A thing behind a locked door counts here and does not count to
-    /// the game. Things inside a container that is not itself spawned on the map
+    /// The pawn's own forbidden rules for the ITEM, which need the real worker.
+    /// Reachability and reservation ARE modelled: a stack no route reaches from
+    /// the bench's interaction cell is subtracted and tallied in
+    /// <c>excludedUnreachable</c>, and a stack somebody has already claimed is
+    /// tallied in <c>excludedReserved</c> and LEFT IN the count, because the
+    /// claimant is usually fetching it for this very bill.
+    ///
+    /// The route question is the one place a pawn IS used, and it has to be: the
+    /// scan ran <c>TraverseMode.PassDoors</c> until 2026-09-12, and
+    /// <c>Verse.Region.Allows</c> ignores the door entirely in that mode, so a
+    /// locked door could never strand an ingredient. It now asks
+    /// <c>TraverseMode.ByPawn</c> for the bill's allowed worker when it has one
+    /// and otherwise for the first spawned free colonist —
+    /// <c>MapItems.TraverserFor</c> — which is the door test the hauler would
+    /// actually face. A map with no colonist on it falls back to the old
+    /// PassDoors call.
+    ///
+    /// A stack a pawn is CARRYING is despawned, so it is in neither the count nor
+    /// any exclusion tally; that, and hauling in flight, is why two reads seconds
+    /// apart can disagree. Every row carries the radius it counted within, so the
+    /// scope is never the unexplained half.
+    ///
+    /// Things inside a container that is not itself spawned on the map
     /// (a caravan's inventory, a transport pod) are not counted: the scan is
     /// <c>ThingRequestGroup.HaulableEver</c>, the same group the region walk uses,
     /// which is every haulable spawned on the map including everything in a
@@ -111,9 +132,205 @@ namespace HomeBridge.BridgeTools
             internal int Scanned;
             internal string Error;
 
+            /// <summary>The map the index was taken from, for the reachability
+            /// test. Null means no reachability test is possible.</summary>
+            internal Map Map;
+
+            /// <summary>Every thing somebody has a reservation on, materialised
+            /// once. Null = the reservation manager could not be read, which is
+            /// reported as "not checked", never as "nothing reserved".</summary>
+            internal HashSet<Thing> Reserved;
+
+            /// <summary>The tick the scan was taken at. Two listings that
+            /// disagree disagree at two different ticks; this is how a reader
+            /// tells that apart from two different scopes.</summary>
+            internal int? Tick;
+
+            /// <summary>CanReach answers, keyed traverser -> root cell index ->
+            /// target cell index. Bills on one bench share a root, so a busy
+            /// larder costs one call per occupied cell, not one per stack per
+            /// bill. The traverser is part of the key because two bills on one
+            /// bench can name two different allowed workers, and a door one of
+            /// them may open is a door the other may not.</summary>
+            private readonly Dictionary<int, Dictionary<int, Dictionary<int, bool>>> _reach =
+                new Dictionary<int, Dictionary<int, Dictionary<int, bool>>>();
+
+            /// <summary>
+            /// A spawned, living free colonist on this map, found once per tool
+            /// invocation and used as the representative worker for any bill that
+            /// names no allowed worker of its own. Null when the map holds none,
+            /// which is what makes the PassDoors fallback in
+            /// <see cref="CanReach"/> necessary rather than decorative.
+            ///
+            /// Walked by hand off <c>AllPawnsSpawned</c>: <c>MapPawns.FreeColonists</c>
+            /// and <c>.FreeColonistsSpawned</c> both reach <c>Faction.OfPlayer</c>,
+            /// whose failure path is <c>Log.Error</c>, which calls
+            /// <c>TickManager.Pause()</c>.
+            /// </summary>
+            internal Pawn Colonist;
+
+            /// <summary>Reachability calls left in this tool invocation. A read
+            /// must not become the expensive thing on the frame.</summary>
+            internal int ReachBudget = MaxReachChecks;
+
+            /// <summary>True once the budget ran out: rows taken after that say
+            /// reachabilityChecked:false rather than counting nothing.</summary>
+            internal bool ReachBudgetSpent;
+
+            /// <summary>
+            /// The colonist whose reach this bill's ingredients are measured by:
+            /// the bill's own allowed worker when it has one — a bill restricted
+            /// to one pawn is fetched for by nobody else — otherwise the map's
+            /// representative colonist. Null means the ByPawn question cannot be
+            /// asked at all and <see cref="CanReach"/> falls back to PassDoors.
+            /// </summary>
+            internal Pawn TraverserFor(Bill bill)
+            {
+                var restricted = bill == null
+                    ? null
+                    : BridgeCommon.Try(() => bill.PawnRestriction, (Pawn)null);
+                if (UsableTraverser(restricted))
+                    return restricted;
+                return UsableTraverser(Colonist) ? Colonist : null;
+            }
+
+            /// <summary><c>Reachability.CanReach</c> <c>Log.Error</c>s — and so
+            /// pauses the colony — when it is handed a pawn spawned on another
+            /// map, and answers a flat <c>false</c> for one that is not spawned
+            /// at all. Both are screened here rather than risked.</summary>
+            private bool UsableTraverser(Pawn pawn)
+            {
+                if (pawn == null || Map == null)
+                    return false;
+                if (!BridgeCommon.Try(() => pawn.Spawned, false))
+                    return false;
+                if (BridgeCommon.Try(() => pawn.Dead, true))
+                    return false;
+                return BridgeCommon.Try(() => pawn.Map, (Map)null) == Map;
+            }
+
+            /// <summary>
+            /// Whether a route exists from `root` to `cell` for
+            /// <paramref name="traverser"/>, or null when the question could not
+            /// be asked (no map, an invalid cell, the budget spent, or the call
+            /// threw). Null is never read as "unreachable".
+            /// </summary>
+            internal bool? CanReach(IntVec3 root, IntVec3 cell, Pawn traverser)
+            {
+                if (Map == null || !root.IsValid || !cell.IsValid)
+                    return null;
+                if (!UsableTraverser(traverser))
+                    traverser = null;
+
+                int rootIndex, cellIndex;
+                try
+                {
+                    rootIndex = Map.cellIndices.CellToIndex(root);
+                    cellIndex = Map.cellIndices.CellToIndex(cell);
+                }
+                catch { return null; }
+
+                var pawnKey = traverser == null
+                    ? 0
+                    : BridgeCommon.Try(() => traverser.thingIDNumber, 0);
+                Dictionary<int, Dictionary<int, bool>> byRoot;
+                if (!_reach.TryGetValue(pawnKey, out byRoot))
+                {
+                    byRoot = new Dictionary<int, Dictionary<int, bool>>();
+                    _reach[pawnKey] = byRoot;
+                }
+                Dictionary<int, bool> byCell;
+                if (!byRoot.TryGetValue(rootIndex, out byCell))
+                {
+                    byCell = new Dictionary<int, bool>();
+                    byRoot[rootIndex] = byCell;
+                }
+                bool cached;
+                if (byCell.TryGetValue(cellIndex, out cached))
+                    return cached;
+
+                if (ReachBudget <= 0)
+                {
+                    ReachBudgetSpent = true;
+                    return null;
+                }
+                ReachBudget--;
+
+                // ByPawn is the ONLY mode that consults the doors, and the doors
+                // are the whole question. Verse.Region.Allows answers
+                // `return !flag` for TraverseMode.PassDoors -- a fence test, the
+                // door ignored entirely -- so under PassDoors a locked door could
+                // never make an ingredient unreachable, however loudly a comment
+                // said it did. NoPassClosedDoors is the opposite mistake: its arm
+                // is `door == null || door.FreePassage`, which refuses every
+                // ordinary closed door in the colony.
+                //
+                // Under ByPawn the door arm runs Building_Door.CanPhysicallyPass
+                // (FreePassage, or PawnCanOpen, or standing open) and then
+                // IsForbiddenToPass (the door forbidden to this pawn's faction)
+                // against THIS pawn -- which is exactly the hauler's question.
+                // canBashDoors:false because a colonist fetching steel does not
+                // bash a door; Danger.Deadly because (int)maxDanger < 3 is what
+                // gates Allows' danger arm, and a stranded stack is a route fact,
+                // not a nerve one.
+                //
+                // With no colonist to ask for, the old PassDoors call stands: it
+                // is wrong about doors but it is an answer, and
+                // TraverseParms.For(pawn: null) is itself a Log.Error.
+                var pawn = traverser;
+                var answer = pawn == null
+                    ? BridgeCommon.TryN(() => Map.reachability.CanReach(
+                        root, cell, PathEndMode.ClosestTouch,
+                        TraverseParms.For(TraverseMode.PassDoors, Danger.Deadly, false)))
+                    : BridgeCommon.TryN(() => Map.reachability.CanReach(
+                        root, cell, PathEndMode.ClosestTouch,
+                        TraverseParms.For(pawn, Danger.Deadly, TraverseMode.ByPawn, canBashDoors: false)));
+                if (answer == null)
+                    return null;
+                byCell[cellIndex] = answer.Value;
+                return answer.Value;
+            }
+
+            /// <summary>The first spawned, living free colonist on the map, or
+            /// null. <c>Pawn.IsFreeColonist</c> is <c>IsColonist &amp;&amp;
+            /// HostFaction == null</c> and reaches no faction singleton, unlike
+            /// the <c>MapPawns</c> properties that would answer the same
+            /// question.</summary>
+            private static Pawn RepresentativeColonist(Map map)
+            {
+                if (map == null)
+                    return null;
+                // AllPawnsSpawned is IReadOnlyList<Pawn> in 1.6, not List<Pawn>.
+                IReadOnlyList<Pawn> spawned;
+                try { spawned = map.mapPawns.AllPawnsSpawned; }
+                catch { return null; }
+                if (spawned == null)
+                    return null;
+                for (var i = 0; i < spawned.Count; i++)
+                {
+                    var pawn = spawned[i];
+                    if (pawn == null)
+                        continue;
+                    if (!BridgeCommon.Try(() => pawn.IsFreeColonist, false))
+                        continue;
+                    if (BridgeCommon.Try(() => pawn.Dead, true))
+                        continue;
+                    if (!BridgeCommon.Try(() => pawn.Spawned, false))
+                        continue;
+                    if (BridgeCommon.Try(() => pawn.Map, (Map)null) != map)
+                        continue;
+                    return pawn;
+                }
+                return null;
+            }
+
             internal static MapItems Build(Map map)
             {
                 var index = new MapItems();
+                index.Map = map;
+                index.Colonist = RepresentativeColonist(map);
+                index.Reserved = ReservedThings(map);
+                index.Tick = BridgeCommon.TryN(() => Find.TickManager.TicksGame);
                 List<Thing> source;
                 try { source = map.listerThings.ThingsInGroup(ThingRequestGroup.HaulableEver); }
                 catch (Exception e)
@@ -169,6 +386,29 @@ namespace HomeBridge.BridgeTools
                 List<Item> bucket;
                 return def != null && ByDef.TryGetValue(def, out bucket) ? bucket : null;
             }
+        }
+
+        /// <summary>How many reachability calls one tool invocation may make.
+        /// Past it every further row reports reachabilityChecked:false.</summary>
+        internal const int MaxReachChecks = 4000;
+
+        /// <summary>Everything under a standing reservation, as a set. Null when
+        /// the reservation manager could not be read: "not checked", not
+        /// "nothing reserved". AllReservedThings() is a read-only Select over
+        /// the reservation list and touches no faction.</summary>
+        private static HashSet<Thing> ReservedThings(Map map)
+        {
+            try
+            {
+                var set = new HashSet<Thing>();
+                var all = map.reservationManager.AllReservedThings();
+                if (all == null)
+                    return null;
+                foreach (var t in all)
+                    if (t != null) set.Add(t);
+                return set;
+            }
+            catch { return null; }
         }
 
         /// <summary>CompForbiddable directly. ForbidUtility.IsForbidden(Thing,
@@ -430,9 +670,17 @@ namespace HomeBridge.BridgeTools
             }
 
             var benchCell = BridgeCommon.TryN(() => bench == null ? IntVec3.Invalid : bench.Position);
+            // The radius is measured from the bench's own cell; a route is
+            // measured from the cell a worker stands in, which is the game's own
+            // distinction. A bench with no interaction cell falls back to its own.
+            var reachRoot = ReachRoot(bench, benchCell);
+            // Whose reach. One lookup for every slot on this bill; see
+            // MapItems.TraverserFor.
+            var traverser = items == null ? null : items.TraverserFor(bill);
             for (var i = 0; i < ingredients.Count; i++)
             {
-                var row = IngredientRow(recipe, ingredients[i], billFilter, bill, items, radius, benchCell);
+                var row = IngredientRow(recipe, ingredients[i], billFilter, bill, items, radius,
+                                        benchCell, reachRoot, traverser);
                 rows.Add(row);
                 excludedByFilter += (int)BridgeCommon.Num(row, "excludedByFilter");
                 if (!BridgeCommon.Bool(row, "satisfied"))
@@ -440,14 +688,36 @@ namespace HomeBridge.BridgeTools
                     allSatisfied = false;
                     missing.Add("missing " + row["label"] + " ("
                                 + row["available"] + "/" + row["needed"] + ")");
+                    var stranded = (int)BridgeCommon.Num(row, "excludedUnreachable");
+                    if (stranded > 0)
+                        missing.Add(stranded + " " + row["label"] + " on the map have NO ROUTE from this "
+                                    + "bench's interaction cell -- a door, a wall or an unbuilt bridge, not "
+                                    + "a shortage. Open the way or move the bench.");
                 }
             }
             return rows;
         }
 
+        /// <summary>Where a worker would stand: Thing.InteractionCell when the
+        /// def has one and it is in bounds, else the bench's own cell.</summary>
+        private static IntVec3 ReachRoot(Thing bench, IntVec3? benchCell)
+        {
+            var fallback = benchCell == null ? IntVec3.Invalid : benchCell.Value;
+            if (bench == null)
+                return fallback;
+            var cell = BridgeCommon.TryN(() => bench.InteractionCell);
+            if (cell == null || !cell.Value.IsValid)
+                return fallback;
+            var map = BridgeCommon.Try(() => bench.Map, (Map)null);
+            if (map != null && !BridgeCommon.Try(() => cell.Value.InBounds(map), false))
+                return fallback;
+            return cell.Value;
+        }
+
         private static Dictionary<string, object> IngredientRow(
             RecipeDef recipe, IngredientCount ing, ThingFilter billFilter, Bill bill,
-            MapItems items, float radius, IntVec3? benchCell)
+            MapItems items, float radius, IntVec3? benchCell, IntVec3 reachRoot,
+            Pawn traverser)
         {
             var row = new Dictionary<string, object>(StringComparer.Ordinal);
             if (ing == null)
@@ -466,6 +736,12 @@ namespace HomeBridge.BridgeTools
                 row["excludedForbidden"] = 0;
                 row["excludedOutOfRadius"] = 0;
                 row["excludedNotFresh"] = 0;
+                row["excludedUnreachable"] = 0;
+                row["excludedReserved"] = 0;
+                row["reachabilityChecked"] = false;
+                row["reservationChecked"] = false;
+                row["searchRadius"] = null;
+                row["radiusUnlimited"] = false;
                 row["isFixedIngredient"] = false;
                 row["unreadable"] = true;
                 return row;
@@ -490,6 +766,10 @@ namespace HomeBridge.BridgeTools
             var excludedForbidden = 0;
             var excludedOutOfRadius = 0;
             var excludedNotFresh = 0;
+            var excludedUnreachable = 0;
+            var excludedReserved = 0;
+            var reachAsked = 0;
+            var reachAnswered = 0;
 
             foreach (var def in allowedDefs)
             {
@@ -556,6 +836,24 @@ namespace HomeBridge.BridgeTools
                     }
 
                     if (item.Forbidden) { excludedForbidden += item.Stack; continue; }
+
+                    // A route a COLONIST has, from where a worker would stand.
+                    // Only a definite NO subtracts; an unasked or failed question
+                    // leaves the stack counted and lowers reachabilityChecked
+                    // instead.
+                    reachAsked++;
+                    var reachable = items.CanReach(reachRoot, new IntVec3(item.X, 0, item.Z), traverser);
+                    if (reachable != null)
+                    {
+                        reachAnswered++;
+                        if (!reachable.Value) { excludedUnreachable += item.Stack; continue; }
+                    }
+
+                    // Reserved stacks stay IN the count: the claimant is usually
+                    // fetching this very stack for this very bill. The tally is
+                    // the "somebody got there first" tell, not a blocker.
+                    if (items.Reserved != null && items.Reserved.Contains(item.Thing))
+                        excludedReserved += item.Stack;
 
                     have += item.Stack;
                 }
@@ -656,6 +954,18 @@ namespace HomeBridge.BridgeTools
             row["excludedOutOfRadius"] = excludedOutOfRadius;
             // Of excludedByFilter, the units refused for their ROT STAGE alone.
             row["excludedNotFresh"] = excludedNotFresh;
+            // Subtracted from available: no route from the bench's interaction cell.
+            row["excludedUnreachable"] = excludedUnreachable;
+            // NOT subtracted: already claimed, usually for this bill.
+            row["excludedReserved"] = excludedReserved;
+            // False = the question was not asked of every candidate stack, so 0
+            // unreachable means "not known", not "all reachable".
+            row["reachabilityChecked"] = reachAsked == 0 || reachAnswered == reachAsked;
+            row["reservationChecked"] = items.Reserved != null;
+            // The scope every count on this row was taken in, so a number can be
+            // read without knowing the bill's radius.
+            row["searchRadius"] = unlimited ? (object)null : (int)radius;
+            row["radiusUnlimited"] = unlimited;
             row["isFixedIngredient"] = isFixed;
             row["mixingAllowed"] = mixing;
             row["wholeStacks"] = wholeStacks;

@@ -105,12 +105,13 @@ namespace HomeBridge.BridgeTools
         [ToolResponse("benches", "array", "One row per bill giver in scope: thingId, defName, label, position, usableForBills with the reason when it is not, billCount, activeBillCount, billsCanRunNow, maxBills, and bills[]. Present on every action; on a write it is the single bench that was written.", Always = true)]
         [ToolResponse("attention", "object", "Counts worth acting on across the benches in scope: benchesWithNoBills, benchesWithNoActiveBill, benchesUnusable, billsShortOfIngredients, finishedBills, suspendedBills, pausedBills. Always present, zeros included.", Always = true)]
         [ToolResponse("recipes", "array", "Only on action:'recipes'. Every recipe this bench's def offers that passes AvailableNow AND AvailableOnNow(bench), each with ingredients[] under the recipe's DEFAULT filter, ingredientsOnHand, blockedBy[] and workAmount. NULL on every other action.", Nullable = true)]
-        [ToolResponse("write", "object", "NULL on a read. On add/set/delete/move: requested, resolved, refused, reason, before{billCount,bills[],bill}, after{...} (READ BACK from the stack on a real run), changed[], and for add/set the resulting bill's canRunNow and blockedBy[].", Always = true, Nullable = true)]
+        [ToolResponse("write", "object", "NULL on a read. On add/set/delete/move: requested, resolved, refused, reason, before{billCount,bills[],bill}, after{...} (READ BACK from the stack on a real run), changed[], requestedOptions{} (every option the caller gave), optionsNotApplied[] (requested fields the read-back disagrees with -- non-empty beside applied:true is a write that landed on the object and changed nothing), and for add/set the resulting bill's canRunNow and blockedBy[].", Always = true, Nullable = true)]
         [ToolResponse("dryRun", "boolean", "True = nothing was written. TRUE by default; a caller must pass dryRun:false deliberately. Reported on reads too, so it is never mistaken for absent.", Always = true)]
         [ToolResponse("applied", "boolean", "True only when the stack was actually changed. False on every dry run, every refusal and every read.", Always = true)]
-        [ToolResponse("watch", "object", "What was shown on screen while the write landed: shown, and either the tab/selection/camera detail or the reason nothing was shown ('dry run', 'refused', 'watch:false'). Always present, including on reads.", Always = true)]
+        [ToolResponse("watch", "object", "What was shown on screen while the write landed: shown, and either the tab/selection/camera detail or the reason nothing was shown ('dry run', 'refused', 'watch:false'). On a real add it also carries scrolledToNewBill and scrollNote: the Bills tab is scrolled to the bottom, where the new bill is. Always present, including on reads.", Always = true)]
         [ToolResponse("candidates", "array", "Present only when a name was ambiguous or unresolved: what it could have meant. A refusal that lists nothing is a refusal nobody can act on.", Nullable = true)]
         [ToolResponse("ingredientsScanned", "number", "How many spawned haulable stacks the ingredient index looked at. 0 with a non-empty map means the scan failed, and notes.ingredientScan says so.", Always = true)]
+        [ToolResponse("countedAtTick", "number", "The game tick every count in this payload was taken at. Two readings that disagree disagree at two ticks; compare this before blaming scope. NULL when the tick could not be read.", Always = true, Nullable = true)]
         [ToolResponse("notes", "object", "What this payload's silences mean: what the ingredient scan does and does not model, and why ShouldDoNow is never called.", Always = true)]
         [ToolResponse("unknownArguments", "array", "Every argument key the caller sent that this tool does not declare, sorted, case-sensitively. Empty array = every key was recognised. On a write tool this matters twice over: a misspelled dryRun is the difference between a plan and a changed colony. The host's own _rimBridgeTimeoutMs is never listed.", Always = true)]
         [ToolResponse("unknownArgumentsWarning", "string", "Present only when unknownArguments is non-empty, or when the caller's raw keys could not be read at all - in which case the empty unknownArguments means 'not known', not 'nothing unknown'.", Nullable = true)]
@@ -357,6 +358,7 @@ namespace HomeBridge.BridgeTools
             payload["benchesSkippedByFaction"] = skippedByFaction;
             payload["attention"] = attention.ToPayload();
             payload["ingredientsScanned"] = items.Scanned;
+            payload["countedAtTick"] = items.Tick;
             payload["recipes"] = null;
             payload["write"] = null;
 
@@ -877,15 +879,64 @@ namespace HomeBridge.BridgeTools
             reply["benchesOnMap"] = givers.Count;
             reply["attention"] = attention.ToPayload();
             reply["ingredientsScanned"] = items.Scanned;
+            reply["countedAtTick"] = items.Tick;
             reply["recipes"] = null;
             reply["applied"] = applied;
             reply["write"] = WriteBlock(request, plan.Recipe, plan.Before, after, refusal, false);
+
+            // A new bill lands at the bottom of a stack that may be taller than
+            // the tab, so the thing the viewer was told to watch is off screen.
+            string scrollNote = null;
+            var scrolled = false;
+            if (request.Action == "add" && applied && plan.Session != null && plan.Session.TabOpened)
+            {
+                scrollNote = ScrollBillsTabToNewest(bench);
+                scrolled = scrollNote == null;
+            }
+
             // A write-time refusal is an ANSWER, not a tool failure: the reply
             // stays success:true with applied:false and write.refused:true.
-            reply["watch"] = plan.Session == null
+            var watchBlock = plan.Session == null
                 ? Watch.Skipped("watch:false")
                 : Watch.Finish(plan.Session, request.WatchSeconds);
+            watchBlock["scrolledToNewBill"] = scrolled;
+            watchBlock["scrollNote"] = scrollNote;
+            reply["watch"] = watchBlock;
             return reply;
+        }
+
+        /// <summary>
+        /// Put the newest bill in view. ITab_Bills draws the stack inside a
+        /// scroll view whose offset is a private Vector2, so a stack taller than
+        /// the tab hides the bill an add just appended. A large y is clamped by
+        /// the scroll view on the next frame, which lands at the bottom -- where
+        /// BillStack.AddBill puts it. Returns null on success, else why not.
+        /// Decorative: a tab that did not scroll is still an open tab.
+        /// </summary>
+        private static string ScrollBillsTabToNewest(Thing bench)
+        {
+            try
+            {
+                var tabs = bench.GetInspectTabs();
+                if (tabs == null)
+                    return "this bench exposes no inspect tabs";
+                object billsTab = null;
+                foreach (var tab in tabs)
+                {
+                    if (tab is ITab_Bills) { billsTab = tab; break; }
+                }
+                if (billsTab == null)
+                    return "this bench has no ITab_Bills";
+                var field = BridgeCommon.PrivateInstanceField(typeof(ITab_Bills), "scrollPosition");
+                if (field == null)
+                    return "ITab_Bills has no scrollPosition field on this build";
+                field.SetValue(billsTab, new UnityEngine.Vector2(0f, 100000f));
+                return null;
+            }
+            catch (Exception e)
+            {
+                return "scrolling the Bills tab threw " + e.GetType().Name;
+            }
         }
 
         private static Bill BillAt(BillStack stack, int index)
@@ -1007,6 +1058,7 @@ namespace HomeBridge.BridgeTools
             payload["benchCount"] = 1;
             payload["attention"] = attention.ToPayload();
             payload["ingredientsScanned"] = items.Scanned;
+            payload["countedAtTick"] = items.Tick;
             payload["recipes"] = null;
             payload["applied"] = false;
             payload["write"] = WriteBlock(request, recipe, before, after, null, true);
@@ -1079,9 +1131,92 @@ namespace HomeBridge.BridgeTools
                 { "after", after },
                 { "afterIsPredicted", predicted },
                 { "changed", Changed(before, after) },
+                // The ask beside the read-back. A write that lands on nothing is
+                // otherwise indistinguishable from one that had nothing to do.
+                { "requestedOptions", RequestedOptions(request) },
+                { "optionsNotApplied", predicted ? new List<object>() : NotApplied(request, after) },
                 { "canRunNow", AfterBool(after, "canRunNow") },
                 { "blockedBy", AfterList(after, "blockedBy") }
             };
+        }
+
+        /// <summary>Every option the caller actually gave, under its argument
+        /// name. Empty on delete and move, which take none.</summary>
+        private static Dictionary<string, object> RequestedOptions(Request request)
+        {
+            var asked = new Dictionary<string, object>(StringComparer.Ordinal);
+            if (request.Action == "delete" || request.Action == "move")
+                return asked;
+            if (request.RepeatModeSpec != null) asked["repeatMode"] = request.RepeatModeSpec;
+            if (request.RepeatCount >= 0) asked["repeatCount"] = request.RepeatCount;
+            if (request.TargetCount >= 0) asked["targetCount"] = request.TargetCount;
+            if (request.UnpauseWhenYouHave >= 0) asked["unpauseWhenYouHave"] = request.UnpauseWhenYouHave;
+            if (request.PauseWhenSatisfiedSpec != null) asked["pauseWhenSatisfied"] = request.PauseWhenSatisfiedSpec;
+            if (request.SuspendedSpec != null) asked["suspended"] = request.SuspendedSpec;
+            if (request.SearchRadius >= 0) asked["ingredientSearchRadius"] = request.SearchRadius;
+            if (request.SkillMin >= 0) asked["skillMin"] = request.SkillMin;
+            if (request.SkillMax >= 0) asked["skillMax"] = request.SkillMax;
+            if (request.WorkerSpec != null) asked["worker"] = request.WorkerSpec;
+            if (request.StoreModeSpec != null) asked["storeMode"] = request.StoreModeSpec;
+            if (request.AllowNames.Count > 0) asked["allow"] = string.Join(",", request.AllowNames.ToArray());
+            if (request.OnlyNames.Count > 0) asked["only"] = string.Join(",", request.OnlyNames.ToArray());
+            if (request.DisallowNames.Count > 0) asked["disallow"] = string.Join(",", request.DisallowNames.ToArray());
+            return asked;
+        }
+
+        /// <summary>
+        /// Which requested fields the READ-BACK does not agree with, one sentence
+        /// each. Empty is the normal answer. A non-empty list beside applied:true
+        /// is a write that landed on the object and left the field alone -- the
+        /// one failure shape a bill sheet printed unchanged cannot show.
+        /// </summary>
+        private static List<object> NotApplied(Request request, Dictionary<string, object> after)
+        {
+            var missed = new List<object>();
+            var bill = after == null ? null
+                : after.ContainsKey("bill") ? after["bill"] as Dictionary<string, object> : null;
+            if (bill == null)
+                return missed;
+            var config = bill.ContainsKey("config") ? bill["config"] as Dictionary<string, object> : null;
+            if (config == null)
+                return missed;
+
+            // repeatMode: what was named, or the mode the count implies.
+            var wantedMode = request.RepeatModeSpec;
+            if (wantedMode == null && request.TargetCount >= 0) wantedMode = "TargetCount";
+            if (wantedMode == null && request.RepeatCount >= 0) wantedMode = "RepeatCount";
+            if (wantedMode != null)
+            {
+                var got = config.ContainsKey("repeatMode") ? Flatten(config["repeatMode"]) : "null";
+                if (!string.Equals(got, wantedMode, StringComparison.OrdinalIgnoreCase))
+                    missed.Add("repeatMode " + wantedMode + " asked for, the bill reads " + got);
+            }
+            if (request.RepeatCount >= 0) Mismatch(missed, config, "repeatCount", request.RepeatCount);
+            if (request.TargetCount >= 0) Mismatch(missed, config, "targetCount", request.TargetCount);
+            if (request.UnpauseWhenYouHave >= 0) Mismatch(missed, config, "unpauseWhenYouHave", request.UnpauseWhenYouHave);
+            if (request.SearchRadius >= 0) Mismatch(missed, config, "ingredientSearchRadius", request.SearchRadius);
+            if (request.PauseWhenSatisfiedSpec != null)
+            {
+                var wanted = OnOff(request.PauseWhenSatisfiedSpec);
+                if (wanted != null) Mismatch(missed, config, "pauseWhenSatisfied", wanted.Value);
+            }
+            if (request.SuspendedSpec != null)
+            {
+                var wanted = OnOff(request.SuspendedSpec);
+                var got = bill.ContainsKey("suspended") ? Flatten(bill["suspended"]) : "null";
+                if (wanted != null && !string.Equals(got, Flatten(wanted.Value), StringComparison.OrdinalIgnoreCase))
+                    missed.Add("suspended " + Flatten(wanted.Value) + " asked for, the bill reads " + got);
+            }
+            return missed;
+        }
+
+        private static void Mismatch(
+            List<object> missed, Dictionary<string, object> config, string key, object wanted)
+        {
+            var got = config.ContainsKey(key) ? Flatten(config[key]) : "null";
+            var want = Flatten(wanted);
+            if (!string.Equals(got, want, StringComparison.OrdinalIgnoreCase))
+                missed.Add(key + " " + want + " asked for, the bill reads " + got);
         }
 
         private static object AfterBool(Dictionary<string, object> after, string key)
@@ -1773,7 +1908,8 @@ namespace HomeBridge.BridgeTools
                     } },
                 { "notes", new Dictionary<string, object>
                     {
-                        { "ingredientScan", "canRunNow and ingredients[] reproduce WorkGiver_DoBill.TryFindBestBillIngredients WITHOUT a pawn: every spawned haulable that both the recipe's ingredient filter and this bill's own filter allow, unforbidden, inside ingredientSearchRadius of the bench's cell. Reachability, reservation and a pawn's own forbidden rules are NOT modelled, so a thing behind a locked door counts here and does not count to the game." },
+                        { "ingredientScan", "canRunNow and ingredients[] reproduce WorkGiver_DoBill.TryFindBestBillIngredients: every spawned haulable that both the recipe's ingredient filter and this bill's own filter allow, unforbidden, inside ingredientSearchRadius of the bench's cell. A stack with no route from the bench's interaction cell is SUBTRACTED and tallied in excludedUnreachable; a stack under a standing reservation is tallied in excludedReserved and LEFT IN, because the claimant is usually fetching it for this bill. The route is asked as a real colonist walks it (TraverseMode.ByPawn, the bill's allowed worker if it names one, else the first spawned free colonist), so a locked or faction-forbidden door does strand a stack; a map with no colonist on it falls back to the old door-blind check. reachabilityChecked:false on a row means the question was not asked of every stack, so 0 unreachable is 'not known' there. The worker's own forbidden rules for the ITEM are still not modelled." },
+                        { "countIsASnapshot", "Every count is one tick's worth, and each row says which scope it covers: searchRadius with radiusUnlimited. A stack a pawn is CARRYING is despawned and is in neither the count nor any exclusion tally, so two readings seconds apart can differ by a haul in flight. countedAtTick is the tick both readings should be compared at before anything else is blamed." },
                         { "defsDoNotMix", "available is the best SINGLE def's count, not the sum: the game satisfies one ingredient slot from one def unless recipe.allowMixingIngredients is set. availableTotal is the sum, and the two differ on purpose. shortfall == max(0, needed - available) always." },
                         { "radius999", "ingredientSearchRadius 999 is Bill.MaxIngredientSearchRadius and means UNLIMITED: at 999 the game drops its region-entry condition entirely, and 999 cells exceeds the diagonal of the largest map. config.ingredientSearchRadiusUnlimited says so as a bool." },
                         { "shouldDoNowNotCalled", "Bill_Production.ShouldDoNow() writes the bill's paused field, so it is never called here; finished, paused and active are read from the fields." }
@@ -1793,6 +1929,7 @@ namespace HomeBridge.BridgeTools
             payload["benchCount"] = 0;
             payload["attention"] = new Attention().ToPayload();
             payload["ingredientsScanned"] = 0;
+            payload["countedAtTick"] = null;
             payload["recipes"] = null;
             payload["write"] = null;
             payload["notes"] = new Dictionary<string, object>

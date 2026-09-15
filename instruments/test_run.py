@@ -1,3 +1,4 @@
+import io
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -113,7 +114,8 @@ class RunSafetyTests(unittest.TestCase):
         self.assertEqual([], report.call_args.args[5])
 
     def test_unavailable_watcher_fails_closed_without_polling(self):
-        with mock.patch.object(run, "_companion",
+        with mock.patch.object(run, "_supervised_session", return_value=None), \
+             mock.patch.object(run, "_companion",
                                side_effect=run._NoCompanion("busy")), \
              mock.patch.object(run, "_polling") as polling, \
              mock.patch.object(run.rim, "game",
@@ -147,6 +149,56 @@ class RunSafetyTests(unittest.TestCase):
 
         self.assertEqual("threat", reason)
         self.assertEqual(1, sum(c.args[0] == run.TOOL for c in game_mock.call_args_list))
+
+
+class SupervisedPlayTests(unittest.TestCase):
+    """WEIRD 66: run.py under supervised play failed, paused the clock and
+    killed the play service; recovery took a full `play.py start`."""
+
+    def test_a_live_play_service_refuses_before_any_bridge_call(self):
+        out = io.StringIO()
+        with mock.patch.object(run, "_supervised_session",
+                               return_value={"epoch": 12, "pid": 4242}), \
+             mock.patch.object(run, "_companion") as companion, \
+             mock.patch.object(run.rim, "game") as game, \
+             mock.patch("sys.stdout", out):
+            reason, detail = run.until(None, 10, "Superfast", 1.5)
+        self.assertEqual(("supervised play", []), (reason, detail))
+        companion.assert_not_called()
+        game.assert_not_called()
+        text = out.getvalue()
+        self.assertIn("SUPERVISED PLAY OWNS THE CLOCK (epoch 12, service pid 4242)",
+                      text)
+        self.assertIn("python play.py status", text)
+        self.assertIn("python play.py pause", text)
+        self.assertIn("Nothing was touched here", text)
+
+    def test_the_companion_busy_refusal_does_not_pause_the_clock(self):
+        reply = {"stopReason": "busy", "stopDetail":
+                 "A supervised_play session is active; use its status/pause API "
+                 "instead of starting a competing clock guard."}
+        def game(name, args=None, strict=True, timeout=600):
+            if name == run.TOOL:
+                return reply
+            raise AssertionError("run.py must not call %s here" % name)
+        out = io.StringIO()
+        with mock.patch.object(run, "_supervised_session", return_value=None), \
+             mock.patch.object(run, "_letters", return_value=set()), \
+             mock.patch.object(run, "_ticks", return_value=100), \
+             mock.patch.object(run.rim, "game", side_effect=game), \
+             mock.patch("sys.stdout", out):
+            reason, _ = run.until(None, 10, "Superfast", 1.5)
+        self.assertEqual("supervised play", reason)
+        self.assertIn("SUPERVISED PLAY OWNS THE CLOCK", out.getvalue())
+        self.assertIn("the companion said:", out.getvalue())
+        self.assertNotIn("WATCHER FAILED", out.getvalue())
+
+    def test_a_dead_service_state_is_not_an_owner(self):
+        with mock.patch.object(run, "_supervised_session", return_value=None), \
+             mock.patch.object(run, "_companion",
+                               return_value=("done", [])) as companion:
+            self.assertEqual(("done", []), run.until(None, 1, "Normal", 1.5))
+        companion.assert_called_once()
 
 
 if __name__ == "__main__":

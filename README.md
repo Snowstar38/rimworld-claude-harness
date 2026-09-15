@@ -24,6 +24,7 @@ If Steam is installed somewhere else, edit `$modDir` and `$managed` near the top
 - `profile/` — an isolated RimWorld configuration and one current example save.
 - `journal/` and `instruments/CHRONICLE.md` — the real development/play history, retained as an example.
 - `overlay/` — the optional local stream overlay. Copy `chat-config.example.json` to `chat-config.json` and set your own channel.
+- `patches/` — source and a ready-built mod for the optional Adrenaline compatibility fix; see its README for when it applies and how to install it.
 
 Generated state, bridge tokens, logs, screenshots, binaries, autosaves, and local chat configuration are excluded. The setup only writes to this checkout, RimWorld's local `Mods`/`BridgeTools` folders, and Claude Code's project-local MCP configuration.
 

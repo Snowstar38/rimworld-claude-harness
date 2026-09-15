@@ -146,6 +146,37 @@ def warn(msg):
     print("[stream] " + msg)
 
 
+# The bottom bar's two goal boxes are `-webkit-line-clamp: 6` at 27px serif in a
+# ~200px column (overlay.html, `.goal p`), so a long goal renders as a fragment
+# ending in an ellipsis. Nothing in the loop reports that -- the post succeeds,
+# /state echoes the whole string back, and the truncation exists only on the
+# screen. Measured 2026-09-09 off M's OBS captures in `~\Videos`, by
+# matching each frame's mtime to the goals event live at that instant:
+#
+#     82 chars  "Five alive at spring thaw -- winter is meat, ..."   rendered whole
+#     84 chars  "Hold to spring -- berries, hydroponics, and a ..."  cut: "behind its ow..."
+#     87 chars  "Close the south side -- Cassandra knows where ..."  cut: "is six..."
+#    106 chars  "Five alive at spring thaw -- the field is next..."  cut: "cooking and..."
+#
+# so the box holds ~82. Wrapping is proportional, not per-character, so treat
+# this as a bracket rather than a hard boundary. Over the whole log to that
+# date: 62% of distinct long goals and 38% of short ones were over it.
+GOAL_CHARS = 82
+
+
+def goal_warning(**goals):
+    """Name any goal that will render truncated. Returns a line, or None."""
+    over = [(k, v) for k, v in sorted(goals.items()) if v and len(v) > GOAL_CHARS]
+    if not over:
+        return None
+    out = []
+    for k, v in over:
+        out.append("%s goal is %d chars and the bar holds about %d -- viewers "
+                   "will see %r and then an ellipsis"
+                   % (k, len(v), GOAL_CHARS, v[:GOAL_CHARS].rstrip()))
+    return "\n".join("[stream] " + line for line in out)
+
+
 def down(reason):
     """One line, once, and we are done. Callers return 0 straight after."""
     warn("overlay is not answering at %s -- nothing narrated (%s)"
@@ -221,6 +252,9 @@ def cmd_goals(a):
     if not goals:
         warn("nothing to set -- pass --long and/or --short")
         return 0
+    _over = goal_warning(**goals)
+    if _over:
+        print(_over)
     ok, why = ov.post("/goals", timeout=FAST, **goals)
     if not ok:
         # Named rather than the generic `down()`: this subcommand is one post,
@@ -281,6 +315,9 @@ def cmd_hands_start(a):
         down(why)
         return 0
     if a.goal:
+        _over = goal_warning(short=a.goal)
+        if _over:
+            print(_over)
         # The result of this one used to go straight in the bin. /status having
         # just succeeded means the server is up, so a failure here is a real
         # miss -- the turn's goal never reached the bar -- and it says so.

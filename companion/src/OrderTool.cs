@@ -113,7 +113,8 @@ namespace HomeBridge.BridgeTools
         /// documented. Used for validation and for the refusal text.</summary>
         private static readonly string[] Actions =
         {
-            "resolve", "draft", "undraft", "attack", "goto", "equip", "rescue", "tend", "haul", "work"
+            "resolve", "draft", "undraft", "attack", "goto", "equip", "rescue", "tend", "haul", "work", "rest",
+            "deploy"
         };
 
         /// <summary>Attack modes.</summary>
@@ -128,7 +129,7 @@ namespace HomeBridge.BridgeTools
             Title = "Order a colonist directly, as a job",
             Description =
                 "Issues a vanilla pawn order as a JOB, bypassing the right-click float menu entirely. "
-                + "action = resolve | draft | undraft | attack | goto | equip | rescue | tend | haul | work. "
+                + "action = resolve | draft | undraft | attack | goto | equip | rescue | tend | haul | work | rest | deploy. "
                 + "The pawn and the target each accept four id forms - the full Thing_Human123, the ThingID Human123, the bare "
                 + "number 123, or a name/label case-insensitively - so an explicit id can never be 'ambiguous'. Hostility is "
                 + "NEVER a precondition: a drafted pawn may attack any spawned pawn, downed or not, hostile or not, exactly as "
@@ -136,7 +137,9 @@ namespace HomeBridge.BridgeTools
                 + "refusal check and reports the job it WOULD issue without touching the game, which makes it the oracle for "
                 + "'can this pawn attack that thing'. The float menu is never opened and no click is ever synthesised, so a pawn "
                 + "in a mental break - which makes FloatMenuMakerMap return zero options - is refused here with a readable "
-                + "reason instead of an empty list.",
+                + "reason instead of an empty list. deploy is the worn-pack gizmo (\"Deploy turret, 1 / 1\") run as a job: "
+                + "it names the cell rule the targeter refuses SILENTLY and, on a refusal, the nearest cells that would "
+                + "work.",
             ResultDescription =
                 "success, action, dryRun, applied, pawn{}, target{}, job{}, wouldIssue{}, candidates[], after{}, watch{}, "
                 + "error, errorKind.")]
@@ -144,27 +147,27 @@ namespace HomeBridge.BridgeTools
         [ToolResponse("dryRun", "boolean", "True = nothing was written. Defaults to FALSE for this tool, unlike the other write tools: an order that quietly did not happen is what this tool exists to stop.", Always = true)]
         [ToolResponse("applied", "boolean", "True only when the game actually took a draft change or a job. False on every dry run, every refusal, and on resolve.", Always = true)]
         [ToolResponse("pawn", "object", "The colonist being ordered: thingId, idForms[], name, position, spawned, faction, drafted, autoDrafted, autoUndrafted, downed, dead, mentalState, playerControlled, incapableOfViolence, canBeDrafted, canBeDraftedReason, weapon{}. Null only when no pawn was asked for (resolve with target alone) or none resolved.", Nullable = true)]
-        [ToolResponse("target", "object", "What the order acts on: thingId, idForms[], name, label, defName, kindDef, faction, isPawn, spawned, hostileToPlayer, mentalState, downed, dead, predator, position, distance, reachable, matchedBy (loadId, thingID, idNumber, defNameAtCell, name, nameSubstring or cell -- which form actually matched). Null when the action takes no target. A downed or DEAD target still resolves - dead is reported, not hidden.", Nullable = true)]
+        [ToolResponse("target", "object", "What the order acts on: thingId, idForms[], name, label, defName, kindDef, faction, isPlayerFaction (faction.Name is a colony name, so this bool is the only way to ask 'is it ours'), isPawn, spawned, hostileToPlayer, mentalState, downed, dead, predator, position, distance, reachable, matchedBy (loadId, thingID, idNumber, defNameAtCell, name, nameSubstring or cell -- which form actually matched). Null when the action takes no target. A downed or DEAD target still resolves - dead is reported, not hidden.", Nullable = true)]
         [ToolResponse("job", "object", "The job that was issued: def, targetA, targetB, verb, mode, killIncappedTarget, draftedTend, count, expiryInterval, unforbade, jobTag, workGiver, workType, billLabel, tendPath, rescuePath, issued, verified, verifiedReason, note. tendPath is \"work\" when the ordinary undrafted WorkGiver_Tend prioritize order was used and \"drafted\" when the patient was on the ground and the drafted provider was needed; rescuePath is the same distinction for rescue. Both are set under dryRun too, so wouldIssue says which path WOULD run. Every field is the shape vanilla's own float-menu code builds, nothing added. verified is Pawn.CurJob read back AFTER the issue and compared by def and target, so a job the game silently dropped reads as false. Null on a dry run, a refusal, and on resolve/draft/undraft.", Nullable = true)]
         [ToolResponse("wouldIssue", "object", "Under dryRun, the same shape as job{} for the job that WOULD have been issued, with issued and verified false. Null on a real run and on any refusal.", Nullable = true)]
         [ToolResponse("candidates", "array", "On an ambiguous name: the things it matched, each with thingId, idForms[], name, defName, position, distance. Capped at 25 rows; the error text carries the true total. Empty when nothing was ambiguous. Pass one of the idForms back to address exactly one -- an explicit id form never ties.", Always = true)]
         [ToolResponse("after", "object", "Read back from the game after the write: drafted, jobDef, jobTarget, mentalState. On a dry run this is the state before, unchanged.", Nullable = true)]
-        [ToolResponse("diagnostics", "object", "Action diagnostics. For haul: globalHaulCandidateCount and targetInGlobalHaulList show the lister state; checks reports designation, reservation, reachability, manipulation, fire/fog and storage-search results. Always present.", Always = true)]
+        [ToolResponse("diagnostics", "object", "Action diagnostics. For haul: globalHaulCandidateCount and targetInGlobalHaulList show the lister state; checks reports designation, reservation, reachability, manipulation, fire/fog and storage-search results. For deploy: deploy{ok, reason, reasonKind, rule, cell, pack{thingId,defName,label,gizmoLabel,verbClass,charges,maxCharges,oneUse}, checks{verbClass,requiresLineOfSight,mustCastOnOpenGround,charges,maxCharges,range,minRange,distance,fogged,buildingOnCell,standable,lineOfSight,inRange,canHitTarget,canReserve}, validCellsNearby[up to 8 {x,z,distanceFromAsked,distanceFromPawn}], validCellsOrigin}. rule is the plain-words statement of what the targeter refuses in silence and is present on success and refusal alike. Always present.", Always = true)]
         [ToolResponse("watch", "object", "The decorative half: shown, selected, inspectTab, mainTab, cameraMoved, leadMs, closesAfterSeconds, note, reason. The target is selected first and the camera jumps to it, then after the lead the PAWN is selected so the inspect pane shows the new job. Never opens a float menu. reason says why nothing was shown on a dry run, a refusal or watch:false.", Always = true)]
         [ToolResponse("error", "string", "Why the call was refused, in a sentence naming what was resolved. Null when it was not refused.", Nullable = true)]
-        [ToolResponse("errorKind", "string", "One of pawn_not_found, target_not_found, ambiguous, pawn_dead, pawn_downed, mental_state, incapable_of_violence, target_dead, not_reachable, draft_refused, draft_cleanup_required, job_refused, job_unverified, bad_arguments, work_disabled, missing_haul_designation, no_storage, no_bill. Null when there was no refusal.", Nullable = true)]
+        [ToolResponse("errorKind", "string", "One of pawn_not_found, target_not_found, ambiguous, pawn_dead, pawn_downed, mental_state, incapable_of_violence, target_dead, not_reachable, draft_refused, draft_cleanup_required, job_refused, job_unverified, bad_arguments, work_disabled, missing_haul_designation, no_storage, unreachable_storage, no_bill, no_deploy_pack, deploy_refused, deploy_cell_blocked, deploy_out_of_range, deploy_no_line_of_sight, deploy_cell_reserved. Null when there was no refusal.", Nullable = true)]
         [ToolResponse("unknownArguments", "array", "Every argument key the caller sent that this tool does not declare, sorted, case-sensitively. Empty array = every key was recognised.", Always = true)]
         [ToolResponse("unknownArgumentsWarning", "string", "Present only when unknownArguments is non-empty, or when the caller's raw keys could not be read at all - in which case the empty unknownArguments means 'not known', not 'nothing unknown'.", Nullable = true)]
         public async Task<object> Order(
             IRimBridgeContext ctx,
             CancellationToken cancellationToken,
-            [ToolParameter(Description = "resolve | draft | undraft | attack | goto | equip | rescue | tend | haul | work. resolve reads and mutates nothing and is the safe way to learn a thing's id forms. haul is 'prioritize hauling X'; work is 'prioritize doing bills at X' - both go through the same WorkGiver path the float menu uses, so the job is the giver's own.", DefaultValue = "resolve")] string action = "resolve",
+            [ToolParameter(Description = "resolve | draft | undraft | attack | goto | equip | rescue | tend | haul | work | rest | deploy. resolve reads and mutates nothing and is the safe way to learn a thing's id forms. haul is 'prioritize hauling X'; work is 'prioritize doing bills at X' - both go through the same WorkGiver path the float menu uses, so the job is the giver's own. rest is 'go and lie down in that bed', the LayDown job JobGiver_GetRest builds, which has NO float-menu option at all because RimWorld auto-takes a click on a bed. deploy throws a worn pack's capsule at a cell - the gizmo's own verb, as the job Verb.OrderForceTarget builds - and is the only action here whose target is a CELL the pawn must SEE.", DefaultValue = "resolve")] string action = "resolve",
             [ToolParameter(Description = "The colonist to order. Any of: the full thingId (Thing_Human123), the ThingID (Human123), the bare number (123), or a name/nickname case-insensitively. Required for every action except a resolve that names only a target.")] string pawn = null,
-            [ToolParameter(Description = "What to act on, for attack / rescue / tend / equip, and optional under resolve. Any spawned pawn or thing on the current map, in any of the same four id forms plus its label, plus the DefName@x,z form home/bills and home/building_config take (TableMachining@62,141) so a bench addressed by bills.py is addressable here. Hostility is never required.")] string target = null,
-            [ToolParameter(Description = "Destination cell x, for goto. Also a fallback locator for equip - the weapon lying on that cell - when target is not given.", DefaultValue = int.MinValue)] int x = int.MinValue,
+            [ToolParameter(Description = "What to act on, for attack / rescue / tend / equip / rest, and optional under resolve. Under deploy it names WHICH worn pack, and only when the pawn wears more than one - a worn pack is not on the map, so it is matched against the pawn's own apparel by thingId, defName, label or gizmo label, never by cell. Any spawned pawn or thing on the current map, in any of the same four id forms plus its label, plus the DefName@x,z form home/bills and home/building_config take (TableMachining@62,141) so a bench addressed by bills.py is addressable here. Hostility is never required.")] string target = null,
+            [ToolParameter(Description = "Destination cell x, for goto and for deploy (where it is the cell the capsule is thrown at, and is required). Also a fallback locator for equip - the weapon lying on that cell - and for rest, the bed standing on that cell - when target is not given.", DefaultValue = int.MinValue)] int x = int.MinValue,
             [ToolParameter(Description = "Destination cell z, for goto. See x.", DefaultValue = int.MinValue)] int z = int.MinValue,
             [ToolParameter(Description = "attack only: auto | melee | ranged. auto melees when the pawn is unarmed or holds a melee weapon and shoots when it holds a ranged one, which is what vanilla's own float menu picks. melee and ranged force it.", DefaultValue = "auto")] string mode = "auto",
-            [ToolParameter(Description = "Manage the draft state automatically. attack, goto and tend need a drafted pawn, so true drafts one that is not; haul and work are undrafted work orders unless the WorkGiver allows drafted work, so true undrafts. rescue and equip need no draft change at all. false refuses instead, so the caller can see the draft state was wrong.", DefaultValue = true)] bool draft = true,
+            [ToolParameter(Description = "Manage the draft state automatically. attack and tend need a drafted pawn, so true drafts one that is not; haul, work and rest are undrafted orders, so true undrafts. rescue and equip need no draft change at all. false refuses instead, so the caller can see the draft state was wrong - EXCEPT on goto, where false does not refuse but issues the move UNDRAFTED (a plain Goto job, which an undrafted pawn takes and then goes back to work), and undrafts a pawn who was drafted. That is the 'move without leaving anybody drafted' order.", DefaultValue = true)] bool draft = true,
             [ToolParameter(Description = "Permit a real ground-tend order to leave an auto-drafted doctor under caller-managed cleanup. False by default: raw calls otherwise have no reliable way to restore the doctor after the job completes. combat.py passes true because its ledger records and restores that obligation. Dry runs do not require this flag.", DefaultValue = false)] bool allowPersistentDraft = false,
             [ToolParameter(Description = "Resolve everything, run every refusal check and report the job that WOULD be issued, without touching the game. Defaults to FALSE - this tool's job is to make orders land.", DefaultValue = false)] bool dryRun = false,
             [ToolParameter(Description = "Refuse a target that is not hostile to the player faction. Defaults to FALSE, because vanilla imposes no such rule and imposing it is what got a colonist killed.", DefaultValue = false)] bool requireHostile = false,
@@ -391,11 +394,27 @@ namespace HomeBridge.BridgeTools
             /// a work job carries queues, counts and a bill that only the
             /// giver knows how to fill in.</summary>
             internal Job PreparedJob;
+
+            /// <summary>deploy: the worn pack, its comp, its gizmo verb, and
+            /// whether that verb is the one-use kind whose job reserves the
+            /// target cell. The verb itself lives in <see cref="Verb"/>.</summary>
+            internal Apparel DeployPack;
+            internal CompApparelVerbOwner DeployComp;
+            internal bool DeployOneUse;
+            internal Dictionary<string, object> DeployChecks;
+            internal List<object> DeployCells;
+            internal string DeployCellsOrigin;
+
+            /// <summary>Write `job.verbToUse` / `job.endIfCantShootInMelee`.
+            /// Both are shapes only the verb-cast jobs carry.</summary>
+            internal bool SetVerbToUse;
+            internal bool EndIfCantShootInMelee;
             internal WorkGiver_Scanner Scanner;
             internal WorkGiverDef GiverDef;
             internal WorkTypeDef WorkType;
             internal string BillLabel;
             internal string TendPath;
+            internal bool UndraftedGoto;
             internal int? HaulGlobalCandidateCount;
             internal bool? HaulTargetInGlobalList;
             internal Dictionary<string, object> HaulChecks;
@@ -458,6 +477,12 @@ namespace HomeBridge.BridgeTools
                 List<Thing> pawnCandidates;
                 string matchedBy;
                 var found = Resolve(map, request.PawnArg, true, out pawnCandidates, out matchedBy);
+                // An explicit id that the SPAWNED map does not hold may still
+                // be a pawn this map knows about: carried, in a pod, in a
+                // container. Resolving it turns "no pawn answers to that" into
+                // "that pawn is not on the map", which is a different problem.
+                if (found == null && pawnCandidates.Count == 0)
+                    found = UnspawnedPawn(map, request.PawnArg);
                 if (found == null)
                 {
                     plan.SetCandidates(pawnCandidates);
@@ -469,7 +494,8 @@ namespace HomeBridge.BridgeTools
                     else
                         plan.Refuse("pawn_not_found",
                             "No pawn on this map answers to '" + request.PawnArg
-                            + "'. Accepted forms: Thing_Human123, Human123, 123, or a name.");
+                            + "'. Accepted forms: Thing_Human123, Human123, 123, or a name."
+                            + MissingThingHint(map, request.PawnArg, true));
                     return plan;
                 }
                 plan.Pawn = found as Pawn;
@@ -479,15 +505,43 @@ namespace HomeBridge.BridgeTools
                         "'" + request.PawnArg + "' resolved to " + Describe(found) + ", which is a thing, not a pawn.");
                     return plan;
                 }
+                // Resolved from a corpse or a container: the id is right and
+                // the pawn is not on the map, which is a different sentence
+                // from "no pawn answers to that".
+                if (!BridgeCommon.Try(() => plan.Pawn.Dead, false)
+                    && !BridgeCommon.Try(() => plan.Pawn.Spawned, false))
+                {
+                    plan.Refuse("pawn_not_found",
+                        NameOf(plan.Pawn) + " answers to '" + request.PawnArg
+                        + "' but is NOT SPAWNED on this map -- carried, in a pod or a container, or away with a caravan. "
+                        + "Nothing can be ordered until they are back on the map.");
+                    return plan;
+                }
             }
 
             // ---------------------------------------------------- the target
             var targetWanted = !string.IsNullOrEmpty(request.TargetArg);
+            // A deploy's target is the WORN pack, which is not on
+            // map.listerThings at all -- the ordinary resolver would answer
+            // target_not_found about a thing the pawn has on.
+            if (targetWanted && request.Action == "deploy")
+            {
+                ResolveWornPack(plan, request.TargetArg);
+                if (plan.Error != null)
+                    return plan;
+                targetWanted = false;
+            }
             if (targetWanted)
             {
                 List<Thing> targetCandidates;
                 string matchedBy;
                 var found = Resolve(map, request.TargetArg, false, out targetCandidates, out matchedBy);
+                if (found == null && targetCandidates.Count == 0)
+                {
+                    found = UnspawnedPawn(map, request.TargetArg);
+                    if (found != null)
+                        matchedBy = "unspawnedPawn";
+                }
                 if (found == null)
                 {
                     plan.SetCandidates(targetCandidates);
@@ -499,7 +553,8 @@ namespace HomeBridge.BridgeTools
                     else
                         plan.Refuse("target_not_found",
                             "Nothing on this map answers to '" + request.TargetArg
-                            + "'. Accepted forms: Thing_Wolf_Timber334862, Wolf_Timber334862, 334862, or a label.");
+                            + "'. Accepted forms: Thing_Wolf_Timber334862, Wolf_Timber334862, 334862, or a label."
+                            + MissingThingHint(map, request.TargetArg, false));
                     return plan;
                 }
                 plan.Target = found;
@@ -552,6 +607,8 @@ namespace HomeBridge.BridgeTools
                 case "tend": PrepareTend(plan); break;
                 case "haul": PrepareHaul(plan); break;
                 case "work": PrepareWork(plan); break;
+                case "rest": PrepareRest(plan); break;
+                case "deploy": PrepareDeploy(plan); break;
             }
 
             return plan;
@@ -733,6 +790,21 @@ namespace HomeBridge.BridgeTools
                     NameOf(plan.Pawn) + " cannot reach (" + plan.Cell.x + "," + plan.Cell.z
                     + ")" + (plan.Cell == asked ? "" : ", the nearest standable cell to the one asked for")
                     + ", even accepting deadly danger.");
+                return;
+            }
+            // draft:false is not a refusal here -- it is the undrafted move, the
+            // one order in this file the float menu has no equivalent for.
+            // "Go here" is drawn only for a drafted pawn, but JobDefOf.Goto is
+            // an ordinary job and TryTakeOrderedJob takes it from an undrafted
+            // one, who walks there and then picks its next job normally. So
+            // this is the move that leaves nobody drafted, and it undrafts a
+            // pawn who already was.
+            if (!plan.Request.Draft)
+            {
+                if (BridgeCommon.Try(() => plan.Pawn.Drafted, false))
+                    plan.NeedsUndraft = true;
+                plan.UndraftedGoto = true;
+                BuildGotoJob(plan);
                 return;
             }
             if (!EnsureDraft(plan, true))
@@ -1002,6 +1074,731 @@ namespace HomeBridge.BridgeTools
                 return;
             }
             BuildTendJob(plan);
+        }
+
+        // -------------------------------------------------------------- rest
+
+        /// <summary>
+        /// "Go and lie down in that bed" -- the job vanilla's own
+        /// `JobGiver_GetRest` builds, `JobMaker.MakeJob(JobDefOf.LayDown, bed)`.
+        ///
+        /// **There is no float-menu option for it and there never was.**
+        /// RimWorld AUTO-TAKES a right-click on a bed, so `open_context_menu`
+        /// on a bed cell comes back with no menu and zero options -- which is
+        /// exactly what `order.py force &lt;pawn&gt; &lt;bed cell&gt; "Rest"`
+        /// found, and why resting needed an action of its own.
+        ///
+        /// The bed is the named target when one is given, the bed standing on
+        /// x,z when a cell is given, and `RestUtility.FindBedFor`'s answer when
+        /// neither is -- the same search the game runs when a tired colonist
+        /// puts itself to bed.
+        ///
+        /// A DRAFTED pawn will not lie down, so this undrafts one; draft:false
+        /// refuses instead of undrafting, as everywhere else.
+        /// </summary>
+        private static void PrepareRest(Plan plan)
+        {
+            var bed = plan.Target as Building_Bed;
+            if (plan.Target != null && bed == null)
+            {
+                plan.Refuse("bad_arguments",
+                    Describe(plan.Target) + " is not a bed, so nobody can be ordered to rest in it. Name a bed, give the "
+                    + "bed's cell as x/z, or leave the target off entirely and RestUtility.FindBedFor picks "
+                    + NameOf(plan.Pawn) + "'s own.");
+                return;
+            }
+            if (bed == null && plan.Cell.IsValid)
+            {
+                // OccupiedRect, so a two-cell double bed answers at both cells.
+                bed = BridgeCommon.Try<Building_Bed>(
+                    () => Pool(plan.Map, false).OfType<Building_Bed>().FirstOrDefault(b => Covers(b, plan.Cell)), null);
+                if (bed == null)
+                {
+                    plan.Refuse("target_not_found",
+                        "No bed stands on (" + plan.Cell.x + "," + plan.Cell.z + "). 'rest' needs a bed: name one, give a "
+                        + "cell a bed covers, or leave both off to use the pawn's own.");
+                    return;
+                }
+            }
+            if (bed == null)
+            {
+                bed = BridgeCommon.Try<Building_Bed>(() => RestUtility.FindBedFor(plan.Pawn), null);
+                if (bed == null)
+                    bed = BridgeCommon.Try<Building_Bed>(
+                        () => RestUtility.FindBedFor(plan.Pawn, plan.Pawn, false, ignoreOtherReservations: true), null);
+                if (bed == null)
+                {
+                    plan.Refuse("job_refused",
+                        "RestUtility.FindBedFor found no bed " + NameOf(plan.Pawn)
+                        + " may use, with and without ignoreOtherReservations. Build one, free one, or name a bed outright.");
+                    return;
+                }
+            }
+
+            if (!BridgeCommon.Try(() => RestUtility.CanUseBedEver(plan.Pawn, bed.def), true))
+            {
+                plan.Refuse("job_refused",
+                    NameOf(plan.Pawn) + " can never use " + Describe(bed)
+                    + " (RestUtility.CanUseBedEver is false) -- an animal bed for a humanlike, or the other way round.");
+                return;
+            }
+            if (!BridgeCommon.Try(() => bed.AnyUnoccupiedSleepingSlot, true))
+            {
+                plan.Refuse("job_refused", "Every sleeping slot in " + Describe(bed) + " is occupied.");
+                return;
+            }
+            if (!BridgeCommon.Try(() => plan.Pawn.CanReach(bed, PathEndMode.OnCell, Danger.Deadly), false))
+            {
+                plan.Refuse("not_reachable",
+                    NameOf(plan.Pawn) + " cannot reach " + Describe(bed) + ", even accepting deadly danger.");
+                return;
+            }
+            // A drafted pawn stands in the bed instead of lying in it.
+            if (!EnsureDraft(plan, false))
+                return;
+
+            plan.Target = bed;
+            plan.TargetPawn = null;
+            if (plan.TargetMatchedBy == null)
+                plan.TargetMatchedBy = "bedAtCell";
+            BuildRestJob(plan);
+        }
+
+
+        // ================================================================
+        // deploy -- the wearable-pack gizmo, as a job
+        // ================================================================
+
+        /// <summary>
+        /// `deploy` -- the worn-pack gizmo ("Deploy turret, 1 / 1"), issued as
+        /// a job instead of through the targeter.
+        ///
+        /// ## The bug this exists for
+        ///
+        /// 2026-09-08, Threadneedle: two colonists wore turret packs, a raw
+        /// pixel click on the gizmo raised the placement ghost reliably, and
+        /// every map click CLOSED the targeter without placing anything. Four
+        /// cells, two carriers, paused and running. No message, no letter,
+        /// nothing in `home/status`.
+        ///
+        /// Decompiled, the reason is that a pack deploy is **a thrown grenade,
+        /// not a build order**. `Apparel_PackTurret` lives in ANOMALY, not
+        /// Odyssey (`Data\Anomaly\Defs\ThingDefs_Misc\Apparel_Packs.xml`), and
+        /// all of its code is in the ordinary `Assembly-CSharp.dll`. It carries
+        /// a `CompProperties_ApparelVerbOwnerCharged` (maxCharges 1,
+        /// destroyOnEmpty, shown drafted AND undrafted) and one verb:
+        ///
+        ///     verbClass          Verb_LaunchProjectileStaticOneUse
+        ///     label              deploy turret
+        ///     defaultProjectile  Grenade_TurretPack -- Projectile_SpawnsThing,
+        ///                        spawnsThingDef Turret_TacticalTurret
+        ///     range              22.9
+        ///     targetParams       canTargetLocations only
+        ///
+        /// `VerbProperties.requireLineOfSight` defaults to **true** and the def
+        /// does not override it, so the capsule has to FLY to the cell.
+        ///
+        /// ## Two gates, and they fail differently
+        ///
+        /// `Targeter.ProcessInputEvents`, on a left click:
+        ///
+        ///     var t = CurrentTargetUnderMouse(mustBeHittableNowIfNotMelee: false);
+        ///     needsStopTargetingCall = true;
+        ///     if (!targetingSource.ValidateTarget(t)) { Event.current.Use(); return; }
+        ///     OrderVerbForceTarget();
+        ///     ...
+        ///     if (needsStopTargetingCall) StopTargeting();
+        ///
+        /// and `OrderPawnForceTarget` re-reads the cell with
+        /// `CurrentTargetUnderMouse(mustBeHittableNowIfNotMelee: **true**)`,
+        /// which blanks it to `LocalTargetInfo.Invalid` when
+        /// `targetingSource.CanHitTarget(t)` is false -- and then orders
+        /// nothing, because `target.IsValid` is false. So:
+        ///
+        ///   * **`ValidateTarget` false** -- the click is swallowed and the
+        ///     targeter STAYS OPEN. `Verb_LaunchProjectileStaticOneUse` puts
+        ///     its whole cell rule here:
+        ///     `target.Cell.GetFirstBuilding(map) == null` then
+        ///     `target.Cell.Standable(map)`. **Any** `Building` refuses it: a
+        ///     wall, a door, a power conduit under the floor, a chair, an
+        ///     unfinished `Frame` (which is a `Building`).
+        ///   * **`CanHitTarget` false** -- the targeter CLOSES and nothing is
+        ///     ordered. That is the reported symptom, exactly.
+        ///     `Verb.CanHitTarget` is `TryFindShootLineFromTo`: inside
+        ///     `EffectiveRange` (22.9), outside `EffectiveMinRange` (0 for a
+        ///     plain cell, because `VerbUtility.AllowAdjacentShot` is true when
+        ///     the target has no Thing), and `GenSight.LineOfSight(root, cell,
+        ///     map, skipFirstCell: true)` from the pawn's own cell or from one
+        ///     of `ShootLeanUtility.LeanShootingSourcesFromTo`'s lean-out cells.
+        ///
+        /// **Neither posts a `Messages.Message`.** The only branch in the whole
+        /// path that does is `ReloadableUtility.CanUseConsideringQueuedJobs`,
+        /// for a pack with no charges left -- which is why `home/status`
+        /// messages were empty on every one of those four clicks. A mined-out
+        /// mountain room with a one-wide throat has line of sight to almost
+        /// nothing outside it, and that is what ate them.
+        ///
+        /// `CanUseConsideringQueuedJobs` reads `Event.current.shift`, and
+        /// `Event.current` is **null** outside `OnGUI`. So `ValidateTarget` is
+        /// never called from this tool -- it would throw on the main-thread
+        /// hop. Its checks are run one at a time instead, from the same source.
+        ///
+        /// ## The job
+        ///
+        /// `Verb_LaunchProjectileStaticOneUse.OrderForceTarget` is three lines:
+        ///
+        ///     Job job = JobMaker.MakeJob(JobDefOf.UseVerbOnThingStaticReserve, target);
+        ///     job.verbToUse = this;
+        ///     CasterPawn.jobs.TryTakeOrderedJob(job, JobTag.Misc);
+        ///
+        /// `JobDriver_CastVerbOnceStaticReserve.TryMakePreToilReservations`
+        /// **reserves the target cell**, so a cell another colonist has already
+        /// claimed for a job takes the order and drops it. `Pawn.CanReserve` is
+        /// pre-checked here. The plain `Verb_LaunchProjectileStatic` base uses
+        /// `UseVerbOnThingStatic` with no reservation, and a verb that is
+        /// neither -- the broadshield, tox and deadlife packs all derive
+        /// straight from `Verb` -- takes `Verb.OrderForceTarget`'s own shape:
+        /// `verbProps.ai_IsWeapon ? AttackStatic : UseVerbOnThing`, with
+        /// `endIfCantShootInMelee = true`.
+        /// </summary>
+        private const string DeployRule =
+            "A pack deploy is a THROWN GRENADE, not a build order. The cell must (1) hold NO Building at all -- no wall, "
+            + "door, power conduit under the floor, furniture or unfinished frame -- and be standable, and (2) be inside "
+            + "the verb's range AND in LINE OF SIGHT of the pawn, because the capsule flies there. Neither refusal says "
+            + "anything in the UI: a cell that fails (1) swallows the click and leaves the targeter open, and a cell that "
+            + "fails (2) CLOSES the targeter and places nothing. Inside a mined-out mountain room, a cell on the far side "
+            + "of the rock is invisible however close it is.";
+
+        /// <summary>How many suggestion cells are offered, and the hard cap on
+        /// how many cells one refusal is allowed to test for them.</summary>
+        private const int MaxDeployCells = 8;
+
+        private const int MaxDeployScan = 2200;
+
+        /// <summary>One worn pack and one of its gizmo verbs.</summary>
+        private sealed class PackOption
+        {
+            internal Apparel Apparel;
+            internal CompApparelVerbOwner Comp;
+            internal Verb Verb;
+        }
+
+        /// <summary>Every worn apparel that draws a targeting gizmo, read where
+        /// `Pawn_ApparelTracker.AllApparelVerbs` reads -- the apparel's own
+        /// `CompApparelVerbOwner` -- but kept beside its verb, so the pack that
+        /// owns each command is known. `Verb.EquipmentSource` is null for an
+        /// uncharged `CompApparelVerbOwner`, which is why the walk is done here
+        /// rather than from the verb back.</summary>
+        private static List<PackOption> DeployablePacks(Pawn pawn)
+        {
+            var found = new List<PackOption>();
+            try
+            {
+                var tracker = pawn == null ? null : pawn.apparel;
+                var worn = tracker == null ? null : tracker.WornApparel;
+                if (worn == null)
+                    return found;
+                for (var i = 0; i < worn.Count; i++)
+                {
+                    var apparel = worn[i];
+                    if (apparel == null)
+                        continue;
+                    var comp = BridgeCommon.Try<CompApparelVerbOwner>(() => apparel.GetComp<CompApparelVerbOwner>(), null);
+                    if (comp == null)
+                        continue;
+                    var verbs = BridgeCommon.Try<List<Verb>>(() => comp.AllVerbs, null);
+                    if (verbs == null)
+                        continue;
+                    for (var j = 0; j < verbs.Count; j++)
+                    {
+                        var verb = verbs[j];
+                        if (verb == null || verb.verbProps == null)
+                            continue;
+                        if (!BridgeCommon.Try(() => verb.verbProps.hasStandardCommand && verb.verbProps.targetable, false))
+                            continue;
+                        found.Add(new PackOption { Apparel = apparel, Comp = comp, Verb = verb });
+                    }
+                }
+            }
+            catch
+            {
+                // A pawn whose apparel tracker throws simply wears no pack.
+            }
+            return found;
+        }
+
+        /// <summary>The same id forms every other target takes, matched against
+        /// a WORN pack -- which is not on `map.listerThings`, so the ordinary
+        /// resolver can never see it. The gizmo's own label ("deploy turret")
+        /// matches too, because that is the string a reader has in front of
+        /// them.</summary>
+        private static bool PackAnswersTo(PackOption option, string query)
+        {
+            if (option == null || string.IsNullOrEmpty(query))
+                return false;
+            var q = query.Trim();
+            var thing = option.Apparel;
+            if (string.Equals(BridgeCommon.SafeString(() => thing.GetUniqueLoadID()), q, StringComparison.OrdinalIgnoreCase))
+                return true;
+            if (string.Equals(BridgeCommon.SafeString(() => thing.ThingID), q, StringComparison.OrdinalIgnoreCase))
+                return true;
+            var number = BridgeCommon.TryN(() => thing.thingIDNumber);
+            if (number.HasValue && string.Equals(number.Value.ToString(CultureInfo.InvariantCulture), q, StringComparison.Ordinal))
+                return true;
+            if (string.Equals(BridgeCommon.SafeString(() => thing.def == null ? null : thing.def.defName), q, StringComparison.OrdinalIgnoreCase))
+                return true;
+            var label = BridgeCommon.SafeString(() => thing.LabelCap.ToString());
+            if (label != null && label.IndexOf(q, StringComparison.OrdinalIgnoreCase) >= 0)
+                return true;
+            var verbLabel = BridgeCommon.SafeString(() => option.Verb.verbProps.label);
+            return verbLabel != null && verbLabel.IndexOf(q, StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        private static string PackListing(List<PackOption> options)
+        {
+            var parts = new List<string>();
+            foreach (var option in options)
+            {
+                parts.Add(BridgeCommon.SafeString(() => option.Apparel.LabelCap.ToString())
+                          + " (" + BridgeCommon.SafeString(() => option.Apparel.def.defName)
+                          + ", gizmo \"" + BridgeCommon.SafeString(() => option.Verb.verbProps.label) + "\")");
+            }
+            return string.Join("; ", parts.ToArray());
+        }
+
+        /// <summary>Resolve a named pack against the pawn's WORN apparel, in
+        /// place of the ordinary target resolution. The pack is worn, not
+        /// spawned, so `map.listerThings` cannot see it and the normal path
+        /// would answer `target_not_found` about a thing the pawn is wearing.
+        /// </summary>
+        private static void ResolveWornPack(Plan plan, string query)
+        {
+            var options = DeployablePacks(plan.Pawn);
+            if (options.Count == 0)
+            {
+                plan.Refuse("no_deploy_pack",
+                    NameOf(plan.Pawn) + " wears no apparel with a deploy gizmo (no worn CompApparelVerbOwner with a "
+                    + "targetable standard command), so '" + query + "' cannot name one.");
+                return;
+            }
+            var hits = new List<PackOption>();
+            foreach (var option in options)
+                if (PackAnswersTo(option, query))
+                    hits.Add(option);
+            if (hits.Count == 0)
+            {
+                plan.Refuse("target_not_found",
+                    "None of the packs " + NameOf(plan.Pawn) + " wears answers to '" + query
+                    + "'. Worn and deployable: " + PackListing(options)
+                    + ". A worn pack is not on the map, so it takes its thingId, its defName or its label -- never a cell.");
+                return;
+            }
+            if (hits.Count > 1)
+            {
+                plan.Refuse("ambiguous",
+                    "'" + query + "' matched " + hits.Count + " of the packs " + NameOf(plan.Pawn)
+                    + " wears: " + PackListing(hits) + ". Name one by its defName or its thingId.");
+                return;
+            }
+            plan.DeployPack = hits[0].Apparel;
+            plan.DeployComp = hits[0].Comp;
+            plan.Verb = hits[0].Verb;
+            plan.Target = hits[0].Apparel;
+            plan.TargetMatchedBy = "wornPack";
+        }
+
+        private static void PrepareDeploy(Plan plan)
+        {
+            var checks = new Dictionary<string, object>(StringComparer.Ordinal);
+            plan.DeployChecks = checks;
+
+            // ------------------------------------------------------ the pack
+            if (plan.DeployPack == null)
+            {
+                var options = DeployablePacks(plan.Pawn);
+                if (options.Count == 0)
+                {
+                    plan.Refuse("no_deploy_pack",
+                        NameOf(plan.Pawn) + " wears nothing with a deploy gizmo. A deployable pack is apparel carrying a "
+                        + "CompApparelVerbOwner whose verb has hasStandardCommand and targetable -- the turret pack, the "
+                        + "hunter pack, the tox / deadlife / broadshield packs. Read what they wear with `python gear.py "
+                        + (NameOf(plan.Pawn) ?? "<pawn>") + "`.");
+                    return;
+                }
+                if (options.Count > 1)
+                {
+                    plan.Refuse("ambiguous",
+                        NameOf(plan.Pawn) + " wears " + options.Count + " deployable packs: " + PackListing(options)
+                        + ". Pass the one you mean as `target` -- its defName or its thingId.");
+                    return;
+                }
+                plan.DeployPack = options[0].Apparel;
+                plan.DeployComp = options[0].Comp;
+                plan.Verb = options[0].Verb;
+                plan.Target = options[0].Apparel;
+                if (plan.TargetMatchedBy == null)
+                    plan.TargetMatchedBy = "onlyWornPack";
+            }
+
+            var verb = plan.Verb;
+            var pack = plan.DeployPack;
+            var oneUse = verb is Verb_LaunchProjectileStaticOneUse;
+            var isStatic = verb is Verb_LaunchProjectileStatic;
+            plan.DeployOneUse = oneUse;
+
+            checks["pack"] = BridgeCommon.SafeString(() => pack.def == null ? null : pack.def.defName);
+            checks["verbClass"] = verb == null ? null : verb.GetType().Name;
+            checks["requiresLineOfSight"] = BridgeCommon.Try(() => verb.verbProps.requireLineOfSight, true);
+            checks["mustCastOnOpenGround"] = BridgeCommon.Try(() => verb.verbProps.mustCastOnOpenGround, false);
+
+            // ------------------------------------------------- the gizmo bar
+            // CompApparelVerbOwner.CreateVerbTargetCommand's three Disable
+            // arms, in its own order. A disabled gizmo never opens a targeter
+            // at all, so these come before anything about the cell.
+            if (!BridgeCommon.Try(() => plan.Pawn.IsColonistPlayerControlled, false))
+            {
+                plan.Refuse("deploy_refused",
+                    NameOf(plan.Pawn) + " is not a player-controlled colonist, so the deploy gizmo is disabled "
+                    + "(\"CannotOrderNonControlled\") and clicking it would open no targeter either.");
+                return;
+            }
+            if (BridgeCommon.Try(() => verb.verbProps.violent, false) && IncapableOfViolence(plan.Pawn))
+            {
+                plan.Refuse("incapable_of_violence",
+                    NameOf(plan.Pawn) + " has WorkTags.Violent disabled and this verb is violent, so the gizmo is greyed "
+                    + "out. Somebody else has to wear the pack.");
+                return;
+            }
+            if (!CompCanBeUsed(plan.DeployComp))
+            {
+                plan.Refuse("deploy_refused",
+                    Describe(pack) + " cannot be used here: CompApparelVerbOwner.CanBeUsed is false, which is a pocket map "
+                    + "or a vacuum biome this verb is not rated for.");
+                return;
+            }
+            var charged = plan.DeployComp as CompApparelVerbOwner_Charged;
+            if (charged != null)
+            {
+                var remaining = BridgeCommon.TryN(() => charged.RemainingCharges) ?? 0;
+                checks["charges"] = remaining;
+                checks["maxCharges"] = BridgeCommon.TryN(() => charged.MaxCharges);
+                if (remaining <= 0)
+                {
+                    plan.Refuse("deploy_refused",
+                        Describe(pack) + " has 0 charges left, so ReloadableUtility.CanUseConsideringQueuedJobs refuses "
+                        + "the cast. This is the ONE refusal in the whole deploy path that posts a Messages.Message, so "
+                        + "it is also the only one home/status would ever have shown you.");
+                    return;
+                }
+            }
+            // Verb_LaunchProjectile.Available() opens with
+            // `casterPawn.Faction != Faction.OfPlayer`, and Faction.OfPlayer's
+            // null arm is a Log.Error -- which is a TickManager.Pause(). It
+            // cannot be null on a loaded colony map; this proves that rather
+            // than trusting it, and skips the optional gate if it ever is.
+            var playerFaction = BridgeCommon.Try<Faction>(() => Faction.OfPlayerSilentFail, null);
+            checks["availableChecked"] = playerFaction != null;
+            if (playerFaction != null && !BridgeCommon.Try(() => verb.Available(), true))
+            {
+                plan.Refuse("deploy_refused",
+                    "Verb.Available() is false for " + Describe(pack)
+                    + ", so Targeter.ConfirmStillValid would close the targeter on the next frame even if it opened. "
+                    + "That is missing fuel, a role restriction, or the pocket-map / vacuum gate.");
+                return;
+            }
+
+            // ------------------------------------------------------ the cell
+            if (!plan.Cell.IsValid)
+            {
+                plan.Refuse("bad_arguments",
+                    "action 'deploy' needs both x and z -- the CELL to deploy onto. The pack itself is worn, so `target` "
+                    + "only ever names WHICH pack, and only when the pawn wears more than one.");
+                return;
+            }
+            if (!BridgeCommon.Try(() => plan.Cell.InBounds(plan.Map), false))
+            {
+                plan.Refuse("bad_arguments", "(" + plan.Cell.x + "," + plan.Cell.z + ") is outside this map.");
+                return;
+            }
+
+            var range = BridgeCommon.TryN(() => verb.EffectiveRange) ?? 0f;
+            var minRange = BridgeCommon.TryN(() => verb.verbProps.EffectiveMinRange(plan.Cell, plan.Pawn)) ?? 0f;
+            var distanceSquared = BridgeCommon.TryN(() => plan.Pawn.Position.DistanceToSquared(plan.Cell)) ?? -1;
+            var distance = distanceSquared < 0 ? -1f : (float)Math.Sqrt(distanceSquared);
+            checks["range"] = Math.Round((double)range, 2);
+            checks["minRange"] = Math.Round((double)minRange, 2);
+            checks["distance"] = Math.Round((double)distance, 2);
+            checks["fogged"] = BridgeCommon.Try(() => plan.Cell.Fogged(plan.Map), false);
+
+            var building = BridgeCommon.Try<Building>(() => plan.Cell.GetFirstBuilding(plan.Map), null);
+            var standable = BridgeCommon.Try(() => plan.Cell.Standable(plan.Map), false);
+            checks["buildingOnCell"] = building == null ? null : Describe(building);
+            checks["standable"] = standable;
+
+            // Verb_LaunchProjectileStaticOneUse.ValidateTarget, run as its own
+            // two lines rather than by calling it: the base it chains to reads
+            // Event.current, which is null off the GUI thread.
+            if (oneUse && building != null)
+            {
+                FindValidCells(plan, verb, oneUse, oneUse);
+                plan.Refuse("deploy_cell_blocked",
+                    "(" + plan.Cell.x + "," + plan.Cell.z + ") holds " + Describe(building)
+                    + ". Verb_LaunchProjectileStaticOneUse.ValidateTarget is `cell.GetFirstBuilding(map) == null` first, "
+                    + "so ANY Building refuses the cell -- a wall, a door, a power conduit under the floor, a chair, an "
+                    + "unfinished construction frame. In the game that click is SWALLOWED and the targeter stays open, "
+                    + "which is why it read as nothing happening. " + NearbyHint(plan));
+                return;
+            }
+            if (oneUse && !standable)
+            {
+                FindValidCells(plan, verb, oneUse, oneUse);
+                plan.Refuse("deploy_cell_blocked",
+                    "(" + plan.Cell.x + "," + plan.Cell.z + ") is not standable (IntVec3.Standable: impassable terrain, or "
+                    + "something on it whose def.passability is not Standable). "
+                    + "Verb_LaunchProjectileStaticOneUse.ValidateTarget refuses it, silently. " + NearbyHint(plan));
+                return;
+            }
+
+            // Verb.CanHitTarget -- the gate that CLOSES the targeter.
+            var canHit = BridgeCommon.Try(() => verb.CanHitTarget(plan.Cell), false);
+            var lineOfSight = BridgeCommon.Try(
+                () => GenSight.LineOfSight(plan.Pawn.Position, plan.Cell, plan.Map, true), false);
+            var inRange = distance >= 0f && distance <= range && distanceSquared >= minRange * minRange;
+            checks["lineOfSight"] = lineOfSight;
+            checks["inRange"] = inRange;
+            checks["canHitTarget"] = canHit;
+
+            if (!canHit && !inRange)
+            {
+                FindValidCells(plan, verb, oneUse, oneUse);
+                plan.Refuse("deploy_out_of_range",
+                    NameOf(plan.Pawn) + " is " + distance.ToString("0.0", CultureInfo.InvariantCulture)
+                    + " cells from (" + plan.Cell.x + "," + plan.Cell.z + ") and this verb reaches "
+                    + range.ToString("0.0", CultureInfo.InvariantCulture)
+                    + ". Verb.CanHitTarget is false, which CLOSES the targeter and places nothing, with no message. "
+                    + "Move the pawn closer first: `python order.py goto " + (NameOf(plan.Pawn) ?? "<pawn>")
+                    + " <x> <z>`. " + NearbyHint(plan));
+                return;
+            }
+            if (!canHit)
+            {
+                FindValidCells(plan, verb, oneUse, oneUse);
+                plan.Refuse("deploy_no_line_of_sight",
+                    NameOf(plan.Pawn) + " cannot throw " + Describe(pack) + " to (" + plan.Cell.x + "," + plan.Cell.z
+                    + "): it is IN range (" + distance.ToString("0.0", CultureInfo.InvariantCulture) + " of "
+                    + range.ToString("0.0", CultureInfo.InvariantCulture) + ") but there is NO LINE OF SIGHT from ("
+                    + plan.Pawn.Position.x + "," + plan.Pawn.Position.z
+                    + "). Verb.TryFindShootLineFromTo fails from the pawn's own cell and from every ShootLeanUtility "
+                    + "lean-out cell beside it, so Verb.CanHitTarget is false -- and THAT is the gate that closes the "
+                    + "targeter without a word. " + DeployRule + " " + NearbyHint(plan));
+                return;
+            }
+
+            // JobDriver_CastVerbOnceStaticReserve reserves the target CELL.
+            if (oneUse)
+            {
+                var canReserve = BridgeCommon.Try(() => plan.Pawn.CanReserve(plan.Cell), true);
+                checks["canReserve"] = canReserve;
+                if (!canReserve)
+                {
+                    FindValidCells(plan, verb, oneUse, oneUse);
+                    plan.Refuse("deploy_cell_reserved",
+                        "(" + plan.Cell.x + "," + plan.Cell.z + ") is already reserved by another colonist's job. "
+                        + "JobDriver_CastVerbOnceStaticReserve.TryMakePreToilReservations reserves the target cell, so "
+                        + "this order would be taken and then dropped. " + NearbyHint(plan));
+                    return;
+                }
+            }
+
+            BuildDeployJob(plan, verb, oneUse, isStatic);
+        }
+
+        /// <summary>`CompApparelVerbOwner.CanBeUsed`, which takes an `out`
+        /// argument and therefore cannot sit inside a lambda.</summary>
+        private static bool CompCanBeUsed(CompApparelVerbOwner comp)
+        {
+            try
+            {
+                if (comp == null)
+                    return false;
+                string reason;
+                return comp.CanBeUsed(out reason);
+            }
+            catch { return true; }
+        }
+
+        /// <summary>
+        /// `Verb_LaunchProjectileStaticOneUse.OrderForceTarget` and its two
+        /// neighbours, as the job each of them builds:
+        ///
+        ///     OneUse  -> UseVerbOnThingStaticReserve, verbToUse, targetA
+        ///     Static  -> UseVerbOnThingStatic,        verbToUse, targetA
+        ///     Verb    -> ai_IsWeapon ? AttackStatic : UseVerbOnThing,
+        ///                verbToUse, targetA, endIfCantShootInMelee = true
+        ///
+        /// `playerForced` is set by `TryTakeOrderedJob` itself, as everywhere
+        /// else in this file.
+        /// </summary>
+        private static void BuildDeployJob(Plan plan, Verb verb, bool oneUse, bool isStatic)
+        {
+            string defName;
+            if (oneUse)
+            {
+                defName = "UseVerbOnThingStaticReserve";
+            }
+            else if (isStatic)
+            {
+                defName = "UseVerbOnThingStatic";
+            }
+            else
+            {
+                defName = BridgeCommon.Try(() => verb.verbProps.ai_IsWeapon, false) ? "AttackStatic" : "UseVerbOnThing";
+                plan.EndIfCantShootInMelee = true;
+                // Verb.OrderForceTarget's own melee-range refusal -- the one
+                // branch of the whole path that DOES post a message.
+                var minRange = BridgeCommon.TryN(() => verb.verbProps.EffectiveMinRange(plan.Cell, plan.Pawn)) ?? 0f;
+                if (BridgeCommon.Try(() => plan.Pawn.Position.DistanceToSquared(plan.Cell) < minRange * minRange
+                                           && plan.Pawn.Position.AdjacentTo8WayOrInside(plan.Cell), false))
+                {
+                    plan.Refuse("deploy_out_of_range",
+                        "(" + plan.Cell.x + "," + plan.Cell.z + ") is inside this verb's minimum range and adjacent to "
+                        + NameOf(plan.Pawn) + ". Verb.OrderForceTarget answers that with MessageCantShootInMelee and "
+                        + "issues nothing. Step back, or pick a cell further out.");
+                    return;
+                }
+            }
+
+            plan.JobDef = BridgeCommon.Try<JobDef>(() => DefDatabase<JobDef>.GetNamedSilentFail(defName), null);
+            if (plan.JobDef == null)
+            {
+                plan.Refuse("job_refused", "JobDef " + defName + " was not found in this build.");
+                return;
+            }
+            plan.TargetA = plan.Cell;
+            plan.SetVerbToUse = true;
+        }
+
+        /// <summary>The up-to-eight nearest cells this pawn could actually
+        /// deploy onto, tested with the same predicate the refusals use.
+        /// Radial-ordered around the cell that was asked for; and then, if that
+        /// found nothing -- which is what "out of range" looks like -- around
+        /// the pawn, out to the verb's own range.</summary>
+        private static void FindValidCells(Plan plan, Verb verb, bool oneUse, bool needsReserve)
+        {
+            plan.DeployCells = new List<object>();
+            if (verb == null || plan.Map == null || plan.Pawn == null)
+                return;
+            var asked = plan.Cell;
+            if (asked.IsValid && Scan(plan, verb, oneUse, needsReserve, asked, 12.9f, asked) > 0)
+            {
+                plan.DeployCellsOrigin = "askedCell";
+                return;
+            }
+            var origin = BridgeCommon.Try(() => plan.Pawn.Position, IntVec3.Invalid);
+            if (!origin.IsValid)
+                return;
+            var range = BridgeCommon.TryN(() => verb.EffectiveRange) ?? 0f;
+            if (range <= 0f)
+                return;
+            plan.DeployCells = new List<object>();
+            if (Scan(plan, verb, oneUse, needsReserve, origin, Math.Min(range, 24.9f), asked) > 0)
+                plan.DeployCellsOrigin = "pawn";
+        }
+
+        private static int Scan(Plan plan, Verb verb, bool oneUse, bool needsReserve,
+                                IntVec3 centre, float radius, IntVec3 measureFrom)
+        {
+            var found = 0;
+            try
+            {
+                var examined = 0;
+                foreach (var cell in GenRadial.RadialCellsAround(centre, radius, true))
+                {
+                    if (++examined > MaxDeployScan || found >= MaxDeployCells)
+                        break;
+                    if (!DeployCellOk(plan, verb, oneUse, needsReserve, cell))
+                        continue;
+                    var fromAsked = measureFrom.IsValid
+                        ? (int)Math.Round(Math.Sqrt(measureFrom.DistanceToSquared(cell)))
+                        : 0;
+                    var fromPawn = (int)Math.Round(Math.Sqrt(plan.Pawn.Position.DistanceToSquared(cell)));
+                    plan.DeployCells.Add(new Dictionary<string, object>(StringComparer.Ordinal)
+                    {
+                        { "x", cell.x },
+                        { "z", cell.z },
+                        { "distanceFromAsked", fromAsked },
+                        { "distanceFromPawn", fromPawn }
+                    });
+                    found++;
+                }
+            }
+            catch
+            {
+                // A scan that throws simply offers no suggestions.
+            }
+            return found;
+        }
+
+        private static bool DeployCellOk(Plan plan, Verb verb, bool oneUse, bool needsReserve, IntVec3 cell)
+        {
+            try
+            {
+                if (!cell.InBounds(plan.Map))
+                    return false;
+                if (oneUse && (cell.GetFirstBuilding(plan.Map) != null || !cell.Standable(plan.Map)))
+                    return false;
+                if (!verb.CanHitTarget(cell))
+                    return false;
+                if (needsReserve && !plan.Pawn.CanReserve(cell))
+                    return false;
+                return true;
+            }
+            catch { return false; }
+        }
+
+        private static string NearbyHint(Plan plan)
+        {
+            var cells = plan.DeployCells;
+            if (cells == null || cells.Count == 0)
+                return "No cell within reach passes both gates from where " + (NameOf(plan.Pawn) ?? "the pawn")
+                       + " stands, so the pawn has to move first: `python order.py goto "
+                       + (NameOf(plan.Pawn) ?? "<pawn>") + " <x> <z>`.";
+            var first = cells[0] as Dictionary<string, object>;
+            var x = first == null ? 0 : Convert.ToInt32(first["x"], CultureInfo.InvariantCulture);
+            var z = first == null ? 0 : Convert.ToInt32(first["z"], CultureInfo.InvariantCulture);
+            return cells.Count + " cell(s) nearby DO pass both gates -- diagnostics.deploy.validCellsNearby -- and the "
+                   + "nearest is (" + x + "," + z + "): `python order.py deploy " + (NameOf(plan.Pawn) ?? "<pawn>")
+                   + " " + x + " " + z + " --do`.";
+        }
+
+        private static object DeployBlock(Plan plan)
+        {
+            var pack = plan.DeployPack;
+            var charged = plan.DeployComp as CompApparelVerbOwner_Charged;
+            return new Dictionary<string, object>(StringComparer.Ordinal)
+            {
+                { "ok", plan.Error == null },
+                { "reason", plan.Error },
+                { "reasonKind", plan.ErrorKind },
+                { "rule", DeployRule },
+                { "cell", plan.Cell.IsValid ? BridgeCommon.Pos(plan.Cell) : null },
+                {
+                    "pack", pack == null ? null : new Dictionary<string, object>(StringComparer.Ordinal)
+                    {
+                        { "thingId", BridgeCommon.SafeString(() => pack.GetUniqueLoadID()) },
+                        { "defName", BridgeCommon.SafeString(() => pack.def == null ? null : pack.def.defName) },
+                        { "label", BridgeCommon.SafeString(() => pack.LabelCap.ToString()) },
+                        { "gizmoLabel", plan.Verb == null ? null : BridgeCommon.SafeString(() => plan.Verb.verbProps.label) },
+                        { "verbClass", plan.Verb == null ? null : plan.Verb.GetType().Name },
+                        { "charges", charged == null ? (object)null : BridgeCommon.TryN(() => charged.RemainingCharges) },
+                        { "maxCharges", charged == null ? (object)null : BridgeCommon.TryN(() => charged.MaxCharges) },
+                        { "oneUse", plan.DeployOneUse }
+                    }
+                },
+                { "checks", plan.DeployChecks ?? new Dictionary<string, object>(StringComparer.Ordinal) },
+                { "validCellsNearby", plan.DeployCells ?? new List<object>() },
+                { "validCellsOrigin", plan.DeployCellsOrigin }
+            };
         }
 
         // ============================================== haul / work (WorkGivers)
@@ -1541,6 +2338,11 @@ namespace HomeBridge.BridgeTools
                         job.count = plan.Count;
                     if (plan.DraftedTend)
                         job.draftedTend = true;
+                    // Verb.OrderForceTarget's own two fields, for a verb cast.
+                    if (plan.SetVerbToUse && plan.Verb != null)
+                        job.verbToUse = plan.Verb;
+                    if (plan.EndIfCantShootInMelee)
+                        job.endIfCantShootInMelee = true;
                 }
                 plan.ExpiryInterval = job.expiryInterval;
             }
@@ -1598,6 +2400,23 @@ namespace HomeBridge.BridgeTools
             {
                 plan.Verified = true;
                 plan.VerifiedReason = null;
+            }
+
+            // A DRAFTED pawn equips instantly -- the Equip job completes inside
+            // the frame, so by this read-back CurJob is already Wait_MaintainPosture
+            // and the job test above can never pass (found live 2026-09-12: the
+            // refusal's own read-back showed the rifle equipped). The evidence
+            // that survives the job is the equipment itself.
+            if (!plan.Verified && plan.JobDef != null
+                && string.Equals(DefNameOf(plan.JobDef), "Equip", StringComparison.Ordinal)
+                && BridgeCommon.Try(() => plan.Pawn.Drafted, false)
+                && plan.TargetA.HasThing
+                && BridgeCommon.Try(() => plan.Pawn.equipment != null
+                       && ReferenceEquals(plan.Pawn.equipment.Primary, plan.TargetA.Thing), false))
+            {
+                plan.Verified = true;
+                plan.VerifiedReason = "Verified by EQUIPMENT, not by job: a drafted pawn equips instantly, and "
+                    + Describe(plan.TargetA.Thing) + " is now the pawn's primary weapon.";
             }
 
             if (!plan.Verified)
@@ -1852,6 +2671,27 @@ namespace HomeBridge.BridgeTools
             plan.DraftedTend = true;
         }
 
+        /// <summary>
+        /// `JobGiver_GetRest`, minus the tiredness check:
+        ///
+        ///     Job job = JobMaker.MakeJob(JobDefOf.LayDown, bed);
+        ///
+        /// That is the whole job. `JobDriver_LayDown` reserves the sleeping
+        /// slot itself, and a pawn who is not sleepy still lies down and rests
+        /// -- which is what tending, recovery and "rest until healed" are made
+        /// of.
+        /// </summary>
+        private static void BuildRestJob(Plan plan)
+        {
+            plan.JobDef = BridgeCommon.Try<JobDef>(() => JobDefOf.LayDown, null);
+            if (plan.JobDef == null)
+            {
+                plan.Refuse("job_refused", "JobDefOf.LayDown was not found in this build.");
+                return;
+            }
+            plan.TargetA = plan.Target;
+        }
+
         // =================================================================
         // Resolution
         // =================================================================
@@ -1967,6 +2807,74 @@ namespace HomeBridge.BridgeTools
             if (partial.Count == 1) { matchedBy = "nameSubstring"; return partial[0]; }
             candidates = partial;
             return null;
+        }
+
+        /// <summary>A pawn this map knows about that is NOT on the map --
+        /// carried, inside a drop pod, inside a container. Matched by an
+        /// EXPLICIT id form only, never by name, so it can never introduce an
+        /// ambiguity the spawned search did not already have.</summary>
+        private static Pawn UnspawnedPawn(Map map, string query)
+        {
+            var text = query == null ? string.Empty : query.Trim();
+            if (text.Length == 0)
+                return null;
+
+            List<Pawn> all;
+            try { all = map.mapPawns.AllPawns.ToList(); }
+            catch { return null; }
+
+            int number;
+            var isNumber = int.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out number);
+            foreach (var pawn in all)
+            {
+                if (pawn == null || BridgeCommon.Try(() => pawn.Spawned, true))
+                    continue;
+                if (Eq(BridgeCommon.SafeString(() => pawn.GetUniqueLoadID()), text)
+                    || Eq(BridgeCommon.SafeString(() => pawn.ThingID), text)
+                    || (isNumber && BridgeCommon.Try(() => pawn.thingIDNumber, -1) == number))
+                    return pawn;
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// Why an id that a listing printed does not resolve here.
+        ///
+        /// This tool pools `map.listerThings.AllThings` and home/list_pawns
+        /// reads `map.mapPawns.AllPawnsSpawned`; both are the SPAWNED map. So
+        /// an id one printed and the other cannot find names something that
+        /// has left -- carried, in a pod or a container, away with a caravan,
+        /// or destroyed. The census of the same defName is the evidence, and
+        /// it separates "that kind is not on this map at all" from "three of
+        /// them are and none is that one".
+        /// </summary>
+        private static string MissingThingHint(Map map, string query, bool pawnsOnly)
+        {
+            var text = query == null ? string.Empty : query.Trim();
+            if (text.StartsWith("Thing_", StringComparison.OrdinalIgnoreCase))
+                text = text.Substring("Thing_".Length);
+            var letters = new string(text.TakeWhile(c => !char.IsDigit(c)).ToArray()).Trim();
+            if (letters.Length < 2)
+                return string.Empty;
+
+            List<Thing> kin;
+            try
+            {
+                kin = Pool(map, pawnsOnly)
+                    .Where(t => Eq(BridgeCommon.SafeString(() => t.def == null ? null : t.def.defName), letters))
+                    .ToList();
+            }
+            catch { return string.Empty; }
+
+            if (kin.Count == 0)
+                return " Nothing with defName '" + letters + "' is spawned on this map at all, so that id is for another "
+                     + "map, another save, or something that no longer exists.";
+
+            var ids = string.Join(", ", kin.Take(5).Select(t => BridgeCommon.SafeString(() => t.ThingID) ?? "?").ToArray());
+            return " " + kin.Count + " spawned thing(s) share the defName '" + letters + "' (" + ids
+                 + (kin.Count > 5 ? ", ..." : string.Empty) + ") and none of them is that one. An id a listing printed and "
+                 + "this cannot find has LEFT the map -- carried, in a pod or a container, away with a caravan, or "
+                 + "destroyed. Both readers see only SPAWNED things, so re-read the listing instead of trusting the id.";
         }
 
         /// <summary>How many candidates a tie may list. A one-letter query can
@@ -2176,6 +3084,8 @@ namespace HomeBridge.BridgeTools
 
         private static object DiagnosticsBlock(Plan plan)
         {
+            if (plan.Request.Action == "deploy")
+                return new Dictionary<string, object>(StringComparer.Ordinal) { { "deploy", DeployBlock(plan) } };
             if (plan.Request.Action != "haul")
                 return new Dictionary<string, object>();
             return new Dictionary<string, object>
@@ -2253,6 +3163,10 @@ namespace HomeBridge.BridgeTools
                 { "defName", BridgeCommon.SafeString(() => target.def == null ? null : target.def.defName) },
                 { "kindDef", pawn == null ? null : BridgeCommon.SafeString(() => pawn.kindDef == null ? null : pawn.kindDef.defName) },
                 { "faction", BridgeCommon.SafeString(() => target.Faction == null ? null : target.Faction.Name) },
+                // Faction.Name is a COLONY NAME, so it cannot be compared to
+                // "player" by a caller. This is the bool that answers "is this
+                // one of ours" -- OfPlayerSilentFail, never OfPlayer.
+                { "isPlayerFaction", BridgeCommon.Try(() => target.Faction != null && target.Faction == Faction.OfPlayerSilentFail, false) },
                 { "isPawn", pawn != null },
                 { "spawned", BridgeCommon.Try(() => target.Spawned, false) },
                 { "hostileToPlayer", HostileToPlayer(target) },
@@ -2311,6 +3225,23 @@ namespace HomeBridge.BridgeTools
             {
                 note += " verb is REPORTED, not written onto the job: JobDriver_AttackStatic calls "
                       + "pawn.TryGetAttackVerb(target, !pawn.IsColonist) for itself on every run.";
+            }
+            if (plan.SetVerbToUse)
+            {
+                note += " This is a VERB CAST: job.verbToUse is the pack's own gizmo verb, exactly as "
+                      + "Verb.OrderForceTarget writes it, and the cell is targetA. The pawn walks nowhere - "
+                      + "JobDriver_CastVerbOnceStatic is StopDead then CastVerb - so the throw happens from where they "
+                      + "stand, after the verb's warmup.";
+            }
+            if (plan.UndraftedGoto)
+            {
+                note += " This move is UNDRAFTED (draft:false): the pawn walks to the cell and then picks its next job "
+                      + "normally, so nothing is left drafted and the pawn will NOT hold the position.";
+            }
+            if (plan.JobDef != null && string.Equals(DefNameOf(plan.JobDef), "LayDown", StringComparison.Ordinal))
+            {
+                note += " LayDown is the job JobGiver_GetRest builds; the float menu has no rest option at all, because "
+                      + "RimWorld auto-takes a click on a bed. The pawn lies down and stays until rested or interrupted.";
             }
             note += " TryTakeOrderedJob checks KeyBindingDefOf.QueueOrder.IsDownEvent, so a physically held SHIFT key would "
                   + "queue this order behind the current one instead of replacing it; that is what verified is for.";

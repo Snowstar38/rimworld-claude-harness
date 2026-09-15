@@ -26,6 +26,14 @@ cycles the selection through the things under the cursor on repeated clicks, so
 is the selected one, and raises rather than let a caller fire a gizmo on
 whatever else happened to be lying there.
 
+**A PAWN is never selected by a click here.** Cycling a cell cannot separate two
+pawns standing on the same tile -- Samantha stood on Ernst's square for fourteen
+turns of the 2026-09-08 stream and every read of his gizmo bar came back hers,
+hiding a wearable turret pack the whole time. `select_pawn()` sends
+`rimworld/select_pawn {pawnId}` and verifies the selection by id, with no pixel
+in the path at all; `select_thing()` hands over to it whenever the target
+resolves as a pawn.
+
 Read-only from the command line:
 
   python pick.py where 118 144      # would a click at 118,144 land? camera only
@@ -130,6 +138,34 @@ def holds(sel, thing_id):
     return bool(want) and want in sel.get("ids", set())
 
 
+def _target(reply):
+    """`get_map_target_info`'s `target`, carrying the ids the ENVELOPE holds.
+
+    The envelope always names `thingId`, `pawnId` and `kind`. The `target`
+    payload does not: a thing is described by `DescribeThing`, which has
+    `thingId`, and a PAWN by `DescribePawn`, which has `pawnId` and **no
+    `thingId` at all**. Callers read `target["thingId"]`, so every pawn came
+    back with a None id, and a None id verifies against nothing -- live
+    2026-09-08, `buildings.py gizmo` refused itself with "selection is pawn
+    Ernst [Thing_Human618], expected Ernst [None]".
+    """
+    target = dict(reply.get("target") or {})
+    for key in ("thingId", "pawnId", "kind", "position", "label"):
+        if not target.get(key) and reply.get(key):
+            target[key] = reply[key]
+    if not target.get("thingId") and target.get("pawnId"):
+        target["thingId"] = target["pawnId"]
+    if not target.get("kind"):
+        target["kind"] = "pawn" if target.get("pawnId") else "thing"
+    return target
+
+
+def is_pawn(target):
+    """Is this resolved target a pawn? Pawns are selected by id, never clicked."""
+    t = target or {}
+    return t.get("kind") == "pawn" or bool(t.get("pawnId"))
+
+
 def resolve(thing_id):
     """`rimworld/get_map_target_info` for any thing on the map, or None.
 
@@ -146,7 +182,26 @@ def resolve(thing_id):
         r = rim.game("rimworld/get_map_target_info", {"thingId": spelling},
                      strict=False)
         if isinstance(r, dict) and r.get("target"):
-            return r["target"]
+            return _target(r)
+    return None
+
+
+def resolve_pawn(name_or_id):
+    """A pawn on the current map, by NAME or by id, or None.
+
+    `get_map_target_info {thingId:...}` matches an exact thing id and nothing
+    else, so "Ernst" -- which is how a person names a pawn, and the only handle
+    a stream chat ever says out loud -- resolved to nothing. The same tool takes
+    `pawnId` and `pawnName` against every pawn on the map; both are tried, id
+    first, because a name can be ambiguous and an id never is.
+    """
+    text = str(name_or_id or "").strip()
+    if not text:
+        return None
+    for args in ({"pawnId": text}, {"pawnName": text}):
+        r = rim.game("rimworld/get_map_target_info", args, strict=False)
+        if isinstance(r, dict) and r.get("target"):
+            return _target(r)
     return None
 
 
@@ -325,14 +380,82 @@ def select_cell(x, z, expect=None, expect_label=None, button="left",
     return sel
 
 
+def select_pawn(pawn_id, label=None, announce=True, clear=True):
+    """Select a pawn BY ID. No click, no camera move, no cell involved.
+
+    **Two pawns standing on one tile are one cell**, and a cell click cycles
+    whatever is drawn there in whatever order the game draws it. Reading Ernst's
+    gizmo bar through a click returned Samantha's for fourteen turns of the
+    2026-09-08 stream because she was standing on his square, and a wearable
+    turret pack sat unseen on his bar the whole time. A pawn has a stable id and
+    the bridge has `rimworld/select_pawn {pawnId}`, so there is no reason to
+    aim a pixel at one -- `order.py`, `move.py` and `combat_actions.py` have
+    always selected pawns this way.
+
+    Upstream `select_pawn` resolves PLAYER COLONISTS only (`ResolveColonist`),
+    so an animal, a raider or a visitor is refused here -- and the caller can
+    fall back to the cell path, which at least verifies what it selected.
+
+    Returns the selection read-back. Raises ClickMissed on a refusal or on a
+    selection that came back as someone else.
+    """
+    who = label or "that pawn"
+    if not pawn_id:
+        raise ClickMissed(
+            "SELECT REFUSED -- %s was resolved without an id, so there is "
+            "nothing to select by and nothing to verify against. A pawn "
+            "payload names the id `pawnId`, not `thingId`." % who)
+    if clear:
+        clear_designator(announce=announce)
+    rim.game("rimworld/clear_selection", {}, strict=False)
+    r = rim.game("rimworld/select_pawn", {"pawnId": str(pawn_id)}, strict=False)
+    if not isinstance(r, dict) or r.get("success") is False:
+        why = ((r.get("message") or r.get("error")) if isinstance(r, dict)
+               else str(r)[:160]) or "no reason given"
+        raise ClickMissed(
+            "SELECT REFUSED -- rimworld/select_pawn would not select %s [%s]: "
+            "%s. It resolves PLAYER COLONISTS only, so an animal, a prisoner, "
+            "a visitor or a raider has to be reached by clicking their cell."
+            % (who, pawn_id, why))
+    sel = selection()
+    if holds(sel, pawn_id):
+        if announce:
+            print("   selected by id, no click: %s" % sel["text"])
+        return sel
+    if not sel.get("ok"):
+        # The selection read is the one that throws on a selected turret
+        # (live 2026-09-06). select_pawn's own read-back is then the evidence.
+        confirmed = _norm_id((r.get("selected") or {}).get("pawnId"))
+        if confirmed and confirmed == _norm_id(pawn_id):
+            if announce:
+                print("   selected by id, no click: %s [%s] -- the selection "
+                      "read did not answer, so this is select_pawn's own "
+                      "read-back" % (who, pawn_id))
+            return {"ok": True, "count": 1, "objects": [r["selected"]],
+                    "ids": {_norm_id(pawn_id)},
+                    "text": "%s [%s] (from select_pawn's read-back)"
+                            % (who, pawn_id)}
+    raise ClickMissed(
+        "SELECT MISSED -- selection is %s, expected %s [%s]. This was selected "
+        "BY ID and not by a click, so a cell holding two pawns is not the "
+        "explanation; the game is disagreeing with its own selection read."
+        % (sel["text"], who, pawn_id))
+
+
 def select_thing(thing_id, x=None, z=None, label=None, tries=CLICK_TRIES,
-                 announce=True, clear=True):
+                 announce=True, clear=True, kind=None):
     """Select exactly this thing, cycling the cell's stack until it is the one.
 
     A cell can hold a turret and twelve plainleather; the first click can select
     either. Returns the selection read-back. Raises ClickMissed naming what got
     selected instead, so nothing downstream fires on the wrong thing.
+
+    `kind="pawn"` -- or a resolve that comes back a pawn -- hands over to
+    `select_pawn()`, which selects by id and never clicks: no amount of cycling
+    can separate two pawns sharing a cell if the game hands back the same one.
     """
+    if kind == "pawn":
+        return select_pawn(thing_id, label=label, announce=announce, clear=clear)
     if x is None or z is None:
         target = resolve(thing_id)
         if not target:
@@ -342,6 +465,10 @@ def select_thing(thing_id, x=None, z=None, label=None, tries=CLICK_TRIES,
         p = target.get("position") or {}
         x, z = p.get("x"), p.get("z")
         label = label or target.get("label")
+        if kind is None and is_pawn(target):
+            return select_pawn(target.get("thingId") or target.get("pawnId")
+                               or thing_id, label=label, announce=announce,
+                               clear=clear)
         if x is None or z is None:
             raise ClickMissed("CLICK MISSED -- selection is nothing, expected "
                               "%s (it reports no map position, so there is no "

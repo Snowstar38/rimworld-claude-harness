@@ -18,7 +18,8 @@ unread one never look the same.
 ## What each line says
 
   CLOCK      the date the game prints, and whether it is stopped -- and WHY.
-             `PAUSED by guard colonist_injury -- Longhoff was injured.
+             `PAUSED by guard colonist_injury -- Longhoff stopped play: took a
+             new wound worth 14.00 hit points.
              (service exited 43 s ago; fix the cause, then python play.py
              start)`. The reason comes from the companion, which keeps
              StopReason for the last epoch after the supervisor process is
@@ -42,12 +43,9 @@ unread one never look the same.
              come from `targets[]`, never from the prose.
   COLONISTS  one line each: mood with its break band, health, current job, and
              a `[...]` tag for drafted / in bed / downed / bleeding / mental.
-  THREATS    hostiles, hunting predators, WILD PREDATORS NEAR a colonist and
-             DOWNED pawns near one. A tame predator's hunt and a wild one
-             eating wildlife are excluded by the tool, not here. The last two
-             rows exist because on 2026-09-04 this board said "THREATS none"
-             with a timber wolf 15 cells from the medic: a predator is not
-             hostile until it starts hunting, and by then it is on somebody.
+  THREATS    hostiles, hunting predators and DOWNED pawns near one. A tame
+             predator's hunt and a wild one eating wildlife are excluded by the
+             tool, not here.
              The hostile NUMBER folds the downed-near rows in -- `2 hostile(s)
              (1 downed -- gets back up)` -- because a manhunter that goes down
              loses its mental state and leaves hostiles[] by the companion's
@@ -343,15 +341,13 @@ def brief_lines(r):
         out.append(warning)
     threat = threat_summary(r)
     out.append("        %d letter(s) (%d choice), %d message(s), %d alert(s) "
-               "(%d loud), %d colonist(s) (%d down), %s, %s%s"
+               "(%d loud), %d colonist(s) (%d down), %s, %s"
                % (c.get("letterCount") or 0,
                   sum(letter_mark(row).strip() == "CHOICE" for row in (r.get("letters") or [])),
                   c.get("messageCount") or 0, c.get("alertCount") or 0,
                   c.get("loudAlertCount") or 0, c.get("colonistCount") or 0,
                   c.get("downedCount") or 0,
-                  hostile_phrase(threat), hunter_phrase(threat),
-                  ", %d wild predator(s) near a colonist" % threat["wildPredatorsNear"]
-                  if threat["wildPredatorsNear"] else ""))
+                  hostile_phrase(threat), hunter_phrase(threat)))
 
     loud = [a for a in (r.get("alerts") or [])
             if priority_rank(a.get("priority")) >= LOUD_FLOOR]
@@ -465,9 +461,6 @@ def threat_summary(r):
     extra = max(0, near_count - overlap)
 
     downed_in_hostiles = [h for h in hostiles if h.get("downed")]
-    wild_near = t.get("wildPredatorsNearCount")
-    if not isinstance(wild_near, int):
-        wild_near = len(t.get("wildPredatorsNear") or [])
 
     hunter_count = t.get("huntingPredatorCount")
     if not isinstance(hunter_count, int):
@@ -481,7 +474,6 @@ def threat_summary(r):
     return {"total": total, "downed": downed,
             "hostileCount": hostile_count, "downedNearExtra": extra,
             "rows": hostiles + extra_rows,
-            "wildPredatorsNear": wild_near,
             "huntingPredatorCount": hunter_count, "guardHunts": hunts}
 
 
@@ -629,25 +621,19 @@ def show(r, explain=False):
         print("COLONISTS none spawned on this map. (checked)")
 
     threats = r.get("threats") or {}
-    # 2026-09-04: wildPredatorsNear and downedNear are new rows, and they are
-    # the two the board was silent about on the night a timber wolf killed two
-    # colonists. A predator 15 cells away is not "hostile" until it starts
-    # hunting -- the board said THREATS none -- and a downed colonist is the
-    # single most time-critical fact a between-turns read can carry.
-    near = threats.get("wildPredatorsNear") or []
-    near_count = threats.get("wildPredatorsNearCount", len(near))
+    # downedNear[] is listed with its own count, apart from the fold below.
     downed = threats.get("downedNear") or []
     downed_count = threats.get("downedNearCount", len(downed))
     nearby_hunts = guard_hunters(threats)
     if (threats.get("hostileCount") or threats.get("huntingPredatorCount")
-            or near_count or downed_count or nearby_hunts):
+            or downed_count or nearby_hunts):
         summary = threat_summary(r)
         # The hostile number already FOLDS the downed-near rows in (they get
-        # back up); the last two are the raw lists, printed so the fold can be
-        # checked rather than taken on trust.
-        print("THREATS %s, %s   [lists: %d wild predator near, %d downed near]"
+        # back up); the raw count is printed so the fold can be checked rather
+        # than taken on trust.
+        print("THREATS %s, %s   [list: %d downed near]"
               % (hostile_phrase(summary), hunter_phrase(summary),
-                 near_count or 0, downed_count or 0))
+                 downed_count or 0))
         for h in nearby_hunts:
             print("  !! %s (%s) hunting %s within 40 cells: supervised-play guard applies"
                   % (h.get("name"), h.get("thingId"), h.get("prey") or "unknown prey"))
@@ -662,25 +648,18 @@ def show(r, explain=False):
             print("  !! %-18s hunting %s at %s"
                   % (_trim(h.get("name"), 18), h.get("prey"),
                      _pos(h.get("position"))))
-        for h in near[:ROW_CAP]:
-            print("  !! %-18s WILD PREDATOR, not hunting yet, at %s, %s cells "
-                  "from a colonist"
-                  % (_trim(h.get("name") or h.get("defName"), 18),
-                     _pos(h.get("position")), h.get("distanceToNearestColonist")))
         for h in downed[:ROW_CAP]:
             print("  !! %-18s DOWNED (alive, not a corpse -- GETS BACK UP), %s,"
                   " at %s, %s cells from a colonist"
                   % (_trim(h.get("name") or h.get("defName"), 18),
                      _owner(h), _pos(h.get("position")),
                      h.get("distanceToNearestColonist")))
-        for label, rows_, count in (("wild predator", near, near_count),
-                                    ("downed", downed, downed_count)):
-            if count and len(rows_) > ROW_CAP:
-                print("  ... +%d more %s (`python pawns.py --threats`)"
-                      % (len(rows_) - ROW_CAP, label))
+        if downed_count and len(downed) > ROW_CAP:
+            print("  ... +%d more downed (`python pawns.py --threats`)"
+                  % (len(downed) - ROW_CAP))
     elif blocks.get("threats"):
-        print("THREATS none. (checked -- hostiles, predator hunts, wild "
-              "predators near a colonist and the downed were all read.)")
+        print("THREATS none. (checked -- hostiles, predator hunts and the "
+              "downed were all read.)")
 
     ui = r.get("ui") or {}
     if ui.get("modalOpen") or ui.get("mainTabOpen") or ui.get("selectedCount"):

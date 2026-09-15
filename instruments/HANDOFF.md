@@ -16,6 +16,10 @@ One file. It points; it does not repeat.
 - **`tests\contract_test.py`** (in `rimworld\companion\`) — run after every
   DLL change, offline first, then live. The `live_*.py` scripts beside it are
   one command each per feature.
+- **`runtests.py`** — the unit suite (`test_*.py`), hermetically: it blocks
+  the bridge and overlay ports and fails on ANY socket connect, so it is safe
+  beside a live game. Prefer it to bare `unittest discover`, which started
+  the supervised-play clock twice on 2026-09-12 through unmocked tests.
 
 ## Shipped in phase 4, live-verified on `Lampblack - day 39`, nothing saved
 

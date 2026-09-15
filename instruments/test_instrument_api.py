@@ -171,7 +171,7 @@ class HuntTests(unittest.TestCase):
             act.hunt("alpaca", do=True, every=True)
         self.assertEqual([(120, 143), (121, 144)],
                          [(c.args[1]["x"], c.args[1]["z"])
-                          for c in call.call_args_list])
+                          for c in call.call_args_list if "x" in c.args[1]])
 
     def test_no_match_says_so_without_touching_the_game(self):
         with self._pawns([]), mock.patch.object(act.rim, "game") as call:

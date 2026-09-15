@@ -216,9 +216,11 @@ def run(config, call=None, runtime_path=RUNTIME, state_path=SERVICE_STATE,
     cooldown = config.get("injuryStopCooldownMs")
     args = {"op": "start", "speed": config["speed"],
             "mode": config.get("mode", "colony"),
+            "minHealthFraction": config.get("minHealthFraction", 0.5),
             "leaseMs": config["leaseMs"], "owner": config["owner"],
             "ignoredAlertLabels": config.get("ignoredAlertLabels") or "",
             "ignoredHostileIds": config.get("ignoredHostileIds") or "",
+            "ignoredPredatorIds": config.get("ignoredPredatorIds") or "",
             "ignoredDownedColonistIds": config.get("ignoredDownedColonistIds") or "",
             "ignoredInjuredColonistIds": config.get("ignoredInjuredColonistIds") or "",
             "injuryStopCooldownMs": int(DEFAULT_INJURY_COOLDOWN_MS
@@ -262,6 +264,14 @@ def run(config, call=None, runtime_path=RUNTIME, state_path=SERVICE_STATE,
     if isinstance(initial_events, dict) and initial_events.get("relayError"):
         raise RuntimeError(initial_events["relayError"])
     if started.get("active") is not True:
+        # The guard's own classification of everything it saw, kept on the state
+        # file so `play.py start` can print a category per pawn instead of one
+        # name. main() rewrites this row with the error and keeps the key.
+        state["stopThreats"] = started.get("stopThreats") or []
+        try:
+            commit(epoch)
+        except Exception:
+            pass
         raise RuntimeError("supervised_play stopped during start: %s: %s"
                            % (started.get("stopReason"), started.get("stopDetail")))
     state.update({"cursor": cursor,

@@ -22,6 +22,11 @@ printed as `NEW ALERT:` lines in the report.
 **An outside pause always wins.** A key press in the game window, or a
 `pause_game` from another session, stops this loop and is never undone.
 
+**Supervised play owns the clock outright.** While a `play.py` service is
+alive this refuses to start, touches neither the clock nor the service, and
+names the `play.py` verbs instead. Two guards fighting over one clock is how
+`run.py` used to pause the game and kill the play service on its way out.
+
 The safety watcher runs in short calls:
 
 * `home/play_until_event` (companion DLL) pauses at the moment of an event.
@@ -63,6 +68,43 @@ _EXTERNAL = ("external_pause", "force_paused", "speed_changed", "session_changed
 
 class _NoCompanion(Exception):
     """The companion tool is missing or failed. Never swallowed silently."""
+
+
+class _Supervised(Exception):
+    """A `play.py` session owns the clock. Refuse; never pause, never recover."""
+
+
+def _supervised_session():
+    """The live supervised-play service, read from disk. -> its state or None.
+
+    No bridge call and nothing touched. `run.py` has to be able to SEE the
+    durable clock owner without competing for the clock it owns.
+    """
+    try:
+        import play
+        import play_service
+    except Exception:
+        return None
+    try:
+        row = play_service.read_json(play_service.SERVICE_STATE)
+        return row if play.service_alive(row) else None
+    except Exception:
+        return None
+
+
+def _supervised_lines(epoch=None, pid=None, detail=None):
+    """What run.py prints instead of running. Nothing here changed anything."""
+    who = ("epoch %s, service pid %s" % (epoch, pid) if epoch or pid
+           else "already running")
+    lines = ["** SUPERVISED PLAY OWNS THE CLOCK (%s) ** run.py did not start: "
+             "two clock guards would fight over one clock." % who]
+    if detail:
+        lines.append("   the companion said: %s" % str(detail)[:160])
+    lines.append("   Nothing was touched here -- the clock is still running and "
+                 "the play service is still alive.")
+    lines.append("   Watch it:  python play.py status")
+    lines.append("   Stop it:   python play.py pause   (then run.py works normally)")
+    return lines
 
 
 def _guard_game(name, args, strict=False):
@@ -252,7 +294,12 @@ def _companion(done, seconds, speed, interval, verbose, ignored_hostile_ids=None
             raise _NoCompanion(str(r)[:160])
         stop = r["stopReason"]
         if stop in ("error", "unavailable", "busy"):
-            raise _NoCompanion("%s: %s" % (stop, r.get("stopDetail")))
+            detail = r.get("stopDetail")
+            # The companion refuses a second guard by name. That refusal is not
+            # a broken watcher, so it must not reach the fail-closed pause.
+            if stop == "busy" and "supervised_play" in str(detail):
+                raise _Supervised(detail)
+            raise _NoCompanion("%s: %s" % (stop, detail))
 
         # Threats are level-triggered. A previously reported predator or
         # hostile remains a reason to stop; only an explicit hostile ID can be
@@ -364,9 +411,16 @@ def until(done=None, seconds=60, speed="Superfast", interval=1.5, verbose=True,
     new information. A longer requested duration returns ``review needed`` and
     can be continued deliberately with another call.
     """
+    owner = _supervised_session()
+    if owner is not None:
+        print("\n".join(_supervised_lines(owner.get("epoch"), owner.get("pid"))))
+        return "supervised play", []
     try:
         return _companion(done, seconds, speed, interval, verbose,
                           ignored_hostile_ids, ignored_downed_ids)
+    except _Supervised as e:
+        print("\n".join(_supervised_lines(detail=e)))
+        return "supervised play", []
     except Exception as e:
         # Fail closed.  This may itself time out behind a legacy long-running
         # call, but it is still the only safe request to enqueue.

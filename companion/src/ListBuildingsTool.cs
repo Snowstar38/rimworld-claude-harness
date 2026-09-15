@@ -192,8 +192,8 @@ namespace HomeBridge.BridgeTools
                 + "construction), buildings[] (individually detailed rows) and aggregated[] (built structures grouped by def).")]
         [ToolResponse("buildings", "array", "One entry per building that was promoted to an individual row: every blueprint, frame, bill giver, bed, turret, and anything unpowered / switched off / broken down / out of fuel. Each carries thingId (the handle home/building_config and home/bills accept) and reasons[]. With billIngredients=true every bills[] row also carries ingredients[], canRunNow and blockedBy[].", Always = true)]
         [ToolResponse("aggregated", "array", "Built structures grouped by def: count (every instance), a SAMPLE of positions capped at maxPositionsPerDef with positionsListed / positionsNotListed / positionsTruncated / positionsCap saying so outright, distinctCells, promotedOut, and a damaged count. Empty when aggregate=false.", Always = true)]
-        [ToolResponse("powerNets", "array", "One row per PowerNet on the map: transmitterCount, connectorCount, producerCount, consumerCount, batteryCount, playerBuildingCount, buildingCount, generationW, consumptionW, netW, storedWd, storedMaxWd, hasPowerSource, hasActivePowerSource, flags[] (noProducer, noConsumer, isolatedBattery, isolatedTransmitter) and, on a flagged net only, buildings[] naming them with buildingsNotListed. This is the read that can see an orphaned battery; the per-building power block structurally cannot.", Always = true)]
-        [ToolResponse("powerSummary", "object", "netCount, flaggedNetCount, readable, error and a flags{} tally across every net. readable false with an error means the power-net manager could not be read at all, which is not the same as a clean grid.", Always = true)]
+        [ToolResponse("powerNets", "array", "One row per PowerNet on the map: transmitterCount, connectorCount, producerCount, consumerCount, batteryCount, playerBuildingCount, buildingCount, generationW and consumptionW (THIS TICK), generationCapacityW and consumptionCapacityW (what the defs could do), idleProducerCount, poweredConsumerCount, unpoweredConsumerCount, netW, storedWd, storedMaxWd, hasPowerSource, hasActivePowerSource, flags[] (noProducer, noConsumer, isolatedBattery, isolatedTransmitter) and, when the net is flagged or anything on it is dark or idle, buildings[] naming them (each with capacityW, poweredOn, switchedOn, brokenDown, hasFuel) plus buildingsNotListed. This is the read that can see an orphaned battery; the per-building power block structurally cannot.", Always = true)]
+        [ToolResponse("powerSummary", "object", "netCount, flaggedNetCount, readable, error, a flags{} tally across every net, activeConditions[] (the map's game conditions by defName) and solarFlare. readable false with an error means the power-net manager could not be read at all, which is not the same as a clean grid.", Always = true)]
         [ToolResponse("resourceDeficit", "array", "Every resource still needed by any blueprint or frame, summed across the map, with how much of it exists.", Always = true)]
         [ToolResponse("attention", "object", "Counts of the actionable states: blueprints, frames, pending short of materials, unpowered, broken down, switched off, out of fuel, worktables with no bills, finished bills, suspended bills, damaged. Always present, zeros included. billsShortOfIngredients is added by billIngredients=true and only then.", Always = true)]
         [ToolResponse("inspectSkipped", "array", "Present only when inspect=true. One entry per DEF whose GetInspectString() threw: defName, count, error. An empty array with inspect=true means every row's string was read; the key's ABSENCE means inspect was off and nothing was attempted. filters.inspect says which.", Nullable = true)]
@@ -204,7 +204,7 @@ namespace HomeBridge.BridgeTools
             CancellationToken cancellationToken,
             [ToolParameter(Description = "Only rows whose defName, label, or the def they will become contains this text (case-insensitive).")] string match = null,
             [ToolParameter(Description = "Which statuses to return: 'all' (default), 'built', 'blueprint', 'frame', or 'pending' (blueprints and frames together).", DefaultValue = "all")] string status = "all",
-            [ToolParameter(Description = "Which built things count as buildings: 'artificial' (default; RimWorld's own BuildingArtificial group, which excludes natural rock) or 'all' (adds natural and resource rock).", DefaultValue = "artificial")] string category = "artificial",
+            [ToolParameter(Description = "Which built things count as buildings: 'artificial' (default; RimWorld's own BuildingArtificial group, which excludes natural rock), 'all' (adds natural and resource rock) or 'rock' (ONLY natural rock, smoothed rock and mineable ore; requires playerOnly=false, because rock belongs to no faction).", DefaultValue = "artificial")] string category = "artificial",
             [ToolParameter(Description = "Only buildings belonging to the player faction.", DefaultValue = false)] bool playerOnly = false,
             [ToolParameter(Description = "Group mundane built structures by def instead of listing each one. Blueprints, frames, bill givers, beds, turrets and anything unpowered are always listed individually regardless.", DefaultValue = true)] bool aggregate = true,
             [ToolParameter(Description = "Promote a damaged building to its own row when its hit points are below this percentage of maximum. 0 = never promote on damage (aggregate rows still report a damaged count).", DefaultValue = 0)] int damagedBelowPct = 0,
@@ -280,8 +280,14 @@ namespace HomeBridge.BridgeTools
                 return Failure("status must be one of: all, built, blueprint, frame, pending. Got: " + status);
 
             var wantCategory = (category ?? "artificial").Trim().ToLowerInvariant();
-            if (wantCategory != "artificial" && wantCategory != "all")
-                return Failure("category must be one of: artificial, all. Got: " + category);
+            if (wantCategory != "artificial" && wantCategory != "all" && wantCategory != "rock")
+                return Failure("category must be one of: artificial, all, rock. Got: " + category);
+            var rockOnly = wantCategory == "rock";
+            // Natural rock belongs to no faction, so the colony filter removes
+            // every row of it. Saying so beats returning worktables.
+            if (rockOnly && playerOnly)
+                return Failure("category=rock with playerOnly=true returns nothing: natural rock, "
+                               + "smoothed rock and ore belong to no faction. Pass playerOnly=false.");
 
             if (maxPositions < 0) maxPositions = 0;
             if (maxDetailed < 0) maxDetailed = 0;
@@ -310,7 +316,7 @@ namespace HomeBridge.BridgeTools
                             source.Add(t);
                 }
 
-                if (wantCategory == "all")
+                if (wantCategory == "all" || rockOnly)
                 {
                     foreach (var t in map.listerThings.AllThings)
                         if (t != null && t.def != null &&
@@ -344,6 +350,7 @@ namespace HomeBridge.BridgeTools
             var skippedStatus = 0;
             var skippedRadius = 0;
             var skippedFaction = 0;
+            var skippedCategory = 0;
             var detailTruncated = 0;
 
             // Blueprints and frames first, so the maxDetailed cap -- if it ever
@@ -354,6 +361,12 @@ namespace HomeBridge.BridgeTools
                 if (thing == null || thing.def == null)
                     continue;
                 scanned++;
+
+                if (rockOnly && !IsRockDef(thing.def))
+                {
+                    skippedCategory++;
+                    continue;
+                }
 
                 var isBlueprint = thing is Blueprint;
                 var isFrame = thing is Frame;
@@ -489,6 +502,7 @@ namespace HomeBridge.BridgeTools
                         { "byStatus", skippedStatus },
                         { "byRadius", skippedRadius },
                         { "byPlayerOnly", skippedFaction },
+                        { "byCategory", skippedCategory },
                         { "byMaxDetailed", detailTruncated }
                     } },
                 { "notes", new Dictionary<string, object>
@@ -496,6 +510,7 @@ namespace HomeBridge.BridgeTools
                         // Not a filter over enumerated things -- a source choice --
                         // so it gets a stated flag rather than a fabricated count.
                         { "naturalRockExcluded", wantCategory == "artificial" },
+                        { "rockCategory", "category=rock keeps ONLY def.building.isNaturalRock, def.building.isResourceRock and def.mineable things -- natural stone, smoothed rock and ore. It reads the whole ThingCategory.Building population like category=all and then drops everything else, counted as skipped.byCategory. It requires playerOnly=false: rock belongs to no faction." },
                         { "aggregatedRowsOmittedWhenEmpty", "A def whose every instance was promoted to buildings[] has no aggregated[] row; nothing is hidden, each one appears there in full." },
                         { "positionIs", "Thing.Position, RimWorld's anchor cell. For multi-cell buildings see occupies." },
                         // 2026-09-02: BUGS.md reported "count: 11 for PowerConduit
@@ -599,6 +614,21 @@ namespace HomeBridge.BridgeTools
             }
 
             return reasons;
+        }
+
+        /// Natural stone, smoothed rock and ore -- what category=rock keeps.
+        /// isNaturalRock covers stone and its smoothed walls, isResourceRock and
+        /// mineable cover ore; a def is rock if any of the three says so.
+        private static bool IsRockDef(ThingDef def)
+        {
+            try
+            {
+                if (def == null) return false;
+                if (def.mineable) return true;
+                var b = def.building;
+                return b != null && (b.isNaturalRock || b.isResourceRock);
+            }
+            catch { return false; }
         }
 
         private static Dictionary<string, object> DetailRow(
@@ -749,6 +779,14 @@ namespace HomeBridge.BridgeTools
             row["workLeft"] = workLeft;
             row["workToBuild"] = workToBuild;
             row["percentComplete"] = percentComplete;
+            // The same number on the two scales it is read on. workLeft is raw
+            // work ticks; the inspect pane draws GenText.ToStringWorkAmount of
+            // it, which is that divided by 60 -- so "work left 800" and
+            // "Work left: 13" are one job, and were printed as two.
+            row["workLeftText"] = workLeft.HasValue
+                ? BridgeCommon.SafeString(() => workLeft.Value.ToStringWorkAmount()) : null;
+            row["workToBuildText"] = workToBuild.HasValue
+                ? BridgeCommon.SafeString(() => workToBuild.Value.ToStringWorkAmount()) : null;
 
             var resources = new List<object>();
             var short_ = false;
@@ -1026,16 +1064,38 @@ namespace HomeBridge.BridgeTools
                 var consumerCount = 0;
                 var generationW = 0f;
                 var consumptionW = 0f;
+                // Capacity is what the DEFS could do; generationW/consumptionW is
+                // what they are doing this tick. An unfuelled generator counts in
+                // the first and contributes nothing to the second, and printing
+                // only the second read as "5400W of power exists" while eleven
+                // consumers sat dark (2026-09-07).
+                var generationCapacityW = 0f;
+                var consumptionCapacityW = 0f;
+                var idleProducerCount = 0;
+                var poweredConsumerCount = 0;
+                var unpoweredConsumerCount = 0;
                 for (var j = 0; j < traders.Count; j++)
                 {
                     var t = traders[j];
                     if (t == null) continue;
                     var output = SafeFloat(() => t.PowerOutput) ?? 0f;
+                    var basis = BaseWatts(t);
                     // The DEF decides which side a thing is on. PowerOutput is 0
                     // on an idle or unpowered generator and would misfile it as
                     // a consumer, which is the very reading being fixed here.
-                    if (IsProducerDef(t)) { producerCount++; if (output > 0f) generationW += output; }
-                    else { consumerCount++; if (output < 0f) consumptionW += -output; }
+                    if (IsProducerDef(t))
+                    {
+                        producerCount++;
+                        generationCapacityW += -basis;
+                        if (output > 0f) generationW += output; else idleProducerCount++;
+                    }
+                    else
+                    {
+                        consumerCount++;
+                        consumptionCapacityW += basis;
+                        if (output < 0f) consumptionW += -output;
+                        if (SafePowerOn(t)) poweredConsumerCount++; else unpoweredConsumerCount++;
+                    }
                 }
                 var storedMax = 0f;
                 for (var j = 0; j < batteries.Count; j++)
@@ -1074,8 +1134,12 @@ namespace HomeBridge.BridgeTools
                     }
                 }
 
+                // Named on a flagged net, and on any net where something is dark
+                // or idle: "which lamp is out" is the question a power table is
+                // read to answer, and a flag alone cannot answer it.
+                var nameThem = flags.Count > 0 || unpoweredConsumerCount > 0 || idleProducerCount > 0;
                 var named = new List<object>();
-                if (flags.Count > 0)
+                if (nameThem)
                     for (var j = 0; j < members.Count && j < maxNamed; j++) named.Add(members[j].Row);
 
                 nets.Add(new Dictionary<string, object>
@@ -1090,6 +1154,11 @@ namespace HomeBridge.BridgeTools
                     { "buildingCount", members.Count },
                     { "generationW", generationW },
                     { "consumptionW", consumptionW },
+                    { "generationCapacityW", generationCapacityW },
+                    { "consumptionCapacityW", consumptionCapacityW },
+                    { "idleProducerCount", idleProducerCount },
+                    { "poweredConsumerCount", poweredConsumerCount },
+                    { "unpoweredConsumerCount", unpoweredConsumerCount },
                     { "netW", generationW - consumptionW },
                     { "storedWd", SafeFloat(net.CurrentStoredEnergy) },
                     { "storedMaxWd", storedMax },
@@ -1100,13 +1169,49 @@ namespace HomeBridge.BridgeTools
                     // able to say WHICH batteries sit on a dead net. A healthy
                     // net's membership is already answerable from buildings[].
                     { "buildings", named },
-                    { "buildingsNotListed", flags.Count == 0 ? 0 : Math.Max(0, members.Count - named.Count) }
+                    { "buildingsNotListed", nameThem ? Math.Max(0, members.Count - named.Count) : 0 }
                 });
             }
+            var conditions = ActiveConditionNames(map);
             summary = new Dictionary<string, object> {
                 { "netCount", nets.Count }, { "flaggedNetCount", flagged },
-                { "readable", true }, { "error", null }, { "flags", flagCounts } };
+                { "readable", true }, { "error", null }, { "flags", flagCounts },
+                // A solar flare switches every powered building off while the
+                // generators still read their full capacity. Without this the
+                // table says "gen 5400W" beside eleven dark consumers and gives
+                // the reader no way to tell why.
+                { "solarFlare", conditions.Contains("SolarFlare") },
+                { "activeConditions", conditions.Cast<object>().ToList() } };
             return nets;
+        }
+
+        /// The map's active game conditions by defName. [] when unreadable --
+        /// which is why solarFlare is derived from this list and not guessed.
+        private static List<string> ActiveConditionNames(Map map)
+        {
+            var names = new List<string>();
+            try
+            {
+                var mgr = map == null ? null : map.gameConditionManager;
+                var active = mgr == null ? null : mgr.ActiveConditions;
+                if (active == null) return names;
+                for (var i = 0; i < active.Count; i++)
+                {
+                    var c = active[i];
+                    if (c != null && c.def != null && c.def.defName != null)
+                        names.Add(c.def.defName);
+                }
+            }
+            catch { }
+            return names;
+        }
+
+        /// The def's own wattage: negative for a generator, positive for a draw.
+        /// This is capacity, not this tick's output.
+        private static float BaseWatts(CompPowerTrader trader)
+        {
+            try { return trader.Props == null ? 0f : trader.Props.PowerConsumption; }
+            catch { return 0f; }
         }
 
         /// A generator: its def's base draw is negative. PowerNet.IsPowerSource
@@ -1152,6 +1257,13 @@ namespace HomeBridge.BridgeTools
                 var thisRole = role ?? (trader != null && IsProducerDef(trader) ? "producer" : "consumer");
                 var isPlayer = false;
                 try { isPlayer = parent.Faction == player; } catch { }
+                // Enough per building to say WHY it is dark without a second
+                // call: a lamp that is off because the net is browning out and
+                // one that is off because somebody flicked it read identically
+                // from powerOutputW alone.
+                var flick = SafeComp<CompFlickable>(parent);
+                var broken = SafeComp<CompBreakdownable>(parent);
+                var refuel = SafeComp<CompRefuelable>(parent);
                 rows.Add(new NetMember {
                     Player = isPlayer,
                     Row = new Dictionary<string, object> {
@@ -1162,6 +1274,11 @@ namespace HomeBridge.BridgeTools
                         { "role", thisRole },
                         { "faction", SafeFactionName(parent) },
                         { "powerOutputW", trader == null ? (object)null : SafeFloat(() => trader.PowerOutput) },
+                        { "capacityW", trader == null ? (object)null : (object)Math.Abs(BaseWatts(trader)) },
+                        { "poweredOn", trader == null ? (object)null : (object)SafePowerOn(trader) },
+                        { "switchedOn", flick == null ? (object)null : (object)SafeSwitchOn(flick) },
+                        { "brokenDown", broken == null ? (object)null : (object)SafeBrokenDown(broken) },
+                        { "hasFuel", refuel == null ? (object)null : (object)SafeHasFuel(refuel) },
                         { "storedWd", battery == null ? (object)null : SafeFloat(() => battery.StoredEnergy) }
                     } });
             }

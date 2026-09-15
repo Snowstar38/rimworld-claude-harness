@@ -180,13 +180,14 @@ namespace HomeBridge.BridgeTools
             [ToolParameter(Description = "WRITE: make this bed a medical bed (true) or an ordinary one (false). Omit to leave it alone. Changing it in EITHER direction drops every owner the bed has (RimWorld's own setter does), and ownersDropped[] names them. Refused on a non-bed and on a bed whose def cannot be medical.")] bool? medical = null,
             [ToolParameter(Description = "WRITE: assign or clear this thing's owner. A colonist name (or ThingID) assigns, \"none\" unassigns everyone. Mirrors the Set-owner dialog: a pawn the game would not list, one it would grey out, or one an ideoligion forbids is REFUSED with the reason. Assigning also unclaims the pawn's previous bed and, on a full bed, evicts its last owner -- both named in the field row. Refused on a medical or prisoner bed, where the game draws no such button.")] string owner = null,
             [ToolParameter(Description = "WRITE: make this bed a prisoner bed (true) or a colonist bed (false). Omit to leave it alone. Setting it true is refused when the room cannot be a prison cell, with the game's own reason; either direction drops the bed's owners. Refused on a non-humanlike bed, a crib, and a bed currently set for slaves (that would silently make it a colonist bed).")] bool? forPrisoners = null,
+            [ToolParameter(Description = "WRITE: turn a BLUEPRINT or FRAME to face north, east, south or west (or 0-3). This is the only rotate on the bridge: RimWorld rotates at placement time only, so a standing building cannot be turned and is refused. Also refused when the def is not rotatable -- Thing.Rotation's setter calls Log.Error there, which pauses the colony -- and when the turned footprint would leave the map or cover something else.")] string rotation = null,
             [ToolParameter(Description = "TRUE by default. Resolve the thing, check every field and report what WOULD happen without touching the game. Pass false to actually apply it.", DefaultValue = true)] bool dryRun = true,
             [ToolParameter(Description = "On a real write, select the building and move the camera to it before the change lands, then clear the selection. Decorative only: the write is the same either way. Ignored on a dry run, a refusal and a gizmos-only read.", DefaultValue = true)] bool watch = true,
             [ToolParameter(Description = "How long the selection stays up after the write, in seconds.", DefaultValue = 8)] int watchSeconds = 8)
         {
             return BridgeCommon.WithUnknownArguments(
                 await BuildingConfigCore(ctx, cancellationToken, thing, gizmos, forbidden, power, temperature,
-                                         medical, owner, forPrisoners, dryRun, watch, watchSeconds)
+                                         medical, owner, forPrisoners, rotation, dryRun, watch, watchSeconds)
                     .ConfigureAwait(false),
                 ctx, typeof(HomeBuildingConfigTools), ToolName);
         }
@@ -202,6 +203,7 @@ namespace HomeBridge.BridgeTools
             bool? medical,
             string owner,
             bool? forPrisoners,
+            string rotation,
             bool dryRun,
             bool watch,
             int watchSeconds)
@@ -215,6 +217,7 @@ namespace HomeBridge.BridgeTools
                 spec = null;
             var powerSpec = string.IsNullOrEmpty(power) ? null : power.Trim();
             var ownerSpec = string.IsNullOrEmpty(owner) ? null : owner.Trim();
+            var rotationSpec = string.IsNullOrEmpty(rotation) ? null : rotation.Trim();
             var seconds = watchSeconds < 1 ? 1 : (watchSeconds > 60 ? 60 : watchSeconds);
 
             // Hop 1: resolve, read `before`, validate every field, and -- only
@@ -223,7 +226,7 @@ namespace HomeBridge.BridgeTools
             // payload is itself a pile of game reads.
             var stage = await ctx.MainThread
                 .InvokeAsync(() => Stage(ctx, spec, gizmos, forbidden, powerSpec, temperature, medical, ownerSpec,
-                                         forPrisoners, dryRun, watch),
+                                         forPrisoners, rotationSpec, dryRun, watch),
                              cancellationToken)
                 .ConfigureAwait(false);
 
@@ -288,7 +291,7 @@ namespace HomeBridge.BridgeTools
 
         private static Stage2 Stage(IRimBridgeContext ctx, string spec, bool wantGizmos,
                                     bool? forbidden, string powerSpec, float? temperature, bool? medical,
-                                    string ownerSpec, bool? forPrisoners,
+                                    string ownerSpec, bool? forPrisoners, string rotationSpec,
                                     bool dryRun, bool watch)
         {
             var stage = new Stage2();
@@ -352,6 +355,8 @@ namespace HomeBridge.BridgeTools
                 plans.Add(PlanForPrisoners(target, forPrisoners.Value));
             if (ownerSpec != null)
                 plans.Add(PlanOwner(target, ownerSpec));
+            if (rotationSpec != null)
+                plans.Add(PlanRotation(target, map, rotationSpec));
             stage.Plans = plans;
 
             var writable = plans.Count(p => !p.Refused && p.Write != null);
@@ -721,6 +726,117 @@ namespace HomeBridge.BridgeTools
                 UpdateFlickDesignation(t);
             };
             return plan;
+        }
+
+        /// <summary>
+        /// Turn a blueprint or frame. There is no rotate action anywhere else
+        /// on this bridge: RimWorld rotates while the placement designator is
+        /// held, and by the time a blueprint exists that moment is gone -- so
+        /// three turns of reinstalling a cooler failed on facing alone.
+        ///
+        /// A standing building is refused: vanilla has no way to turn one, and
+        /// writing Rotation on it would move its footprint without moving the
+        /// thing that occupies the cells. A non-rotatable def is refused
+        /// because Thing.Rotation's own setter calls Log.Error there, and
+        /// Log.Error's call path pauses the colony.
+        /// </summary>
+        private static FieldPlan PlanRotation(Thing thing, Map map, string wanted)
+        {
+            var plan = NewPlan("rotation", wanted, thing);
+            Rot4 rot;
+            if (!TryParseRot(wanted, out rot))
+                return Refuse(plan, RotName(thing),
+                    "rotation must be north, east, south or west (or 0-3). Got: " + wanted);
+
+            var isBlueprint = thing is Blueprint;
+            var isFrame = thing is Frame;
+            if (!isBlueprint && !isFrame)
+                return Refuse(plan, RotName(thing),
+                    "This is a standing building, and RimWorld can only rotate a thing while it is "
+                    + "being placed. Uninstall it (act.py uninstall) and place it again facing the "
+                    + "way you want, or rotate the install BLUEPRINT before a builder carries it.");
+            if (thing.def == null || !thing.def.rotatable)
+                return Refuse(plan, RotName(thing),
+                    "This def is not rotatable, so it has exactly one facing. Thing.Rotation's setter "
+                    + "calls Log.Error on a non-rotatable thing and Log.Error pauses the colony, so "
+                    + "nothing was written.");
+
+            var before = RotName(thing);
+            plan.Before = before;
+            plan.Predicted = rot.ToStringHuman();
+            plan.ReadBack = t => RotName(t);
+            if (string.Equals(before, plan.Predicted as string, StringComparison.Ordinal))
+            {
+                plan.Note = "Already facing " + before + "; nothing changes.";
+                plan.Write = t => { };
+                return plan;
+            }
+
+            string blocked;
+            if (!RotatedFootprintIsClear(thing, map, rot, out blocked))
+                return Refuse(plan, before, blocked);
+
+            plan.Write = t => { t.Rotation = rot; };
+            return plan;
+        }
+
+        private static string RotName(Thing thing)
+        {
+            return BridgeCommon.SafeString(() => thing.Rotation.ToStringHuman());
+        }
+
+        private static bool TryParseRot(string text, out Rot4 rot)
+        {
+            rot = Rot4.North;
+            if (string.IsNullOrEmpty(text))
+                return false;
+            switch (text.Trim().ToLowerInvariant())
+            {
+                case "0": case "n": case "north": rot = Rot4.North; return true;
+                case "1": case "e": case "east": rot = Rot4.East; return true;
+                case "2": case "s": case "south": rot = Rot4.South; return true;
+                case "3": case "w": case "west": rot = Rot4.West; return true;
+            }
+            return false;
+        }
+
+        /// Every cell the turned footprint would newly cover has to be on the
+        /// map and empty of other buildings. A 1x1 thing always passes.
+        private static bool RotatedFootprintIsClear(Thing thing, Map map, Rot4 rot, out string why)
+        {
+            why = null;
+            try
+            {
+                var now = thing.OccupiedRect();
+                var turned = GenAdj.OccupiedRect(thing.Position, rot, thing.def.size);
+                foreach (var cell in turned)
+                {
+                    if (now.Contains(cell))
+                        continue;
+                    if (!cell.InBounds(map))
+                    {
+                        why = "Turning it would put " + cell.x + "," + cell.z + " off the map.";
+                        return false;
+                    }
+                    var here = map.thingGrid.ThingsListAtFast(cell);
+                    for (var i = 0; i < here.Count; i++)
+                    {
+                        var other = here[i];
+                        if (other == null || other == thing || other.def == null) continue;
+                        if (other.def.category != ThingCategory.Building) continue;
+                        why = "Turning it would cover " + cell.x + "," + cell.z + ", where "
+                              + BridgeCommon.SafeString(() => other.LabelCap) + " stands.";
+                        return false;
+                    }
+                }
+                return true;
+            }
+            catch (Exception e)
+            {
+                why = "The turned footprint could not be checked (" + e.GetType().Name
+                      + "), so nothing was written.";
+                return false;
+            }
         }
 
         private static FieldPlan PlanTemperature(Thing thing, float wanted)

@@ -366,7 +366,13 @@ def cmd_preview():
 def watch_line(r, on=None):
     """One line about the menu the write opened, if any. Claims the camera for
     Hands when the watch moved it, so the Lookout stays out of the shot."""
-    w = (r or {}).get("watch") or {}
+    if not isinstance(r, dict):
+        # `call()` is strict=False, so a non-JSON string comes straight back --
+        # the exact shape `_fail` exists to name. It has already said so; going
+        # on to read `watch` off a string only renames that report
+        # `'str' object has no attribute 'get'` one line later.
+        return
+    w = r.get("watch") or {}
     if not w.get("shown"):
         print("watch: skipped (%s)" % (w.get("reason") or "not shown"))
         return

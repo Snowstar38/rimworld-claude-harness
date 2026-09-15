@@ -508,6 +508,91 @@ class AreaViewTests(unittest.TestCase):
             self.assertEqual(2, rimmap.main(["areas"]))
         self.assertIn("needs at least a cell", out.getvalue())
 
+    def test_areas_reads_a_comma_pair_rather_than_dropping_it(self):
+        seen = {}
+
+        def fake_scan(x0, z0, x1, z1, **kw):
+            seen["bounds"] = (x0, z0, x1, z1)
+            return {}
+
+        with mock.patch.object(rimmap.rim, "init"), \
+             mock.patch.object(rimmap.rim, "map_size", return_value=(250, 250)), \
+             mock.patch.object(rimmap, "scan", side_effect=fake_scan), \
+             mock.patch("sys.stdout", new_callable=io.StringIO):
+            rimmap.main(["areas", "122,140", "6", "6"])
+        self.assertEqual((122, 140, 128, 146), seen["bounds"])
+
+
+class LayerAliasTests(unittest.TestCase):
+    """`bldg` and `buildings` are the names a hand types for layer 5."""
+
+    def test_bldg_and_buildings_both_mean_the_build_layer(self):
+        for name in ("bldg", "bldgs", "buildings", "building", "build"):
+            self.assertEqual(({5}, [], {}), rimmap.parse_layers(name), name)
+
+    def test_every_alias_names_a_real_layer(self):
+        for alias, n in rimmap.LAYER_ALIAS.items():
+            self.assertIn(n, rimmap.LAYER_NAMES, alias)
+
+    def test_the_valid_name_help_lists_bldg(self):
+        self.assertIn("bldg", rimmap.layer_names_help())
+
+    def test_an_unknown_name_comes_back_with_the_valid_ones(self):
+        want, bad, elsewhere = rimmap.parse_layers("bldng")
+        self.assertEqual(["bldng"], bad)
+        self.assertEqual(set(), want)
+        self.assertEqual({}, elsewhere)
+
+
+class PayloadShapeTests(unittest.TestCase):
+    """A reply that is not a payload is named where it arrives, never read."""
+
+    def setUp(self):
+        self.src = dict(rimmap.SRC)
+
+    def tearDown(self):
+        rimmap.SRC.clear()
+        rimmap.SRC.update(self.src)
+
+    def test_a_split_stock_reply_raises_instead_of_reading_a_list(self):
+        rimmap.SRC.update(plus=False, tool=rimmap.STOCK_TOOL, why="test")
+        with mock.patch.object(rimmap.rim, "game",
+                               return_value=[{"cells": []}, {"cells": []}]):
+            with self.assertRaises(rimmap.rim.BridgeError) as e:
+                rimmap.block(0, 0, 4, 4)
+        self.assertIn("list", str(e.exception))
+        self.assertIn(rimmap.STOCK_TOOL, str(e.exception))
+
+    def test_a_stock_reply_with_no_cells_key_is_not_an_empty_region(self):
+        rimmap.SRC.update(plus=False, tool=rimmap.STOCK_TOOL, why="test")
+        with mock.patch.object(rimmap.rim, "game",
+                               return_value={"success": True}):
+            with self.assertRaises(rimmap.rim.BridgeError):
+                rimmap.block(0, 0, 4, 4)
+
+    def test_colonists_says_what_it_got_instead_of_an_attribute_error(self):
+        out = io.StringIO()
+        with mock.patch.object(rimmap.rim, "game", return_value="attn_1 ..."), \
+             mock.patch("sys.stdout", out):
+            self.assertEqual({}, rimmap.colonists())
+        self.assertIn("list_colonists failed", out.getvalue())
+        self.assertIn("drawn as unknown", out.getvalue())
+
+    def test_alerts_says_what_it_got_instead_of_an_attribute_error(self):
+        with mock.patch.object(rimmap.rim, "game", return_value=["a", "b"]):
+            said = rimmap.hostile_alerts()
+        self.assertEqual(1, len(said))
+        self.assertIn("list_alerts failed", said[0])
+        self.assertIn("list", said[0])
+
+
+class UsageLineTests(unittest.TestCase):
+    def test_the_usage_line_states_the_four_number_form(self):
+        head = rimmap.__doc__.split("python map.py 112 140")[0]
+        self.assertIn("usage: map.py", head)
+        self.assertIn("x z WIDTH HEIGHT", head)
+        self.assertIn("--corner", head)
+
 
 if __name__ == "__main__":
     unittest.main()

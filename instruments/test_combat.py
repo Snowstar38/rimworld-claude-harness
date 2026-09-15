@@ -5,6 +5,7 @@ import unittest
 from unittest import mock
 
 import combat
+import pawns
 import run
 
 
@@ -742,10 +743,49 @@ class CombatLedgerTests(unittest.TestCase):
             self.assertEqual([True], paused)
             self.assertEqual(100, combat.load_ledger(self.path)["watermarkTick"])
 
-    def test_advance_refuses_pulses_longer_than_the_playbook_limit(self):
-        with self.assertRaisesRegex(combat.CombatRefusal, "20 s or less"):
-            combat.advance(21, snap(), self.ident, self.path,
-                           waiter=lambda _: self.fail("ran a long pulse"))
+    def test_advance_over_the_cap_is_clamped_and_says_so(self):
+        # 2026-09-08: `advance 25` was refused for being over the 20 s cap and
+        # the refusal PAUSED the game. A number too big is a number to clamp.
+        calls = []
+        result = combat.advance(25, snap(), self.ident, self.path,
+                                waiter=lambda args: calls.append(args) or {
+                                    "stopReason": "budget_elapsed",
+                                    "endTick": 400, "success": True})
+        self.assertEqual(1, len(calls))
+        self.assertEqual(20000, calls[0]["maxDurationMs"])
+        self.assertEqual(25.0, result["advanceClamped"]["asked"])
+        self.assertEqual(20.0, result["advanceClamped"]["used"])
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            combat.print_advance_result(result)
+        self.assertIn("advance 25 -> 20 (cap)", out.getvalue())
+
+    def test_a_pulse_inside_the_cap_carries_no_clamp_note(self):
+        result = combat.advance(20, snap(), self.ident, self.path,
+                                waiter=lambda args: {
+                                    "stopReason": "budget_elapsed",
+                                    "endTick": 400, "success": True,
+                                    "askedMs": args["maxDurationMs"]})
+        self.assertEqual(20000, result["askedMs"])
+        self.assertNotIn("advanceClamped", result)
+
+    def test_a_non_positive_advance_refuses_without_a_pulse_or_a_pause(self):
+        with self.assertRaisesRegex(combat.ArgumentRefusal, "must be positive"):
+            combat.advance(0, snap(), self.ident, self.path,
+                           waiter=lambda _: self.fail("ran a zero pulse"))
+        self.assertTrue(issubclass(combat.ArgumentRefusal, combat.CombatRefusal))
+
+    def test_the_cli_never_pauses_over_a_number_it_did_not_like(self):
+        with mock.patch.object(combat.rim, "init"), \
+             mock.patch.object(combat, "_live_snapshot", return_value=snap()), \
+             mock.patch.object(combat, "_identity", return_value=self.ident), \
+             mock.patch.object(combat, "_pause_now") as pause, \
+             mock.patch.object(combat, "LEDGER", self.path), \
+             mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            rc = combat.main(["advance", "0"])
+        self.assertEqual(1, rc)
+        pause.assert_not_called()
+        self.assertIn("must be positive", out.getvalue())
+        self.assertNotIn("CLOCK LEFT PAUSED", out.getvalue())
 
     def test_interrupted_flee_latches_a_decision_instead_of_clearing_it(self):
         ledger = combat.load_ledger(self.path)
@@ -876,7 +916,10 @@ class CombatLedgerTests(unittest.TestCase):
             if tool == "rimworld/get_game_info":
                 return {"ticksGame": 100}
             return {}
-        with mock.patch.object(run.rim, "game", side_effect=game):
+        # _ticks mocked as in test_run.py: the real one hands the tick to the
+        # overlay on a fire-and-forget POST.
+        with mock.patch.object(run.rim, "game", side_effect=game), \
+             mock.patch.object(run, "_ticks", return_value=100):
             run._companion(None, .02, "Normal", .01, False)
         self.assertTrue(payloads)
         for key in ("watchedPawnIds", "watchMeleeThreats", "watchPawnOrders",
@@ -941,6 +984,357 @@ class CombatLedgerTests(unittest.TestCase):
         ledger = combat.load_ledger(self.path)
         self.assertEqual("Equip", ledger["orders"]["p1"]["job"])
         self.assertEqual({}, ledger.get("pendingDecisions", {}))
+
+
+def pawn_row(name="Ben Cooper", thing_id="Human618", **kw):
+    """One `home/list_pawns` row, the shape ListPawnsTool actually emits."""
+    row = {"name": name, "defName": "Human", "kindDef": "Ghoul",
+           "position": {"x": 120, "z": 118}, "faction": "Threadneedle",
+           "hostile": False, "hostileReason": "none",
+           "isColonist": False, "isFreeColonist": False, "isPrisoner": False,
+           "animal": False, "humanlike": True, "predator": False,
+           "tame": False, "wild": False, "mechanoid": False,
+           "downed": False, "drafted": False, "dead": False,
+           "job": "Wait_Wander", "mentalState": None,
+           "nearestColonist": "Lucas", "nearestColonistDistance": 4,
+           "settings": {"thingId": thing_id, "applies": True}}
+    row.update(kw)
+    return row
+
+
+def colonist_row(name="Lucas", thing_id="Human1", **kw):
+    return pawn_row(name, thing_id, kindDef="Colonist", isColonist=True,
+                    isFreeColonist=True, **kw)
+
+
+class FakeListPawns(object):
+    """A scripted `home/list_pawns`. Answers each category query in turn."""
+
+    def __init__(self, humanlikes=(), mechs=()):
+        self.humanlikes = list(humanlikes)
+        self.mechs = list(mechs)
+        self.calls = []
+
+    def __call__(self, params):
+        self.calls.append(params)
+        rows = self.mechs if params.get("mechanoidsOnly") else self.humanlikes
+        return {"pawns": list(rows), "pawnsListed": len(rows)}
+
+
+def asleep_snap(tick=100, drafted=True, count=5, distance=62, job="LayDown"):
+    """A map with hostiles on it that are not a threat to anybody."""
+    result = snap(tick, drafted, hostiles=count)
+    result["threats"]["hostiles"] = [
+        {"thingId": "bug%d" % i, "name": "Megascarab", "defName": "Megascarab",
+         "hostile": True, "downed": False, "dead": False, "job": job,
+         "distanceToNearestColonist": distance + i}
+        for i in range(count)]
+    return result
+
+
+class CombatRosterTests(unittest.TestCase):
+    """Threadneedle, 2026-09-08: `draft Ben` refused with 0 matches while the
+    same read said canBeDrafted=True. Ben Cooper is a ghoul -- a colony pawn
+    that is structurally not a colonist, so home/status cannot list him."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, "combat.json")
+        self.ident = {"save": "fixture", "loadedAt": 1, "loadedAtTick": 50,
+                      "pid": 9}
+        # Nothing in this module may reach the bridge, and a live reader left
+        # armed by an earlier CLI test would do exactly that -- silently, and
+        # only when the game happens to be running. Asserted, not just reset:
+        # `main` is supposed to disarm it itself.
+        self.assertEqual([], combat._ROSTER_READER)
+
+    def tearDown(self):
+        combat._ROSTER_READER[:] = []
+        self.tmp.cleanup()
+
+    def test_begin_enumerates_a_ghoul_the_colonist_read_cannot_see(self):
+        reader = FakeListPawns([colonist_row(), pawn_row()])
+        ledger, made = combat.begin(snap(), self.ident, self.path,
+                                    roster_reader=reader)
+        self.assertTrue(made)
+        self.assertIn("Thing_Human618", ledger["pawns"])
+        row = ledger["pawns"]["Thing_Human618"]
+        self.assertEqual("Ben Cooper", row["name"])
+        self.assertEqual("ghoul", row["kind"])
+        self.assertFalse(row["originalDrafted"])
+        # Two queries, humanlikes and mechanoids, and both ask for settings{}
+        # because that is where list_pawns carries a ThingID at all.
+        self.assertEqual(2, len(reader.calls))
+        self.assertTrue(all(c["settings"] for c in reader.calls))
+
+    def test_begin_never_adopts_a_prisoner_an_animal_or_a_raider(self):
+        reader = FakeListPawns([
+            colonist_row(),
+            pawn_row("Sarah", "Human700", isPrisoner=True),
+            pawn_row("muffalo", "Muffalo9", animal=True, humanlike=False,
+                     tame=True),
+            pawn_row("raider", "Human900", faction="Pirates", hostile=True)])
+        ledger, _ = combat.begin(snap(), self.ident, self.path,
+                                 roster_reader=reader)
+        self.assertEqual(["Thing_Human1", "p1"], sorted(ledger["pawns"]))
+
+    def test_begin_adopts_a_colony_mech(self):
+        reader = FakeListPawns(
+            [colonist_row()],
+            [pawn_row("Militor", "Mech55", kindDef="Mech_Militor",
+                      humanlike=False, mechanoid=True)])
+        ledger, _ = combat.begin(snap(), self.ident, self.path,
+                                 roster_reader=reader)
+        self.assertEqual("colony mech",
+                         ledger["pawns"]["Thing_Mech55"]["kind"])
+
+    def test_a_verb_adopts_the_pawn_the_roster_missed_and_says_so(self):
+        combat.begin(snap(), self.ident, self.path)
+        reader = FakeListPawns([colonist_row(), pawn_row()])
+        combat._ROSTER_READER[:] = [reader]
+        orders = FakeOrderTool(
+            order_reply(action="resolve",
+                        pawn=order_pawn(thingId="Thing_Human618",
+                                        name="Ben Cooper")),
+            order_reply(action="draft",
+                        pawn=order_pawn(thingId="Thing_Human618",
+                                        name="Ben Cooper", drafted=True)))
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            order = combat.issue_draft("Ben", snap(), self.ident, self.path,
+                                       issuer=orders)
+        self.assertIn("ADOPTED Ben Cooper into the ledger", out.getvalue())
+        self.assertEqual("Thing_Human618", order["pawnId"])
+        ledger = combat.load_ledger(self.path)
+        self.assertTrue(ledger["pawns"]["Thing_Human618"]["adopted"])
+        self.assertIn("Thing_Human618", ledger["draftObligations"])
+
+    def test_a_library_caller_with_no_reader_refuses_without_a_bridge_call(self):
+        combat.begin(snap(), self.ident, self.path)
+        with mock.patch.object(combat.rim, "game",
+                               side_effect=AssertionError("reached the bridge")):
+            with self.assertRaisesRegex(combat.PawnNotInRoster,
+                                        "combat.py adopt"):
+                combat._checked_session("Ben", snap(), self.ident, self.path,
+                                        "draft")
+
+    def test_the_cli_disarms_its_live_reader_on_the_way_out(self):
+        # The leak this catches: `main` armed _ROSTER_READER with the live
+        # home/list_pawns caller and left it armed, so the NEXT caller in the
+        # process reached the bridge through a function it gave no reader to.
+        for argv, patches in (
+                (["advance", "0"], {}),
+                (["status"], {"_identity": lambda: self.ident})):
+            with mock.patch.object(combat.rim, "init"), \
+                 mock.patch.object(combat.rim, "game", return_value={}), \
+                 mock.patch.object(combat, "LEDGER", self.path), \
+                 mock.patch.object(combat, "_identity",
+                                   return_value=self.ident), \
+                 mock.patch.object(combat, "_live_snapshot",
+                                   side_effect=lambda *a, **k: snap()), \
+                 mock.patch("sys.stdout", new_callable=io.StringIO):
+                combat.main(argv)
+            self.assertEqual([], combat._ROSTER_READER, argv)
+            self.assertEqual([], combat._CLOCK_PAUSED_BY, argv)
+
+    def test_adopt_refuses_somebody_the_colony_does_not_control(self):
+        combat.begin(snap(), self.ident, self.path)
+        reader = FakeListPawns([colonist_row(),
+                                pawn_row("Dagon", "Human900",
+                                         faction="Pirates", hostile=True)])
+        with self.assertRaisesRegex(combat.CombatRefusal,
+                                    "not one colony-controlled draftable"):
+            combat.adopt_pawn("Dagon", self.path, reader)
+        self.assertNotIn("Thing_Human900",
+                         combat.load_ledger(self.path)["pawns"])
+
+    def test_adopt_records_the_draft_state_it_found_them_in(self):
+        combat.begin(snap(), self.ident, self.path)
+        reader = FakeListPawns([colonist_row(), pawn_row(drafted=True)])
+        pid, _ = combat.adopt_pawn("Ben Cooper", self.path, reader,
+                                   announce=False)
+        self.assertEqual("Thing_Human618", pid)
+        self.assertTrue(
+            combat.load_ledger(self.path)["pawns"][pid]["originalDrafted"])
+
+    def test_an_adopted_pawn_is_restored_by_end_without_force(self):
+        # home/status cannot list a ghoul, so cleanup asks home/order for that
+        # one pawn instead of calling them dead and demanding --force.
+        combat.begin(snap(), self.ident, self.path)
+        reader = FakeListPawns([colonist_row(), pawn_row()])
+        combat.adopt_pawn("Ben", self.path, reader, announce=False)
+        combat.record_draft_intent("Thing_Human618", "Ben Cooper", self.path)
+        combat.confirm_drafted("Thing_Human618", 101, self.path)
+        calls = []
+        lines = combat.reconcile(
+            snap(102), self.ident, path=self.path,
+            resolver=lambda pid: {"pawn": {"name": "Ben Cooper",
+                                           "spawned": True, "dead": False,
+                                           "drafted": True}},
+            set_draft=lambda pid, val: calls.append((pid, val)) or {"drafted": val})
+        self.assertEqual([("Thing_Human618", False)], calls)
+        self.assertIn("Ben Cooper: drafted -> undrafted", chr(10).join(lines))
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_an_adopted_pawn_is_undrafted_through_home_order(self):
+        orders = FakeOrderTool({"success": True, "action": "undraft",
+                                "after": {"drafted": False}})
+        self.assertEqual({"drafted": False, "error": None},
+                         combat._restore_draft("Thing_Human618", False,
+                                               adopted=True, caller=orders))
+        self.assertEqual({"action": "undraft", "pawn": "Thing_Human618"},
+                         orders.calls[0])
+
+    def test_the_companions_own_ghoul_and_playerFaction_bools_are_honoured(self):
+        # Added to list_pawns rows 2026-09-11, and read through the one shared
+        # predicate `pawns.is_colony_member`. When the bools are there they
+        # decide it; when they are not, the faction NAME still has to.
+        row = pawn_row(ghoul=True, playerFaction=True, faction="Threadneedle")
+        self.assertTrue(pawns.is_colony_member(row))
+        self.assertTrue(combat.is_colony_draftable(row))
+        self.assertEqual("ghoul", combat._roster_kind(row))
+        old = pawn_row(faction="Threadneedle")          # a pre-2026-09-11 DLL
+        self.assertFalse(pawns.is_colony_member(old))
+        self.assertTrue(combat.is_colony_draftable(old, "Threadneedle"))
+        theirs = pawn_row("Zed", "Human900", ghoul=True, playerFaction=False,
+                          faction="Threadneedle")
+        self.assertFalse(combat.is_colony_draftable(theirs, "Threadneedle"))
+
+    def test_the_ledger_id_is_the_status_id_form(self):
+        self.assertEqual("Thing_Human618", combat.roster_id(pawn_row()))
+        self.assertEqual("Thing_Human618",
+                         combat.roster_id({"thingId": "Thing_Human618"}))
+        self.assertIsNone(combat.roster_id({"name": "nobody"}))
+
+
+class CombatEndThreatTests(unittest.TestCase):
+    """Threadneedle, 2026-09-08: `end` paused the clock and THEN refused, over
+    insectoids asleep 60+ cells away; only --force closed it."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, "combat.json")
+        self.ident = {"save": "fixture", "loadedAt": 1, "loadedAtTick": 50,
+                      "pid": 9}
+        combat.begin(snap(), self.ident, self.path)
+        combat.record_draft_intent("p1", "Lucas", self.path)
+        combat.confirm_drafted("p1", 101, self.path)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_sleeping_hostiles_do_not_block_end_and_are_named_once(self):
+        calls = []
+        lines = combat.reconcile(
+            asleep_snap(102), self.ident, path=self.path,
+            set_draft=lambda pid, val: calls.append((pid, val)) or {"drafted": val})
+        self.assertEqual([("p1", False)], calls)
+        text = chr(10).join(lines)
+        self.assertIn("still on the map, not a threat: 5 Megascarab asleep "
+                      "62+ cells away", text)
+        self.assertEqual(1, text.count("still on the map"))
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_a_dormant_hostile_two_cells_away_does_not_block_end(self):
+        lines = combat.reconcile(
+            asleep_snap(102, count=1, distance=2, job="Wait_AsleepDormancy"),
+            self.ident, path=self.path,
+            set_draft=lambda pid, val: {"drafted": val})
+        self.assertIn("1 Megascarab dormant 2+ cells away", chr(10).join(lines))
+
+    def test_a_hostile_beyond_weapon_range_does_not_block_end(self):
+        lines = combat.reconcile(
+            asleep_snap(102, count=1, distance=80, job="Goto"), self.ident,
+            path=self.path, set_draft=lambda pid, val: {"drafted": val})
+        self.assertIn("1 Megascarab far off 80+ cells away",
+                      chr(10).join(lines))
+
+    def test_an_awake_hostile_inside_the_threshold_still_refuses(self):
+        with self.assertRaisesRegex(combat.CombatRefusal, "--force"):
+            combat.reconcile(
+                asleep_snap(102, count=1, distance=9, job="AttackMelee"),
+                self.ident, path=self.path,
+                set_draft=lambda *_: self.fail("mutated"))
+
+    def test_a_refusal_never_touches_the_clock(self):
+        with self.assertRaisesRegex(combat.CombatRefusal, "hostile"):
+            combat.reconcile(
+                hostile_snap(102, drafted=True), self.ident, path=self.path,
+                before_write=lambda: self.fail("paused before refusing"),
+                set_draft=lambda *_: self.fail("mutated"))
+
+    def test_the_pause_happens_once_and_only_before_a_real_write(self):
+        order = []
+        combat.reconcile(
+            asleep_snap(102), self.ident, path=self.path,
+            before_write=lambda: order.append("pause"),
+            set_draft=lambda pid, val: order.append("write") or {"drafted": val})
+        self.assertEqual(["pause", "write"], order)
+
+    def test_a_dry_run_pauses_nothing_at_all(self):
+        lines = combat.reconcile(
+            asleep_snap(102), self.ident, dry_run=True, path=self.path,
+            before_write=lambda: self.fail("a dry run paused the game"),
+            set_draft=lambda *_: self.fail("mutated"))
+        self.assertEqual("DRY RUN", lines[0])
+        self.assertIn("still on the map", chr(10).join(lines))
+
+    def test_a_downed_raider_still_gets_its_own_reminder(self):
+        lines = combat.reconcile(
+            hostile_snap(102, drafted=True, downed=True), self.ident,
+            path=self.path, set_draft=lambda pid, val: {"drafted": val})
+        self.assertIn("every remaining hostile is DOWNED", chr(10).join(lines))
+
+    def test_the_downed_reminder_does_not_depend_on_undrafting_anybody(self):
+        """PLAYBOOK: "a downed one proceeds with the finish-off/capture
+        reminder" -- unconditionally. It was gated on there being a pawn this
+        session had to put BACK to undrafted, so a session whose fighters were
+        already drafted at `begin` closed the ledger over a downed raider and
+        said nothing at all about it."""
+        # Lucas was drafted before `begin`, so cleanup leaves him drafted and
+        # there is nothing being undrafted into the danger.
+        path = os.path.join(self.tmp.name, "already-drafted.json")
+        combat.begin(snap(100, drafted=True), self.ident, path)
+        combat.record_draft_intent("p1", "Lucas", path)
+        combat.confirm_drafted("p1", 101, path)
+        lines = combat.reconcile(
+            hostile_snap(102, drafted=True, downed=True), self.ident,
+            path=path, set_draft=lambda pid, val: {"drafted": val})
+        text = chr(10).join(lines)
+        self.assertIn("every remaining hostile is DOWNED", text)
+        self.assertIn("raccoon", text)
+        self.assertIn("Still drafted after this cleanup: Lucas", text)
+
+    def test_the_dry_run_carries_the_downed_reminder_too(self):
+        lines = combat.reconcile(
+            hostile_snap(102, drafted=True, downed=True), self.ident,
+            dry_run=True, path=self.path, set_draft=lambda *_: self.fail("mutated"))
+        self.assertIn("every remaining hostile is DOWNED", chr(10).join(lines))
+
+    def test_the_last_line_always_says_whether_the_ledger_closed(self):
+        self.assertIn("STILL OPEN", combat.end_closure_line(True, self.path))
+        self.assertIn("DRY RUN", combat.end_closure_line(True, self.path))
+        self.assertIn("STILL OPEN", combat.end_closure_line(False, self.path))
+        os.unlink(self.path)
+        self.assertIn("CLOSED", combat.end_closure_line(False, self.path))
+
+    def test_the_cli_refusal_says_still_open_and_leaves_the_clock_alone(self):
+        with mock.patch.object(combat.rim, "init"), \
+             mock.patch.object(combat, "LEDGER", self.path), \
+             mock.patch.object(combat, "_identity", return_value=self.ident), \
+             mock.patch.object(combat, "_live_snapshot",
+                               side_effect=lambda *a, **k: hostile_snap(102, True)), \
+             mock.patch.object(combat, "reconcile",
+                               side_effect=combat.CombatRefusal("1 hostile(s) remain")), \
+             mock.patch.object(combat, "pause_supervised_for_cleanup") as sup, \
+             mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            rc = combat.main(["end"])
+        text = out.getvalue()
+        self.assertEqual(1, rc)
+        self.assertIn("COMBAT REFUSED", text)
+        self.assertIn("COMBAT SESSION STILL OPEN", text)
+        self.assertNotIn("CLOCK LEFT PAUSED", text)
+        sup.assert_not_called()
+        self.assertEqual(1, text.count("COMBAT SESSION"))
 
 
 if __name__ == "__main__":

@@ -27,14 +27,24 @@ namespace HomeBridge.BridgeTools
     ///   * a plain `string` instance field declared on the window's own class or
     ///     any base up to but EXCLUDING `Verse.Window` - `Dialog_Rename.curName`,
     ///     `Dialog_GiveName.curName` / `.curSecondName`;
-    ///   * `Verse.Dialog_NamePawn`, whose boxes live in a `List&lt;NameContext&gt;`
-    ///     of a private nested class, one entry per name part; each holds the
-    ///     text in `current` and the untranslated box label in `textboxName`
-    ///     ("FirstName", "NickName", "LastName", "BackstoryTitle"). Those rows
-    ///     are named `&lt;listField&gt;[&lt;index&gt;].&lt;sub&gt;` so `field` can address one.
+    ///   * `Verse.Dialog_NamePawn`, whose boxes live in `names`, a
+    ///     `List&lt;NameContext&gt;` of a private nested class, one entry per name
+    ///     part; each holds the text in `current`, the untranslated box label in
+    ///     `textboxName` ("FirstName", "NickName", "LastName", "BackstoryTitle")
+    ///     and its own cap in `maximumNameLength`. Those rows are named
+    ///     `&lt;listField&gt;[&lt;index&gt;].&lt;sub&gt;` so `field` can address one.
     ///
     /// `Window`'s own strings (`optionalTitle`, the layer bookkeeping) are never
-    /// offered: they are chrome, not input.
+    /// offered: they are chrome, not input. Neither are the plain strings on a
+    /// window that HAS name-context rows - `Dialog_NamePawn.currentControl` and
+    /// friends are focus bookkeeping, and offering them made the one-box case
+    /// ambiguous. A `Dialog_GiveName` (the colony and settlement names, via
+    /// `Dialog_NamePlayerSettlement`) has no such list, so its `curName` and
+    /// `curSecondName` are reached the plain way.
+    ///
+    /// A write longer than the box's own `maximumNameLength` is refused: the box
+    /// redraws through `Widgets.TextField`, which cuts it back on the next
+    /// frame, so the read-back would report text the screen never shows.
     ///
     /// `accept` presses the dialog's accept the way the Return key does -
     /// `WindowStack.Notify_PressedAccept()`, which walks the stack from the top
@@ -62,6 +72,10 @@ namespace HomeBridge.BridgeTools
         /// labels which box it is.</summary>
         private static readonly string[] ContextLabelFieldNames = { "textboxName", "label", "name" };
 
+        /// <summary>The int field inside a name-context list element that caps
+        /// how many characters the box will hold.</summary>
+        private static readonly string[] ContextLimitFieldNames = { "maximumNameLength", "maxLength" };
+
         [Tool(
             ToolName,
             Title = "Type into the dialog that is on screen",
@@ -79,7 +93,7 @@ namespace HomeBridge.BridgeTools
         [ToolResponse("dryRun", "boolean", "True = nothing was written. Defaults to TRUE; a caller must pass dryRun:false deliberately.", Always = true)]
         [ToolResponse("applied", "boolean", "True only when a field was actually written. False on every dry run and every refusal.", Always = true)]
         [ToolResponse("window", "string", "The full type name of the top-most window on the stack, or null when there was none.", Always = true)]
-        [ToolResponse("fields", "array", "Every string field the dialog offers: name, before. A Dialog_NamePawn's name boxes appear as listField[index].current. Empty means the dialog has no typable string field at all.", Always = true)]
+        [ToolResponse("fields", "array", "Every string field the dialog offers: name, label, maxLength (null when the box declares no cap), before. A Dialog_NamePawn's name boxes appear as names[index].current and are the ONLY rows on such a window. Empty means the dialog has no typable string field at all, and error then names what it does declare.", Always = true)]
         [ToolResponse("set", "object", "The field that was written: field, before, after. Null when nothing was set - a listing call, a dry run's refusal, or a refusal.", Nullable = true)]
         [ToolResponse("accepted", "boolean", "True when WindowStack.Notify_PressedAccept was called. Always false on a dry run, when accept was not asked for, and when the set was refused.", Always = true)]
         [ToolResponse("unknownArguments", "array", "Every argument key the caller sent that this tool does not declare, sorted, case-sensitively. Empty array = every key was recognised. The host's own _rimBridgeTimeoutMs is never listed.", Always = true)]
@@ -167,6 +181,8 @@ namespace HomeBridge.BridgeTools
             var rows = slots.Select(s => (object)new Dictionary<string, object>
             {
                 { "name", s.Name },
+                { "label", s.Label },
+                { "maxLength", s.MaxLength > 0 ? (object)s.MaxLength : null },
                 { "before", s.Read() }
             }).ToList();
 
@@ -175,17 +191,30 @@ namespace HomeBridge.BridgeTools
                 var reason = list
                     ? null
                     : "No text was given, so this is a listing only. Pass text (and field when fields[] has more than one row).";
+                if (slots.Count == 0)
+                    reason = NothingToTypeInto(window, typeName);
                 return Payload(typeName, rows, dryRun, false, null, false, reason);
             }
 
             if (slots.Count == 0)
                 return Payload(typeName, rows, dryRun, false, null, false,
-                    typeName + " declares no string field of its own, so there is nothing to type into.");
+                    NothingToTypeInto(window, typeName));
 
             Slot chosen;
             string why;
             if (!Choose(slots, field, out chosen, out why))
                 return Payload(typeName, rows, dryRun, false, null, false, why);
+
+            // The box redraws itself through Widgets.TextField, which truncates
+            // to its own limit on the next frame. Writing past it and reading
+            // the field straight back would report a value the screen never
+            // shows, so refuse and name the number.
+            if (chosen.MaxLength > 0 && text.Length > chosen.MaxLength)
+                return Payload(typeName, rows, dryRun, false, null, false,
+                    "\"" + chosen.Name + "\" holds at most " + chosen.MaxLength
+                    + " characters and the text given is " + text.Length
+                    + ". The game would cut it back on the next frame. Nothing was written; "
+                    + "pass text of at most " + chosen.MaxLength + " characters.");
 
             var before = chosen.Read();
             object after = text;
@@ -288,11 +317,21 @@ namespace HomeBridge.BridgeTools
         {
             internal string Name;
             internal string Label;
+            internal int MaxLength;
+            internal bool FromList;
             internal Func<string> Read;
             internal Action<string> Write;
         }
 
-        /// <summary>Every box the top window offers, list rows included.</summary>
+        /// <summary>Every box the top window offers, list rows included.
+        ///
+        /// A window that keeps its boxes in a name-context list keeps ALL of
+        /// them there - each row carries its own label, length cap and editable
+        /// flag - so on such a window the plain string fields are chrome, not
+        /// input, and are dropped. `Dialog_NamePawn` declares three of them
+        /// (`focusControlOverride`, `currentControl`, `genderText`) beside its
+        /// `names` list, and offering those made every pawn rename need an
+        /// explicit field.</summary>
         private static List<Slot> Slots(Window window)
         {
             var slots = new List<Slot>();
@@ -311,7 +350,27 @@ namespace HomeBridge.BridgeTools
                     AddListRows(slots, window, info);
                 }
             }
-            return slots;
+            return slots.Any(s => s.FromList) ? slots.Where(s => s.FromList).ToList() : slots;
+        }
+
+        /// <summary>The refusal for a window with no writable string field: it
+        /// names what the window DOES declare, so one call is enough to see
+        /// whether the box lives somewhere this does not look.</summary>
+        private static string NothingToTypeInto(Window window, string typeName)
+        {
+            var declared = BridgeCommon.Try(
+                () => Chain(window.GetType())
+                    .SelectMany(t => t.GetFields(BindingFlags.Public | BindingFlags.NonPublic
+                                                 | BindingFlags.Instance | BindingFlags.DeclaredOnly))
+                    .Where(f => !f.IsLiteral && !f.IsInitOnly)
+                    .Select(f => f.Name + ":" + f.FieldType.Name)
+                    .Take(24)
+                    .ToList(),
+                new List<string>());
+            return typeName + " declares no writable string field and no name-context list, so there is "
+                + "nothing to type into. What it does declare: "
+                + (declared.Count == 0 ? "nothing readable" : string.Join(", ", declared.ToArray()))
+                + ". A box held in a property rather than a field would not be found here.";
         }
 
         /// <summary>The window's own class and every base up to but EXCLUDING
@@ -350,6 +409,7 @@ namespace HomeBridge.BridgeTools
             if (textField == null)
                 return;
             var labelField = Named(element, ContextLabelFieldNames);
+            var limitField = NamedInt(element, ContextLimitFieldNames);
             var editableField = element.GetField("editable",
                 BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
 
@@ -375,6 +435,10 @@ namespace HomeBridge.BridgeTools
                     Label = labelField == null
                         ? null
                         : BridgeCommon.SafeString(() => Text(labelField.GetValue(target))),
+                    MaxLength = limitField == null
+                        ? 0
+                        : BridgeCommon.Try(() => (int)limitField.GetValue(target), 0),
+                    FromList = true,
                     Read = () => BridgeCommon.SafeString(() => (string)textField.GetValue(target)),
                     Write = value => textField.SetValue(target, value)
                 });
@@ -393,8 +457,20 @@ namespace HomeBridge.BridgeTools
             return null;
         }
 
-        /// <summary>A label field is a string on Dialog_NamePawn and a
-        /// TaggedString elsewhere; both answer ToString().</summary>
+        /// <summary>The first int field of `element` with one of these names.</summary>
+        private static FieldInfo NamedInt(Type element, string[] names)
+        {
+            foreach (var name in names)
+            {
+                var info = element.GetField(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                if (info != null && info.FieldType == typeof(int) && !info.IsInitOnly && !info.IsLiteral)
+                    return info;
+            }
+            return null;
+        }
+
+        /// <summary>A label field is a string (`NameContext.textboxName`) or a
+        /// TaggedString; both answer ToString().</summary>
         private static string Text(object value)
         {
             return value == null ? null : value.ToString();

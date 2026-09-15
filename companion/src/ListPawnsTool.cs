@@ -420,15 +420,16 @@ namespace HomeBridge.BridgeTools
                 + "each pawn's hands, plus worn apparel and any weapon stashed in the inventory. All three answer for EVERY "
                 + "pawn in one call, so nothing has to open a Health tab or click a colonist. bio:true adds age, backstory, every trait, every skill with its passion, any title, and -- the field that answers \"why is this colonist idle\" and stops a pawn who CANNOT hold a weapon being reported unarmed forever -- incapableOf[], the work tags the pawn cannot do. thoughts:true adds the Mood tab: every memory and situational thought with the mood it contributes, worst first. work:true adds every work type in the Work tab's own order with its priority (0 = never) and whether it is disabled for this pawn; schedule:true the 24 hour assignments as one letter each plus a key; settings:true medical care, hostility response, self-tend, the follow toggles, the allowed area and the master; relations:true every family relation with the label the game draws, bonded animals, partners, and what this pawn thinks of every other colonist. animals:true adds the Animals tab for every animal on the map in one call -- tame or wild, wildness, trainability, age, gender, body size, the colonists it is bonded to, EVERY trainable with wanted/learned/can-train and its step count, what it is producing, and the slaughter / release-to-wild / tame / hunt designations standing on it, so \"marked for slaughter\" is a read. NARROWING is server-side: wildOnly, tameOnly, animalsOnly, humanlikeOnly, mechanoidsOnly, colonistsOnly, prisonersOnly, downedOnly, draftedOnly and nameFilter (substring on name / defName / kindDef) combine by AND, and a pair that cannot both hold is refused rather than answered with an empty list. The WRITE side of work/schedule/settings/animals is home/pawn_config.",
             ResultDescription =
-                "success, counts, and pawns[]: name, defName, kindDef, position, faction, hostile, hostileReason, animal, "
+                "success, counts, ticksGame -- the tick the whole reply was read at -- and pawns[]: name, defName, kindDef, position, faction, hostile, hostileReason, animal, "
                 + "mechanoid, downed, job, mentalState, distance to the nearest colonist, and -- when asked for -- health{}, "
                 + "needs{} and equipment{}. Every row also carries humanlike, tame, wild, drafted, isFreeColonist and "
                 + "isPrisoner, so a narrowed list can be checked field for field against an unnarrowed one. pawnsListed "
-                + "and pawnsFiltered say how many rows survived the filters; spawnedPawnTotal, colonistCount and "
-                + "hostileCount are NOT narrowed by them. equipment{} is never null: armed is always a bool and primaryLabel says "
+                + "Every row carries thingId (Verse.Thing.ThingID, e.g. \"Ibex404123\") -- the address home/pawn_config, home/order and act.py take -- so finding a pawn and writing to it are one call and not two; it used to live only inside settings{} and animals{}. pawnsListed "
+                + "and pawnsFiltered say how many rows survived the filters; spawnedPawnTotal, colonistCount, ghoulCount and "
+                + "hostileCount are NOT narrowed by them. ghoulCount is live player-faction ghouls and is NOT part of colonistCount: RimWorld does not count a ghoul as a colonist and neither does this, but a colony that has one can now say so. equipment{} is never null: armed is always a bool and primaryLabel says "
                 + "\"unarmed\" in words, so an unarmed colonist can never be mistaken for an unread one. With equipment:true "
                 + "the top level also carries unarmedColonists[]. bio{} and thoughts{} are never null either: an animal gets a bio{} saying hasStory:false and incapableOfRead:false, so an empty incapableOf[] can never be read as \"capable of everything\". incapableOf[] holds the labels the game draws (\"Violent\") and incapableOfTags[] the raw WorkTags names. work{}, schedule{}, settings{}, relations{} and animals{} take the same never-null contract and each carry applies:false rather than being absent -- a humanlike gets an animals{} saying isAnimal:false, so an empty training list is never read as \"untrained\". With settings:true the top level also carries pawnConfigOptions{} -- the areas and enum values home/pawn_config will accept on this map; with animals:true it carries animalCount and tameAnimalCount. animals:true does NOT narrow the list: it adds a block and filters nothing.")]
-        [ToolResponse("pawns", "array", "One entry per spawned pawn that passed the filters. Every row carries predator (Verse.RaceProperties.predator, the GAME'S OWN flag -- no tool in this stack keeps a hardcoded list of predator defNames any more) and manhunterOnDamageChance (Verse.RaceProperties.manhunterOnDamageChance, 0..1, the raw race field), alongside name, defName, kindDef, position, faction, hostile, hostileReason, isColonist, isFreeColonist, isPrisoner, animal, humanlike, tame, wild, mechanoid, downed, drafted, dead, job, mentalState, nearestColonist and nearestColonistDistance.", Always = true)]
+        [ToolResponse("pawns", "array", "One entry per spawned pawn that passed the filters. Every row carries predator (Verse.RaceProperties.predator, the GAME'S OWN flag -- no tool in this stack keeps a hardcoded list of predator defNames any more) and manhunterOnDamageChance (Verse.RaceProperties.manhunterOnDamageChance, 0..1, the raw race field), alongside name, thingId, defName, kindDef, position, faction, hostile, hostileReason, isColonist, ghoul, playerFaction, isFreeColonist, isPrisoner, animal, humanlike, tame, wild, mechanoid, downed, drafted, dead, job, mentalState, nearestColonist and nearestColonistDistance. ghoul is Anomaly's Pawn.IsGhoul and playerFaction is whether the pawn is ours: a colony GHOUL is humanlike, ours, and isColonist:FALSE, because RimWorld's own IsColonist getter ends in !IsSubhuman. Read `isColonist || (ghoul && playerFaction)` for \"one of ours\", or a ghoul is dropped from every roster without a word.", Always = true)]
         [ToolResponse("pawnsListed", "integer", "Rows in pawns[] AFTER every filter -- the same number as pawnCount, under the name that says what it counts. Compare it with spawnedPawnTotal, which is never filtered.", Always = true)]
         [ToolResponse("pawnsFiltered", "integer", "Spawned pawns dropped by the filters: spawnedPawnTotal - pawnsListed. It counts every narrowing together -- includeDead, includeColonists, withinOfColonists, hostileOnly and the category filters -- so it is non-zero on a default call whenever a corpse is lying on the map.", Always = true)]
         [ToolResponse("unknownArguments", "array", "Every argument key the caller sent that this tool does not declare, sorted, case-sensitively. Empty array = every key was recognised. This is the tool where a silently ignored filter cost five sessions of believing a colonist was armed: {skills:true} is NOT a block name and now says so. The host's own _rimBridgeTimeoutMs is never listed.", Always = true)]
@@ -548,9 +549,18 @@ namespace HomeBridge.BridgeTools
             // second traversal of mapPawns, and it is the SAME list, so the two
             // answers cannot be about different sets of people.
             var colonistPawns = new List<Pawn>();
+            // Live ghouls of the player faction. Counted in the SAME sweep and
+            // reported beside colonistCount because `Pawn.IsColonist` is false
+            // for one (see SafeIsGhoul) -- so a colony with a ghoul in it reads
+            // as one pawn short of itself everywhere isColonist is the filter.
+            var ghoulCount = 0;
             foreach (var p in all)
             {
-                if (p == null || !SafeIsColonist(p) || SafeDead(p))
+                if (p == null || SafeDead(p))
+                    continue;
+                if (SafeIsGhoul(p) && SafeIsPlayerFaction(p))
+                    ghoulCount++;
+                if (!SafeIsColonist(p))
                     continue;
                 colonists.Add(new KeyValuePair<string, IntVec3>(SafeName(p), p.Position));
                 colonistPawns.Add(p);
@@ -598,6 +608,11 @@ namespace HomeBridge.BridgeTools
                 var isDowned = SafeDowned(pawn);
                 var isDrafted = SafeDrafted(pawn);
                 var isFreeColonist = SafeIsFreeColonist(pawn);
+                // Read once and used three times below (tame, ghoul, the row's
+                // own playerFaction), so the three can never disagree about who
+                // this pawn belongs to.
+                var isPlayerFaction = SafeIsPlayerFaction(pawn);
+                var isGhoul = SafeIsGhoul(pawn);
                 if (!narrow.Accepts(pawn, isAnimal, isHumanlike, isMechanoid, isPrisoner,
                                     isDowned, isDrafted, isFreeColonist, SafeName(pawn)))
                     continue;
@@ -626,6 +641,17 @@ namespace HomeBridge.BridgeTools
                 var row = new Dictionary<string, object>
                 {
                     { "name", SafeName(pawn) },
+                    // The ADDRESS. `Verse.Thing.ThingID` -- defName + the id
+                    // number, `Ibex404123` -- which is the exact spelling
+                    // act.py, order.py, pick.py and home/pawn_config take. It
+                    // lived only inside settings{} and animals{} until
+                    // 2026-09-11, so `list_pawns --wild` answered "which ibex"
+                    // with a NAME five of them share and no way to write to any
+                    // of them. It is one short string per row and it rides on
+                    // every row unasked, for the same reason `hostile` does:
+                    // the read that finds a thing and the write that acts on it
+                    // must not be two calls.
+                    { "thingId", BridgeCommon.SafeString(() => pawn.ThingID) },
                     { "defName", pawn.def != null ? pawn.def.defName : null },
                     { "kindDef", pawn.kindDef != null ? pawn.kindDef.defName : null },
                     { "position", BridgeCommon.Pos(pawn.Position) },
@@ -635,6 +661,15 @@ namespace HomeBridge.BridgeTools
                     { "hostile", hostile },
                     { "hostileReason", hostileReason },
                     { "isColonist", isColonist },
+                    // Anomaly's colony ghoul, and whether this pawn belongs to
+                    // the player at all. A ghoul is humanlike, ours, and
+                    // isColonist:FALSE -- see SafeIsGhoul -- so without these
+                    // two bools there is nothing on the row that tells a colony
+                    // ghoul apart from a raider's one, and every caller that
+                    // filters on isColonist drops it silently. The colony's
+                    // ghoul Ben Cooper never once appeared in a roster.
+                    { "ghoul", isGhoul },
+                    { "playerFaction", isPlayerFaction },
                     // The free-colonist test the colonistsOnly filter uses.
                     // isColonist is true for a colonist held by another faction;
                     // this one is not, and the two are different questions.
@@ -661,7 +696,7 @@ namespace HomeBridge.BridgeTools
                     // A tame animal is one of ours; a wild one has no faction at
                     // all. They are NOT complements -- a trader's pack muffalo is
                     // neither -- so both are emitted rather than one and a negation.
-                    { "tame", isAnimal && SafeIsPlayerFaction(pawn) },
+                    { "tame", isAnimal && isPlayerFaction },
                     { "wild", isAnimal && SafeFactionless(pawn) },
                     { "mechanoid", isMechanoid },
                     { "downed", isDowned },
@@ -741,7 +776,16 @@ namespace HomeBridge.BridgeTools
                 { "pawnsFiltered", Math.Max(0, all.Count - pawns.Count) },
                 { "spawnedPawnTotal", all.Count },
                 { "colonistCount", colonists.Count },
+                // Live player-faction ghouls, NOT included in colonistCount --
+                // RimWorld does not count them as colonists and neither does
+                // this number, but a colony that has one can now say so instead
+                // of leaving the pawn out of every total it prints.
+                { "ghoulCount", ghoulCount },
                 { "hostileCount", hostileCount },
+                // The tick this whole reply was read at, so a caller printing
+                // "as of" prints the snapshot's own moment rather than a second
+                // bridge call's. Null on a build with no game loaded.
+                { "ticksGame", BridgeCommon.TryN(() => Find.TickManager.TicksGame) },
                 // A filter that hides things states what it hid; the caller must
                 // never have to guess whether an empty list means "nothing there"
                 // or "nothing survived the filter".
@@ -800,6 +844,9 @@ namespace HomeBridge.BridgeTools
                         { "filtersCombineByAnd", narrow.Any
                             ? "Every filter that is on must be satisfied. Contradictory pairs (wildOnly with tameOnly, animalsOnly with colonistsOnly) are REFUSED rather than answered with an empty list; a filter that is merely rare comes back empty and says so through pawnsFiltered."
                             : "no category filter was set; pawns[] is narrowed only by hostileOnly / includeColonists / includeDead / withinOfColonists" },
+                        { "ghoulIsNotAColonist", ghoulCount > 0
+                            ? "This map has " + ghoulCount + " live player-faction ghoul(s). Verse.Pawn.IsColonist ends in !IsSubhuman and a ghoul's MutantDef is consideredSubhuman, so isColonist is FALSE on every one of them and colonistCount does not count them. \"One of ours\" is isColonist || (ghoul && playerFaction); anything filtering on isColonist alone is leaving a colony pawn out in silence."
+                            : "No live player-faction ghoul on this map. If one appears, isColonist will be FALSE on it (Verse.Pawn.IsColonist ends in !IsSubhuman): read isColonist || (ghoul && playerFaction) for \"one of ours\"." },
                         { "everyFilterIsReadableOnTheRow", "wildOnly, tameOnly, animalsOnly, humanlikeOnly, mechanoidsOnly, colonistsOnly, prisonersOnly, downedOnly and draftedOnly each have a matching bool on every row (wild, tame, animal, humanlike, mechanoid, isFreeColonist, isPrisoner, downed, drafted), so a narrowed list can be checked against an unnarrowed one field for field." },
                         { "hediffFilter", wantHealth
                             ? (visibleHediffsOnly
@@ -1163,6 +1210,35 @@ namespace HomeBridge.BridgeTools
         private static bool SafeIsPrisoner(Pawn pawn)
         {
             try { return pawn.IsPrisoner; }
+            catch { return false; }
+        }
+
+        /// <summary>
+        /// Anomaly's ghoul -- and the reason one is invisible to every
+        /// isColonist filter in this stack.
+        ///
+        /// `Verse.Pawn.IsColonist` (decompiled from the 1.6 Assembly-CSharp
+        /// this project references) is:
+        ///
+        ///     Faction != null &amp;&amp; Faction.IsPlayer &amp;&amp; RaceProps.Humanlike
+        ///     &amp;&amp; (!IsSlave || guest.SlaveIsSecure) &amp;&amp; !IsSubhuman
+        ///
+        /// and `IsSubhuman` is `IsMutant &amp;&amp; mutant.Def.consideredSubhuman`,
+        /// which a ghoul's MutantDef sets. So a colony ghoul is humanlike, of
+        /// the player faction, not an animal -- and isColonist:false. It is not
+        /// dropped by this tool at all; it is dropped by every CALLER that reads
+        /// isColonist as "is this one of ours", which was all of them. The
+        /// colony's ghoul Ben Cooper was never once in `pawns.py --roster`.
+        ///
+        /// `Pawn.IsGhoul` tests `ModsConfig.AnomalyActive` before it touches
+        /// `mutant.Def`, so it is false rather than throwing without Anomaly,
+        /// and it reaches neither `Faction.OfPlayer` nor any `Log.Error` path.
+        /// Pair it with <see cref="SafeIsPlayerFaction"/>: a hostile ghoul from
+        /// a ritual is the same bool and is nobody's colonist.
+        /// </summary>
+        private static bool SafeIsGhoul(Pawn pawn)
+        {
+            try { return pawn.IsGhoul; }
             catch { return false; }
         }
 

@@ -113,7 +113,8 @@ class InventoryCliTests(unittest.TestCase):
         pool.update(defCount=2,
                     things=[{"label": "component", "defName": "ComponentIndustrial"},
                             {"label": "steel", "defName": "Steel"}])
-        replies = [answer(), answer(), pool]
+        # miss, singular retry, the whole-map probe (empty), then the label pool.
+        replies = [answer(), answer(), answer(), pool]
         with mock.patch.object(inv.rim, "init"), \
              mock.patch.object(inv, "census",
                                side_effect=lambda **kw: replies.pop(0)), \
@@ -409,6 +410,154 @@ class HolderTests(unittest.TestCase):
         for who in ("trader Ama", "muffalo", "casket", "crate"):
             self.assertIn(who, text)
         self.assertIn("3 further holder(s)", text)
+
+
+class FilterFlagTests(unittest.TestCase):
+    """Every documented filter has to reach the bridge. `--food` was parsed by
+    nobody and the census answered the whole inventory in a filtered answer's
+    shape; the table below is what stops a second one hiding."""
+
+    FILTERS = (
+        ("--all", {"category": "all", "ownership": "all"}),
+        ("--all-owners", {"ownership": "all"}),
+        ("--everyone", {"ownership": "all"}),
+        ("--ours", {"ownership": "ours"}),
+        ("--buildings", {"category": "buildings"}),
+        ("--spawned-only", {"includeHeld": False}),
+        ("--forbidden", {"forbiddenOnly": True}),
+        ("--corpses", {"corpses": True, "ownership": "all"}),
+        ("--chunks-out", {"excludeChunks": True}),
+        ("--food", {"category": "food"}),
+    )
+
+    def _run(self, argv, reply=None):
+        reply = reply if reply is not None else answer()
+        with mock.patch.object(inv.rim, "init"),              mock.patch.object(inv, "census", return_value=reply) as census,              mock.patch.object(inv, "show"),              mock.patch.object(inv, "colony_size", return_value=5),              mock.patch.object(sys, "argv", ["inv.py"] + argv),              mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            rc = inv.main()
+        return rc, out.getvalue(), census
+
+    def test_every_documented_filter_reaches_the_bridge(self):
+        for flag, expected in self.FILTERS:
+            reply = answer()
+            reply["filters"] = dict(expected)
+            rc, text, census = self._run([flag], reply)
+            self.assertEqual(0, rc, "%s: %s" % (flag, text))
+            sent = census.call_args.kwargs
+            for key, value in expected.items():
+                self.assertEqual(value, sent.get(key),
+                                 "%s did not send %s" % (flag, key))
+
+    def test_food_flag_is_the_food_word(self):
+        reply = answer()
+        reply["filters"] = {"category": "food"}
+        for argv in (["--food"], ["food"]):
+            _, _, census = self._run(argv, reply)
+            self.assertEqual("food", census.call_args.kwargs.get("category"), argv)
+            self.assertNotIn("match", census.call_args.kwargs)
+
+    def test_a_dll_that_ignores_the_food_flag_is_refused_not_printed(self):
+        # The failure this whole item is about: a filter nobody applied, and a
+        # whole-inventory answer in a filtered one's shape.
+        reply = answer()
+        reply["filters"] = {"category": "haulable"}
+        rc, text, _ = self._run(["--food"], reply)
+        self.assertEqual(1, rc)
+        self.assertIn("does not support category='food'", text)
+
+    def test_food_still_takes_a_word_to_narrow_by(self):
+        # A zero-kind reply probes for near labels afterwards, so the asked-for
+        # call is the FIRST one, not the last.
+        reply = answer()
+        reply["filters"] = {"category": "food"}
+        for argv in (["food", "meat"], ["--food", "meat"]):
+            _, _, census = self._run(argv, reply)
+            first = census.call_args_list[0].kwargs
+            self.assertEqual("food", first.get("category"), argv)
+            self.assertEqual("meat", first.get("match"), argv)
+
+    def test_match_flag_is_the_bare_word(self):
+        _, _, census = self._run(["--match", "fire"])
+        self.assertEqual("fire", census.call_args_list[0].kwargs.get("match"))
+
+
+class UnknownFlagTests(unittest.TestCase):
+    def _run(self, argv):
+        with mock.patch.object(inv.rim, "init") as init,              mock.patch.object(inv, "census", return_value=answer()) as census,              mock.patch.object(sys, "argv", ["inv.py"] + argv),              mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            rc = inv.main()
+        return rc, out.getvalue(), init, census
+
+    def test_a_flag_this_tool_has_not_got_stops_the_call(self):
+        rc, text, init, census = self._run(["berry", "--radius", "40"])
+        self.assertEqual(1, rc)
+        self.assertIn("no such flag --radius", text)
+        self.assertIn("--near", text)
+        init.assert_not_called()
+        census.assert_not_called()
+
+    def test_a_typo_names_the_nearest_real_flag(self):
+        rc, text, _, _ = self._run(["--corpse"])
+        self.assertEqual(1, rc)
+        self.assertIn("--corpses", text)
+
+    def test_every_documented_flag_is_accepted(self):
+        for flag in inv.FLAGS:
+            self.assertEqual([], inv.unknown_flags([flag]), flag)
+
+    def test_numbers_are_values_not_flags(self):
+        self.assertEqual([], inv.unknown_flags(["--cells", "100", "120", "-4"]))
+
+
+class WiderScopeTests(unittest.TestCase):
+    """A zero in the HAULABLE census is usually the category, not the map: a
+    built sculpture is a building and a berry bush is a plant."""
+
+    def _miss(self, wide_rows, building_defs=()):
+        wide = answer()
+        wide.update(defCount=len(wide_rows), things=wide_rows)
+        builds = answer()
+        builds.update(defCount=len(building_defs),
+                      things=[{"defName": d, "label": d} for d in building_defs])
+        replies = [answer(), answer(), wide, builds]
+        with mock.patch.object(inv.rim, "init"),              mock.patch.object(inv, "census",
+                               side_effect=lambda **kw: replies.pop(0)),              mock.patch.object(inv, "show"),              mock.patch.object(sys, "argv", ["inv.py", self.word]),              mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            self.assertEqual(0, inv.main())
+        return out.getvalue()
+
+    word = "berry"
+
+    def test_plants_that_match_are_counted_and_named(self):
+        text = self._miss([{"defName": "Plant_Berry", "label": "berry bush",
+                            "total": 98, "ours": 0}])
+        self.assertIn("0 HAULABLE ITEMS matches", text)
+        self.assertIn("98 plants", text)
+        self.assertIn("berry bush", text)
+        self.assertIn("add --all", text)
+
+    def test_nothing_close_is_not_printed_when_the_thing_is_right_there(self):
+        text = self._miss([{"defName": "Plant_Berry", "label": "berry bush",
+                            "total": 98, "ours": 0}])
+        self.assertNotIn("nothing close", text)
+        self.assertNotIn("nearest:", text)
+
+    def test_a_built_sculpture_is_named_as_a_building(self):
+        self.word = "sculpture"
+        text = self._miss([{"defName": "SculptureSmall",
+                            "label": "Sandstone small sculpture",
+                            "total": 8, "ours": 8}],
+                          building_defs=("SculptureSmall",))
+        self.assertIn("8 buildings", text)
+        self.assertIn("Sandstone small sculpture", text)
+        self.assertIn("add --all", text)
+
+    def test_a_word_nothing_on_the_map_has_still_gets_the_nearest_labels(self):
+        text = self._miss([])
+        self.assertIn("no kind matched", text)
+        self.assertIn("nearest:", text)
+
+    def test_a_plural_of_a_y_word_is_retried_as_its_singular(self):
+        self.assertIn("berry", inv._variants("berries"))
+        self.assertIn("bush", inv._variants("bushes"))
+        self.assertIn("berries", inv._variants("berry"))
 
 
 if __name__ == "__main__":

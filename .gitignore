@@ -6,6 +6,10 @@ instruments/__pycache__/
 companion/artifacts/
 companion/src/bin/
 companion/src/obj/
+patches/**/src/bin/
+patches/**/src/obj/
+instruments/scratchpad/
+instruments/timing/
 profile/Screenshots/
 profile/Saves/Autosave-*.rws
 overlay/events.jsonl

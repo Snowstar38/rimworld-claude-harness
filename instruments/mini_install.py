@@ -14,11 +14,20 @@ destination, because the placement click is a click too. Both go through
 trusting `click_cell`'s `success: true`. Without `--to`, Install is armed and
 the destination click is left to you -- the camera is on the ITEM at that
 point, so move it before clicking.
+
+**The placing click is confirmed by polling, not by one read.** `click_cell`
+returns before RimWorld has spawned the blueprint, so a single read straight
+after it printed *"the placing click left NO blueprint there (the cell reads
+empty)"* for five statues that were in fact placed. The destination is now read
+up to four times over ~2 s and the outcome is one of three different sentences:
+confirmed (with the id and the work left), something else is standing there, or
+not visible yet with the command to check again.
 """
 import argparse
 import sys
 import time
 
+import buildings
 import pick
 import rim
 
@@ -37,23 +46,44 @@ def selected(thing_id):
             rows[0].get("id") == thing_id)
 
 
-def placed_at(x, z):
-    """A blueprint or frame standing on the destination cell, or None.
+class NotConfirmed(RuntimeError):
+    """The placing click was sent and no new blueprint was seen. Its own type
+    so the caller can say which of the two failures this is."""
 
-    Read off the map, never inferred from the click reply: a placement click
-    that missed reports success exactly like one that landed.
+
+def still_armed():
+    """True when RimWorld is STILL holding the placement designator.
+
+    The game drops a designator the moment a cell is accepted, so a designator
+    that survives the placing click is the game saying no. That is a different
+    fact from "the blueprint is not drawn yet", and until 2026-09-12 both
+    printed the same NOT VISIBLE YET sentence: a 3x3 holding platform whose
+    footprint overlapped a blueprint two cells away read as a slow draw. Never
+    raises -- an unreadable state is not evidence of a refusal.
     """
-    r = rim.game("home/get_cells_plus",
-                 {"x": int(x), "z": int(z), "width": 1, "height": 1,
-                  "fields": "things", "thingFields": "defName,label,isBlueprint,isFrame",
-                  "sparse": True}, strict=False)
-    if not isinstance(r, dict) or not r.get("success"):
-        return None
-    for c in r.get("cells") or []:
-        for t in c.get("things") or []:
-            if t.get("isBlueprint") or t.get("isFrame"):
-                return t.get("label") or t.get("defName") or "a blueprint"
-    return None
+    try:
+        state = call("get_designator_state").get("designatorState") or {}
+    except Exception:
+        return False
+    return state.get("hasSelection") is True
+
+
+def drop_designator():
+    """Clear an Install designator the game refused, and say which happened.
+
+    An armed designator swallows or misdirects the next click, so leaving one
+    behind turns one refused install into a surprise placement later.
+    """
+    try:
+        import act
+        act.clear()
+    except Exception as exc:
+        print("   the designator could NOT be cleared (%s) -- run "
+              "`python act.py clear` before the next click." % exc)
+        return False
+    print("   the armed designator was CLEARED, so the next click cannot drop "
+          "the item somewhere unintended.")
+    return True
 
 
 def install(thing_id, do=False, to=None):
@@ -109,20 +139,25 @@ def install(thing_id, do=False, to=None):
         return
     # The second camera position of the operation.
     dx, dz = int(to[0]), int(to[1])
-    before = placed_at(dx, dz)
+    before = buildings.occupant_ids(dx, dz)
     pick.ensure_camera(dx, dz, reason="mini_install: place at %d,%d" % (dx, dz))
     rim.game("rimworld/click_cell", {"x": dx, "z": dz}, strict=False)
-    time.sleep(0.4)
-    after = placed_at(dx, dz)
-    if after and after != before:
-        print("INSTALL PLACED: %s now stands at %d,%d as %s. Check "
-              "`buildings.py --pending`." % (t.get("label"), dx, dz, after))
+    # The click returns before the game has spawned the blueprint, so this
+    # polls the cell instead of reading it once. Three outcomes, three
+    # sentences: confirmed, something else is there, not visible yet.
+    if buildings.report_placement(dx, dz, t.get("label"), before, pad="") == 0:
         return
-    raise RuntimeError(
-        "Install was fired and the placing click at %d,%d left NO blueprint "
-        "there (the cell reads %s). The targeter may still be armed -- `python "
-        "act.py clear` drops it. Nothing else was changed."
-        % (dx, dz, after or "empty"))
+    if still_armed():
+        print("REFUSED BY THE GAME: the Install designator is STILL ARMED, and "
+              "the game drops it as soon as a cell is accepted -- so %d,%d was "
+              "REJECTED, not slow to draw. The footprint is usually bigger than "
+              "the one cell asked for: `python build.py <def> %d %d` previews "
+              "every cell it would take and names what is in the way."
+              % (dx, dz, dx, dz))
+        drop_designator()
+    raise NotConfirmed("the Install was fired and the placing click at %d,%d is "
+                       "not confirmed -- see the lines above for which case it "
+                       "is. Nothing else was changed." % (dx, dz))
 
 
 def main():

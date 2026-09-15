@@ -7,19 +7,29 @@
   python buildings.py --built            # only finished buildings
   python buildings.py bench              # only things matching "bench"
   python buildings.py --near 120 140 30  # only within 30 cells of 120,140
+  python buildings.py --near 120 140 --radius 30        # the same scope
+  python buildings.py --center 120,140 --radius 30      # the same scope
+  python buildings.py --match door --center 120,140 --radius 12
   python buildings.py --all              # every faction: ruins, tribes, unclaimed
-  python buildings.py --rock             # include natural rock as buildings
+  python buildings.py --rock             # ONLY natural rock, smoothed rock, ore
   python buildings.py --every            # no aggregation: every wall, one row
   python buildings.py --damaged-below 50 # give damaged buildings their own rows
   python buildings.py --inspect          # + the inspect-pane text on every row
   python buildings.py --power            # every power NET, and what is flagged
   python buildings.py 115,154            # what is AT that cell (any occupied cell)
+  python buildings.py at 115,154         # the same question, spelled out
+  python buildings.py at 115 154         # ... two words is the same cell
+  python buildings.py 115,154 --radius 9 # ... a SCAN of 9 cells around it instead
   python buildings.py "Shelf@115,154"    # that def at that cell
   python buildings.py 1234               # one thing by id (build.py's number too)
   python buildings.py --json             # the raw reply, unformatted
   python buildings.py --help             # this text
 
   python buildings.py gizmos <thing>     # what the gizmo bar holds, nothing fired
+  python buildings.py gizmos Ernst       # a PAWN's bar: selected by id, never
+                                         #   clicked -- two pawns on one tile
+                                         #   are one cell
+  python buildings.py gizmo <thing>      # select and read the bar, fire nothing
   python buildings.py gizmo <thing> "<gizmo label>" [--do]
                                          # select, list and fire one, in one
                                          #   process. Dry run without --do.
@@ -27,8 +37,14 @@
       [--temperature C] [--medical on|off] [--owner NAME|none]
       [--prisoners on|off] [--do]
   python buildings.py reinstall <thing> <x> <z> [--do]
+  python buildings.py reinstall <sx> <sz> <x> <z> [--do]
                                          # fire `Reinstall at...` and click the
                                          #   destination. Dry run without --do.
+                                         #   A source cell holding a PACKED-UP
+                                         #   item installs it instead.
+  python buildings.py rotate <thing> <north|east|south|west|0-3> [--do]
+                                         # turn a blueprint or frame. The only
+                                         #   rotate on this bridge.
 
 `<thing>` is a ThingID, an `x,z` cell, a "DefName@x,z" pair, or a unique
 label/defName substring among colony buildings; an ambiguous one is refused with the
@@ -36,6 +52,30 @@ candidates. `set` is a DRY RUN until `--do`, prints before -> after per field,
 and `--power` places a flick designation -- a colonist walks over and flicks
 it, so switchIsOn does not move until they do. `--no-watch` skips selecting
 the building while the write lands.
+
+## Rotation exists at placement time and nowhere else
+
+RimWorld turns a thing while the placement designator is held; once the
+blueprint is down that moment is gone, and there is no rotate gizmo, no rotate
+designator and no rotate tool on this bridge -- three turns of reinstalling a
+cooler failed on facing alone. `rotate` writes `Thing.Rotation` on a BLUEPRINT
+or FRAME, which is what the designator would have written. A standing building
+is refused: vanilla cannot turn one either. So is a def that is not rotatable
+-- `Thing.Rotation`'s setter calls `Log.Error` there and `Log.Error` pauses the
+colony -- and so is a turn whose footprint would leave the map or cover
+something else.
+
+## A placing click is confirmed by polling, not by one read
+
+`click_cell` returns before RimWorld has spawned the blueprint. One read
+straight after it said "the placing click left NO blueprint there (the cell
+reads empty)" nine times in one session while the blueprint was there, and the
+identical sentence was TRUE for the cell next door. `reinstall` and
+`mini_install.py` now read the destination up to four times over ~2 s and print
+three different sentences: **PLACED -- CONFIRMED** with the id and the work
+left, **NOT PLACED -- SOMETHING ELSE IS THERE** naming what stands there, and
+**NOT VISIBLE YET** with the command to check again. None of them is "the cell
+reads empty".
 
 ## An address is not a substring
 
@@ -87,6 +127,22 @@ a click outside the frame does nothing and still reports success -- cycles the
 things in the cell, prints `selected: <label> [Thing_X]`, and REFUSES to fire
 unless the selected id is the one asked for.
 
+## A PAWN's bar is read by id, because a tile is not an address for a pawn
+
+`gizmos <pawn>` / `gizmo <pawn>` take a pawn's NAME or id and read the bar the
+game draws for them. Two things were wrong before 2026-09-08 and both were
+silent. A pawn payload names its id `pawnId` and carries no `thingId`, so the
+resolver handed the click check a blank and it refused itself: *"selection is
+pawn Ernst [Thing_Human618], expected Ernst [None]"*. And the reader clicked
+the cell fresh every call -- so for fourteen turns every read of Ernst's bar
+came back Samantha's, because she was standing on his square, and a wearable
+turret pack sat on his bar unseen the whole time. **No number of cycling clicks
+can separate two pawns on one tile.** A pawn is now selected through
+`rimworld/select_pawn {pawnId}` and verified by id, with no pixel in the path.
+That tool resolves player colonists only, so an animal or a raider falls back
+to the cell click -- which still verifies the id it selected, and refuses
+rather than answer with the neighbour.
+
 A **MinifiedThing** (packed-up furniture) is an item, not a building, so
 `home/building_config` cannot address it and both subcommands used to refuse it
 with "No colony building matches" (turns 12, 13). Its id now resolves through
@@ -137,6 +193,33 @@ It is not the whole pane. `GetInspectStringLowPriority()` -- the deterioration
 and "attack to destroy" lines -- is deliberately never read, because RimWorld's
 implementation of it calls `Faction.OfPlayer`, which reaches `Log.Error`, which
 pauses the game.
+
+## `--rock` reads stone, and it is its own scope
+
+`--rock` used to mean `category=all` while the colony-only default still stood,
+and natural rock belongs to no faction -- so 12,468 rock rows were removed by
+`byPlayerOnly` and the call came back holding worktables. It now asks for
+`category=rock` (natural rock, smoothed rock and mineable ore, and nothing
+else) with `playerOnly=false`, and prints counts by def. The cells are printed
+only under a scope: a whole-map rock census is twelve thousand coordinates.
+
+## Capacity is not output
+
+A power net's `gen` row is what the generators are producing THIS TICK, so an
+unfuelled or dark generator adds a body to the generator count and zero watts;
+and `gen 5400W ... stored 1173.7Wd` was printed above eleven UNPOWERED
+consumers during a solar flare, reading as though power existed. Every net row
+now carries capacity (what the defs could do) beside output (this tick) beside
+draw, counts its powered and unpowered consumers, and names why the dark ones
+are dark: solar flare, no fuel, switched off, broken down, no generator on the
+net, empty batteries -- or says outright that this read cannot tell.
+
+## An unknown flag is refused, not ignored
+
+`--rooms` printed the full worktable and power report and no rooms, with no
+complaint, because the parser only ever looked for the flags it knew. Every
+`-`-prefixed argument is now checked against the two flag tables and an unknown
+one stops the call before any read, naming the tool that does answer it.
 
 ## Colony structures by default
 
@@ -212,6 +295,31 @@ def _pos(row):
 
 def _num(v, fmt="%.0f"):
     return "?" if v is None else fmt % v
+
+
+def _work_left(b):
+    """Work left on ONE scale -- the one the inspect pane draws.
+
+    `workLeft` is raw work ticks and the pane prints that divided by 60, so a
+    row saying "work left 800" sat beside its own `inspect:` line saying "Work
+    left: 13" in a single call. `workLeftText` is the game's own rendering of
+    the same field; the raw number is only printed when the DLL predates it,
+    and is labelled as raw so the two can never be read as one figure."""
+    text = b.get("workLeftText")
+    if text:
+        return str(text)
+    v = b.get("workLeft")
+    return "?" if v is None else "%s raw (this DLL predates workLeftText)" % _num(v)
+
+
+def _kind(b):
+    """built / blueprint / frame -- the one word that separates a grave from a
+    grave that is not there yet."""
+    if b.get("isBlueprint"):
+        return "install-bp" if b.get("isInstallBlueprint") else "blueprint"
+    if b.get("isFrame"):
+        return "frame"
+    return b.get("status") or "built"
 
 
 def _inspect(b, pad="       "):
@@ -302,6 +410,11 @@ def _short(avail, res):
     return usable < max(owed, still)
 
 
+TOUCHED_BLUEPRINT = ("a blueprint becomes a FRAME the moment a hauler drops the "
+                     "first material in it, so blueprints=0 never means "
+                     "'nothing is queued' -- the queue is the two together.")
+
+
 def pending_block(r):
     """Blueprints and frames, deficit first. The point of item 2."""
     rows = [b for b in r["buildings"] if b.get("isBlueprint") or b.get("isFrame")]
@@ -310,14 +423,17 @@ def pending_block(r):
         # for "none survived the filter". An absent block would be
         # indistinguishable from a block that was never rendered.
         print("PENDING CONSTRUCTION: %s" % _why_empty(r, "built"))
+        print("   %s" % TOUCHED_BLUEPRINT)
         print()
         return
     # Short-of-materials first, then least complete first: the ones that are
     # stuck should never be below the ones that are merely slow.
     rows.sort(key=lambda b: (b.get("resourcesComplete", True),
                              b.get("percentComplete") if b.get("percentComplete") is not None else 1.0))
-    print("PENDING CONSTRUCTION -- %d blueprint(s), %d frame(s)"
-          % (r["attention"]["blueprints"], r["attention"]["frames"]))
+    blue, frames = r["attention"]["blueprints"], r["attention"]["frames"]
+    print("PENDING CONSTRUCTION -- %d queued (%d blueprint(s), %d frame(s))"
+          % (blue + frames, blue, frames))
+    print("   %s" % TOUCHED_BLUEPRINT)
     avail = _availability(r)
     for b in rows:
         owed = not b.get("resourcesComplete", True)
@@ -333,7 +449,7 @@ def pending_block(r):
         prog = "" if pct is None else "  %d%% built" % round(100 * pct)
         print("%s %-9s %-30s %-9s%s  work left %s"
               % (mark, b.get("status", "?"), what[:30], _pos(b), prog,
-                 _num(b.get("workLeft"))))
+                 _work_left(b)))
         if b.get("stuff"):
             print("               of %s" % b["stuff"])
         for res in b.get("resources") or []:
@@ -473,6 +589,8 @@ def power_block(r, warn=True):
     print("POWER / FUEL")
     for line in warnings:
         print(line)
+    summary = r.get("powerSummary") or {}
+    on_net = _net_of(r)
     for b in rows:
         p = b["power"]
         why = []
@@ -483,7 +601,19 @@ def power_block(r, warn=True):
         if p.get("brokenDown"):
             why.append("BROKEN DOWN")
         if not why:
-            why.append("no power available on its net")
+            # A lamp that is dark because the sky is flaring and one that is
+            # dark because its net has no generator read identically from the
+            # building alone. The net is where the difference lives.
+            net = on_net.get(_norm_id(b.get("thingId")))
+            trouble = net_trouble(net, summary) if net else []
+            if summary.get("solarFlare"):
+                why.append("SOLAR FLARE -- every powered building is off until "
+                           "it passes")
+            elif trouble:
+                why.append(trouble[0])
+            else:
+                why.append("no power on its net; this read cannot say why "
+                           "(`buildings.py --power` is the net table)")
         print("   !! UNPOWERED  %-30s %-9s  %s%s"
               % ((b.get("label") or b.get("defName") or "?")[:30], _pos(b),
                  ", ".join(why), _fac(r, b)))
@@ -522,6 +652,77 @@ def flagged_nets(r):
     return [n for n in r.get("powerNets") or [] if n.get("flags")]
 
 
+def _net_of(r):
+    """thingId -> the power net row it sits on, for every net that named its
+    buildings. A net that named none is simply absent, never a wrong answer."""
+    out = {}
+    for net in r.get("powerNets") or []:
+        for b in net.get("buildings") or []:
+            out[_norm_id(b.get("thingId"))] = net
+    return out
+
+
+def _dark(net):
+    """Consumers on this net that are not powered. [] when the net is fine."""
+    return [b for b in net.get("buildings") or []
+            if b.get("role") == "consumer" and b.get("poweredOn") is False]
+
+
+def _idle(net):
+    """Generators on this net producing nothing right now."""
+    return [b for b in net.get("buildings") or []
+            if b.get("role") == "producer"
+            and not (b.get("powerOutputW") or 0) > 0]
+
+
+def _why_generator_idle(b):
+    """Why one generator is making nothing. Named causes first, then honesty."""
+    if b.get("hasFuel") is False:
+        return "no fuel"
+    if b.get("switchedOn") is False:
+        return "switched off"
+    if b.get("brokenDown"):
+        return "broken down"
+    return "producing 0W right now (a solar panel at night, a still windmill)"
+
+
+def net_trouble(net, summary):
+    """Why the consumers on this net are dark, in plain words, or [].
+
+    A net summary that prints `gen 5400W ... stored 1173.7Wd` above eleven
+    UNPOWERED consumers is true in every figure and wrong in what it implies.
+    These are the causes this read can actually name; anything it cannot name
+    it says it cannot name."""
+    dark = _dark(net)
+    if not dark:
+        return []
+    out = []
+    if (summary or {}).get("solarFlare"):
+        out.append("SOLAR FLARE is active -- it switches every powered building "
+                   "off until it passes. Nothing here is broken.")
+        return out
+    if not net.get("producerCount"):
+        out.append("no generator on this net at all.")
+        return out
+    if not (net.get("generationW") or 0):
+        causes = sorted({_why_generator_idle(b) for b in _idle(net)})
+        out.append("every generator on this net is producing nothing: %s."
+                   % ("; ".join(causes) or "no reason readable"))
+    stored = net.get("storedWd")
+    if stored is not None and stored <= 0:
+        out.append("the batteries are empty (%s Wd stored), so there is nothing "
+                   "to carry the draw." % _num(stored, "%.1f"))
+    elif (net.get("generationW") or 0) < (net.get("consumptionCapacityW") or 0):
+        out.append("draw capacity %sW is above what is being generated (%sW); "
+                   "the batteries are draining."
+                   % (_num(net.get("consumptionCapacityW")),
+                      _num(net.get("generationW"))))
+    if not out:
+        out.append("this read cannot say why -- the net has generation and "
+                   "stored power. Check the buildings named below by hand.")
+    return out
+
+
 def net_warning_lines(r):
     """The one-line-per-net warning the DEFAULT summary owes the reader.
 
@@ -538,14 +739,43 @@ def net_warning_lines(r):
         return ["   !! POWER GRID UNREADABLE -- %s. This is NOT 'the grid is fine'."
                 % (summary.get("error") or "no reason given")]
     out = []
+    if summary.get("solarFlare"):
+        out.append("   !! SOLAR FLARE is active. Every powered building on the map "
+                   "is switched OFF until it passes; the generators still read "
+                   "their capacity. Nothing below is broken.")
     for net in flagged_nets(r):
         why = "; ".join(NET_FLAG_TEXT.get(f, f) for f in net.get("flags"))
         who = _net_names(net, "battery") or _net_names(net)
-        out.append("   !! POWER NET %d: %s -- %s. gen %sW / draw %sW, %s Wd stored."
+        out.append("   !! POWER NET %d: %s -- %s. %s"
                    % (net.get("index", -1), why, who or "no buildings named",
-                      _num(net.get("generationW")), _num(net.get("consumptionW")),
-                      _num(net.get("storedWd"), "%.1f")))
+                      net_figures(net)))
+    for net in r.get("powerNets") or []:
+        if net.get("flags"):
+            continue                      # already named above
+        dark = _dark(net)
+        if not dark:
+            continue
+        out.append("   !! POWER NET %d: %d of %d consumer(s) UNPOWERED. %s"
+                   % (net.get("index", -1), len(dark),
+                      net.get("consumerCount", 0), net_figures(net)))
+        for line in net_trouble(net, summary):
+            out.append("        %s" % line)
     return out
+
+
+def net_figures(net):
+    """One net's three power numbers, kept apart on purpose.
+
+    Capacity is what the defs could do, output is what they are doing this
+    tick, and draw is what is being pulled. An unfuelled generator is in the
+    first and not the second, which is why one number for both read as
+    "5400W of power exists" beside eleven dark lamps."""
+    return ("capacity gen %sW / draw %sW   now gen %sW / draw %sW   stored %s of %s Wd"
+            % (_num(net.get("generationCapacityW")),
+               _num(net.get("consumptionCapacityW")),
+               _num(net.get("generationW")), _num(net.get("consumptionW")),
+               _num(net.get("storedWd"), "%.1f"),
+               _num(net.get("storedMaxWd"), "%.1f")))
 
 
 def power_nets_block(r):
@@ -565,28 +795,58 @@ def power_nets_block(r):
         return
     print("POWER NETWORKS -- %d net(s), %d flagged"
           % (summary.get("netCount", 0), summary.get("flaggedNetCount", 0)))
+    # Only the first net can answer "does this DLL emit capacity". With NO
+    # nets there is nothing to read it off, and an empty dict is not evidence
+    # of an old DLL -- telling a map with no power on it to reinstall the
+    # companion costs a game-closed restart for nothing.
+    if nets and "generationCapacityW" not in nets[0]:
+        print("   (this DLL predates the capacity figures -- 'gen' below is LIVE "
+              "OUTPUT, not capacity, so an unfuelled generator reads 0W. Rebuild "
+              "and reinstall the companion.)")
+    conditions = summary.get("activeConditions")
+    if summary.get("solarFlare"):
+        print("   !! SOLAR FLARE is active. Every powered building on the map is "
+              "switched OFF until it passes; the generators keep their capacity "
+              "and produce nothing. This is the answer to 'why is everything "
+              "unpowered'.")
+    elif conditions:
+        print("   active map conditions: %s" % ", ".join(str(c) for c in conditions))
     if not nets:
         print("   none. (checked -- the map has no power network at all.)")
         print()
         return
     for net in nets:
-        mark = "!!" if net.get("flags") else "  "
-        print("   %s net %-3d  gen %-8s draw %-8s stored %-8s  "
-              "%d gen / %d draw / %d battery / %d conduit  (%d ours of %d)"
-              % (mark, net.get("index", -1),
-                 _num(net.get("generationW")) + "W",
-                 _num(net.get("consumptionW")) + "W",
-                 _num(net.get("storedWd"), "%.1f") + "Wd",
-                 net.get("producerCount", 0), net.get("consumerCount", 0),
+        dark = _dark(net)
+        mark = "!!" if (net.get("flags") or dark) else "  "
+        print("   %s net %-3d  %s" % (mark, net.get("index", -1), net_figures(net)))
+        print("        %d generator(s) (%d idle) / %d consumer(s) (%d powered, "
+              "%d UNPOWERED) / %d battery / %d conduit  (%d ours of %d)"
+              % (net.get("producerCount", 0), net.get("idleProducerCount", 0),
+                 net.get("consumerCount", 0), net.get("poweredConsumerCount", 0),
+                 net.get("unpoweredConsumerCount", len(dark)),
                  net.get("batteryCount", 0), net.get("transmitterCount", 0),
                  net.get("playerBuildingCount", 0), net.get("buildingCount", 0)))
         for f in net.get("flags") or []:
             print("        !! %s -- %s" % (f, NET_FLAG_TEXT.get(f, "see INSTALL.md")))
+        for line in net_trouble(net, summary):
+            print("        !! %s" % line)
+        for b in _idle(net):
+            print("        idle generator  %-28s %s,%s  %s"
+                  % ((b.get("label") or b.get("defName") or "?")[:28],
+                     (b.get("position") or {}).get("x"),
+                     (b.get("position") or {}).get("z"), _why_generator_idle(b)))
+        for b in dark:
+            print("        UNPOWERED       %-28s %s,%s  draws %sW when on"
+                  % ((b.get("label") or b.get("defName") or "?")[:28],
+                     (b.get("position") or {}).get("x"),
+                     (b.get("position") or {}).get("z"), _num(b.get("capacityW"))))
         named = _net_names(net, cap=12)
         if named:
             print("        on it: %s" % named)
         if net.get("buildingsNotListed"):
             print("        (+%d more not listed)" % net["buildingsNotListed"])
+    print("   capacity is what the defs COULD do; 'now' is this tick. An "
+          "unfuelled or dark generator is in the first and not the second.")
     print("   a net with no building of OURS on it is never flagged: ancient "
           "ruins have dead conduit runs and flagging them would bury ours.")
     print()
@@ -608,6 +868,7 @@ def other_detail_block(r):
         return
     print("OTHER DETAILED ROWS -- %d (promoted out of the aggregate, listed so "
           "nothing is collapsed in silence)" % len(rest))
+    print("   kind | what | where | why it is its own row | detail")
     for b in rest:
         bits = []
         if b.get("ownerNames") is not None:
@@ -617,8 +878,10 @@ def other_detail_block(r):
         hp, mx = b.get("hitPoints"), b.get("maxHitPoints")
         if hp is not None and mx:
             bits.append("hp %d/%d" % (hp, mx))
-        print("   %-30s %-9s  %-24s %s%s"
-              % ((b.get("label") or b.get("defName") or "?")[:30], _pos(b),
+        # The kind column. A built grave and a grave blueprint listed together
+        # with nothing separating them is how one gets read as the other.
+        print("   %-10s %-30s %-9s  %-24s %s%s"
+              % (_kind(b), (b.get("label") or b.get("defName") or "?")[:30], _pos(b),
                  ",".join(str(x) for x in b.get("reasons") or []), "  ".join(bits),
                  _fac(r, b)))
         _inspect(b, "      ")
@@ -761,9 +1024,18 @@ def footer(r):
         got = sum(1 for b in rows if b.get("inspectString"))
         empty = sum(1 for b in rows if b.get("inspectString") == "")
         threw = sum(1 for b in rows if "inspectString" in b and b["inspectString"] is None)
-        print("   inspect: %d of %d detailed row(s) had inspect-pane text, %d had "
-              "none to give, %d could not be read. Aggregated rows never get one "
-              "(--every for one per building)." % (got, len(rows), empty, threw))
+        if not rows and (c["aggregatedBuildings"] or c["scanned"]):
+            # "0 of 0" reads as an empty result. It is a SCOPE problem: the
+            # rows that matched are aggregated, and a def has no inspect string.
+            print("   inspect: NO ROW WAS DETAILED, so no inspect text could be "
+                  "attached -- the %d matching building(s) are AGGREGATED into "
+                  "%d def row(s), and a def has no inspect pane. This is not an "
+                  "empty result. Add --every, or a --near / --center scope."
+                  % (c["aggregatedBuildings"], c["aggregatedRows"]))
+        else:
+            print("   inspect: %d of %d detailed row(s) had inspect-pane text, %d had "
+                  "none to give, %d could not be read. Aggregated rows never get one "
+                  "(--every for one per building)." % (got, len(rows), empty, threw))
         for miss in r.get("inspectSkipped") or []:
             print("   !! inspect UNREADABLE for %s x%s: %s"
                   % (miss.get("defName"), miss.get("count"), miss.get("error")))
@@ -950,6 +1222,21 @@ def target_block(r, target, rows):
 
 
 def show(r):
+    match = r["filters"].get("match")
+    if match:
+        # `--inspect Fence` sent a reader through three sections each saying the
+        # match belonged somewhere else before the rows appeared. This says
+        # where they are, once, at the top.
+        c = r["counts"]
+        found = (c.get("detailed") or 0) + (c.get("aggregatedBuildings") or 0)
+        where = ("OTHER DETAILED ROWS" if not r["filters"]["aggregate"]
+                 else "BUILT (aggregated)")
+        print("MATCH %r -- %d thing(s) matched. Pending ones are in PENDING "
+              "CONSTRUCTION below; the rest are under %s at the bottom. A "
+              "section that says 'nothing matching' is saying the match is not "
+              "ITS business, not that nothing was found."
+              % (match, found, where))
+        print()
     status = r["filters"]["status"]
     if status in ("all", "pending", "blueprint", "frame"):
         pending_block(r)
@@ -1053,6 +1340,21 @@ def _config_state(c):
               % (_val(c.get("assignedPawns")), _val(c.get("maxAssignedPawns"))))
 
 
+# Deconstruct, Uninstall and Cancel are REVERSE designators: the inspect
+# gizmo grid adds them to a SELECTED thing's bar as it draws. This listing
+# reads Thing.GetGizmos() through home/building_config, which never yields
+# them, so an empty search of it says nothing about whether they can be done.
+DESIGNATOR_NOTE = ("Deconstruct, Uninstall and Cancel are REVERSE designators: "
+                   "the inspect grid adds them to a SELECTED thing's bar as it "
+                   "draws, and this listing reads Thing.GetGizmos(), which "
+                   "never yields them -- so their absence HERE says nothing. "
+                   "`python buildings.py gizmo <thing> \"Uninstall\" --do` "
+                   "selects the thing, lists the whole bar and clicks the real "
+                   "button; `python act.py apply \"Deconstruct\" <x> <z>` is "
+                   "the architect route for deconstruct (bare x z, not x,z). A "
+                   "thing whose SELECTED bar carries no Uninstall is not "
+                   "minifiable -- a cooler is not, a heater is.")
+
 MINIFIED = "minifiedthing"
 
 
@@ -1065,10 +1367,18 @@ def _map_target(spec):
     colony building matches" (turns 12 and 13) although selecting one is
     exactly what `mini_install.py` does. `rimworld/get_map_target_info`
     resolves any thing on the map, both id spellings. -> the target, or None.
+
+    A PAWN is reached here too, by id or by NAME. `get_map_target_info
+    {thingId:...}` only ever matches an exact thing id, so `gizmo Ernst` fell
+    through to "No colony building matches" and `gizmo Thing_Human618` resolved
+    to a payload whose id field is `pawnId` -- leaving `thingId` None and the
+    click check comparing against a blank ("expected Ernst [None]", live
+    2026-09-08). `pick.resolve` now carries the envelope's ids onto the target,
+    and `pick.resolve_pawn` takes the name.
     """
     if not spec or any(ch in str(spec) for ch in "@,"):
         return None                      # a cell or DefName@x,z is not a thing id
-    return pick.resolve(spec)
+    return pick.resolve(spec) or pick.resolve_pawn(spec)
 
 
 def _is_minified(target):
@@ -1087,10 +1397,18 @@ def _fire_from_bar(rows, label, do, name, thing_id, expect_count=None):
         print("   !! the selection carries NO gizmos even though it is the "
               "thing asked for. Nothing was fired.")
         return 1
-    if expect_count is not None and expect_count != len(rows):
+    # The two counts are DIFFERENT POPULATIONS whenever the selected bar holds a
+    # reverse designator: `gizmoCount` is Thing.GetGizmos() alone, and the
+    # selection adds Cancel / Deconstruct / Uninstall as the inspect grid draws
+    # (see DESIGNATOR_NOTE). So a selection that merely carries MORE is the
+    # normal case -- `gizmo <blueprint> "Cancel"` has gizmoCount 0 and a
+    # one-row bar every time -- and warning about a shared tile there sent the
+    # reader to inv.py after a hauling problem that does not exist. FEWER on
+    # the selection than the read found is the shape that still means trouble.
+    if expect_count is not None and len(rows) < expect_count:
         print("   !! the read path (home/building_config) counted %s gizmo(s) "
-              "and the selection carries %d. Something else may share this "
-              "tile -- `inv.py` lists what is lying on it."
+              "and the selection carries only %d. Something else may share "
+              "this tile -- `inv.py` lists what is lying on it."
               % (expect_count, len(rows)))
     want = (label or "").strip().lower()
     hits = [g for g in rows if want in (g.get("label") or "").lower()] if label else []
@@ -1103,6 +1421,7 @@ def _fire_from_bar(rows, label, do, name, thing_id, expect_count=None):
     if label is None:
         print("-- %d gizmo(s) on the bar, read through the selection. Nothing "
               "was fired." % len(rows))
+        print("   %s" % DESIGNATOR_NOTE)
         return 0
     enabled = [g for g in hits if not g.get("disabled")]
     if len(enabled) != 1:
@@ -1138,15 +1457,33 @@ def _fire_from_bar(rows, label, do, name, thing_id, expect_count=None):
 
 
 def _bar_via_selection(target, label, do=False, as_json=False):
-    """The bar of a thing `home/building_config` will not address at all."""
-    tid = target.get("thingId") or target.get("id")
+    """The bar of a thing `home/building_config` will not address at all.
+
+    A pawn is selected BY ID and never by a click: two pawns on one tile are
+    one cell, and cycling it cannot tell them apart (turns 1-14 of 2026-09-08,
+    where every read of Ernst's bar came back Samantha's).
+    """
+    tid = (target.get("thingId") or target.get("pawnId") or target.get("id"))
+    pawn = pick.is_pawn(target)
     p = target.get("position") or {}
-    name = target.get("label") or target.get("defName") or tid
-    print("GIZMO%s -- %s (%s) at %s,%s   thingId %s"
+    name = (target.get("label") or target.get("name") or target.get("defName")
+            or tid)
+    print("GIZMO%s -- %s (%s) at %s,%s   %s %s"
           % ("" if label else "S", name, target.get("defName"),
-             p.get("x"), p.get("z"), tid))
-    print("   not a colony building (%s), so the bar is read through the "
-          "SELECTION, not home/building_config." % target.get("className"))
+             p.get("x"), p.get("z"), "pawnId" if pawn else "thingId", tid))
+    if not tid:
+        print("   REFUSED: the map resolved %r but the payload carries no id "
+              "at all, so nothing can be selected and nothing verified. "
+              "Nothing was read or fired." % name)
+        return 1
+    if pawn:
+        print("   a pawn, not a building, so the bar is read through the "
+              "SELECTION -- and the pawn is selected BY ID "
+              "(rimworld/select_pawn), never by clicking their cell: two pawns "
+              "on one tile are one cell, and the click cannot tell them apart.")
+    else:
+        print("   not a colony building (%s), so the bar is read through the "
+              "SELECTION, not home/building_config." % target.get("className"))
     if _is_minified(target):
         print("   packed-up furniture: `python mini_install.py %s --to <x> <z> "
               "--do` selects it, fires Install and places it." % tid)
@@ -1155,7 +1492,23 @@ def _bar_via_selection(target, label, do=False, as_json=False):
               "something), so there is no cell to click.")
         return 1
     try:
-        pick.select_thing(tid, p.get("x"), p.get("z"), label=name)
+        if pawn:
+            try:
+                pick.select_pawn(tid, label=name)
+            except pick.ClickMissed as e:
+                if "SELECT REFUSED" not in str(e) or p.get("x") is None:
+                    raise
+                # rimworld/select_pawn is colonists-only upstream. An animal or
+                # a raider still has a cell, and the cycling path at least
+                # refuses rather than reads the wrong bar.
+                print("   %s" % e)
+                print("   falling back to clicking %s,%s -- that path VERIFIES "
+                      "the id it selected, so a shared tile refuses instead of "
+                      "answering with the neighbour."
+                      % (p.get("x"), p.get("z")))
+                pick.select_thing(tid, p.get("x"), p.get("z"), label=name)
+        else:
+            pick.select_thing(tid, p.get("x"), p.get("z"), label=name)
     except (pick.ClickMissed, pick.CameraStuck) as e:
         print("   REFUSED: %s" % e)
         return 1
@@ -1199,6 +1552,7 @@ def gizmos_cmd(spec, as_json=False):
     print("-- %d gizmo(s) on the bar. Writable from here: --forbid, --power, "
           "--temperature, --medical, --prisoners, --owner; anything else is listed only."
           % (r.get("gizmoCount") or 0))
+    print("   %s" % DESIGNATOR_NOTE)
     _config_state(r["after"])
     return 0
 
@@ -1257,6 +1611,61 @@ def gizmo_cmd(spec, label, do=False, as_json=False):
                           expect_count=r.get("gizmoCount"))
 
 
+MINIFIED_DEFS = ("MinifiedThing", "MinifiedTree")
+
+
+def resolve_at_cell(x, z):
+    """What sits at a cell, for the WRITE side. -> a row, or None.
+
+    `home/building_config` addresses buildings, and a packed-up item is a
+    `MinifiedThing` lying on the floor, so a bare cell refused with "No colony
+    building matches" and a minified item refused twice over. Buildings first,
+    then `home/list_things` for the packed ones."""
+    for b in cell_contents(x, z):
+        if b.get("thingId") and not (b.get("isBlueprint") or b.get("isFrame")):
+            return {"thingId": b["thingId"], "label": b.get("label"),
+                    "defName": b.get("defName"), "minified": False}
+    # `home/list_things` aggregates by defName, so every packed item on the map
+    # shares ONE MinifiedThing row, and `positions[]` is capped at 8 per def by
+    # default -- in a furniture stockpile the item standing on the asked-for
+    # cell lands in `positionsNotListed` and this read calls the cell empty.
+    # A 3x3 box can hold nine, so ask for more than the box can contain.
+    r = rim.game("home/list_things",
+                 {"category": "all", "ownership": "all",
+                  "x": int(x), "z": int(z), "radius": 1,
+                  "maxPositionsPerDef": 64}, strict=False)
+    if not isinstance(r, dict) or not r.get("success"):
+        return None
+    for row in r.get("things") or []:
+        if row.get("defName") not in MINIFIED_DEFS:
+            continue
+        for p in row.get("positions") or []:
+            if p.get("x") != int(x) or p.get("z") != int(z) or not p.get("thingId"):
+                continue
+            target = _map_target(p["thingId"])
+            if target and _is_minified(target):
+                return {"thingId": target.get("thingId") or p["thingId"],
+                        "label": target.get("label") or row.get("label"),
+                        "defName": row.get("defName"), "minified": True}
+    return None
+
+
+def reinstall_argv(words):
+    """-> (thing spec, (x, z)) or (None, what was wrong with the line).
+
+    Four bare numbers are `<source x> <source z> <dest x> <dest z>`: a session
+    spent three turns discovering that the source had to be a thingId."""
+    nums = [w.lstrip("-").isdigit() for w in words]
+    if len(words) == 4 and all(nums):
+        return "%s,%s" % (words[0], words[1]), (int(words[2]), int(words[3]))
+    if len(words) == 3 and nums[1] and nums[2]:
+        return words[0], (int(words[1]), int(words[2]))
+    return None, ("<thing> <x> <z> [--do], or <sx> <sz> <x> <z> [--do]. "
+                  "<thing> is a thingId, an `x,z` cell, DefName@x,z, or a "
+                  "unique label; a cell may hold a packed-up item, which is "
+                  "installed rather than reinstalled.")
+
+
 def reinstall_cmd(spec, x, z, do=False):
     """Move a building whole: fire `Reinstall at...` and click the destination.
 
@@ -1270,6 +1679,28 @@ def reinstall_cmd(spec, x, z, do=False):
 
     Read-only without `--do`, which is the whole call except the two clicks.
     """
+    cell = _cell(spec)
+    if cell:
+        found = resolve_at_cell(cell[0], cell[1])
+        if found is None:
+            print("REFUSED: nothing at %d,%d can be moved -- no building and no "
+                  "packed-up item there. `python buildings.py %d,%d` says what "
+                  "IS there." % (cell[0], cell[1], cell[0], cell[1]))
+            return 1
+        if found["minified"]:
+            print("%s at %d,%d is PACKED UP (a MinifiedThing), not a building, "
+                  "so this INSTALLS it rather than reinstalling it."
+                  % (found["label"], cell[0], cell[1]))
+            import mini_install
+            try:
+                mini_install.install(found["thingId"], do, [x, z])
+                return 0
+            except RuntimeError as e:
+                print("STOP: %s" % e)
+                return 1
+        print("%s at %d,%d resolves to %s."
+              % (found["label"], cell[0], cell[1], found["thingId"]))
+        spec = found["thingId"]
     r = configure(thing=spec, gizmos=True)
     if not r.get("success"):
         return _refusal(r)
@@ -1302,7 +1733,7 @@ def reinstall_cmd(spec, x, z, do=False):
               "%r, move the camera to %d,%d and click there, then read the cell "
               "back. Add --do." % (hits[0].get("label"), x, z))
         return 0
-    before = _blueprint_at(x, z)
+    before = occupant_ids(x, z)
     try:
         pick.select_thing(tid, p["x"], p["z"], label=t.get("label"))
     except (pick.ClickMissed, pick.CameraStuck) as e:
@@ -1339,34 +1770,106 @@ def reinstall_cmd(spec, x, z, do=False):
               "drops it. Nothing was placed." % e)
         return 1
     rim.game("rimworld/click_cell", {"x": int(x), "z": int(z)}, strict=False)
-    time.sleep(0.4)
-    after = _blueprint_at(x, z)
-    if after and after != before:
-        print("   PLACED: %s is now an install blueprint at %d,%d (%s). A "
-              "builder has to carry it; `buildings.py --pending` tracks it."
-              % (t.get("label"), x, z, after))
-        return 0
-    print("   !! the placing click at %d,%d left NO blueprint there (the cell "
-          "reads %s). The designator may still be armed -- `python act.py clear` "
-          "drops it. Nothing else was changed." % (x, z, after or "empty"))
-    return 1
+    return report_placement(x, z, t.get("label"), before)
 
 
-def _blueprint_at(x, z):
-    """A blueprint or frame standing on that cell, or None. Read off the map:
-    a placement click that missed reports success exactly like one that landed."""
-    r = rim.game("home/get_cells_plus",
-                 {"x": int(x), "z": int(z), "width": 1, "height": 1,
-                  "fields": "things",
-                  "thingFields": "defName,label,isBlueprint,isFrame",
-                  "sparse": True}, strict=False)
+CONFIRM_READS = 4               # reads after a placing click
+CONFIRM_GAP = 0.7               # seconds between them; ~2.1 s of polling
+
+
+def cell_contents(x, z):
+    """Every building, blueprint and frame occupying that cell.
+
+    Through `home/list_buildings` rather than the cell read, because this is
+    the reply that carries thingId, status and work left -- the three things a
+    placement confirmation has to be able to print. [] means the read found
+    nothing OR failed; `confirm_placement` is what tells those apart, by
+    reading more than once."""
+    # TARGET_PAD, not 1. The companion's radius filter measures against
+    # `Thing.Position`, which for a multi-cell building is the ANCHOR, not the
+    # min corner -- a 4x4 reaches two cells from it and a 6-wide three. Asked
+    # with radius 1, the row for a solar generator never came back at all, so
+    # `_covers` below was the right predicate applied to a list the filter had
+    # already emptied, and every write-side cell lookup (reinstall by cell, the
+    # placement confirmation) read a big building's non-anchor cell as empty.
+    r = rim.game(TOOL, {"x": int(x), "z": int(z), "radius": TARGET_PAD,
+                        "status": "all", "aggregate": False,
+                        "playerOnly": False}, strict=False)
     if not isinstance(r, dict) or not r.get("success"):
-        return None
-    for c in r.get("cells") or []:
-        for t in c.get("things") or []:
-            if t.get("isBlueprint") or t.get("isFrame"):
-                return t.get("label") or t.get("defName") or "a blueprint"
-    return None
+        return []
+    return [b for b in r.get("buildings") or [] if _covers(b, int(x), int(z))]
+
+
+def occupant_ids(x, z):
+    """The ids standing on a cell right now -- what a placement is NEW against."""
+    return {_norm_id(b.get("thingId")) for b in cell_contents(x, z)}
+
+
+def confirm_placement(x, z, before_ids=None, reads=CONFIRM_READS, gap=CONFIRM_GAP):
+    """Poll a cell after a placing click until the game commits the placement.
+
+    `click_cell` returns before RimWorld has spawned the blueprint, so a single
+    read straight after it saw an empty cell nine times in one session -- and
+    the same sentence was true for the cell next door. Reading four times over
+    ~2 s tells "not placed" and "not committed yet" apart.
+
+    -> (kind, row, reads taken). kind is "blueprint", "frame", "other" (the
+    cell holds something, none of it new) or None (nothing new was seen).
+    """
+    before = set(before_ids or ())
+    other = None
+    reads = max(1, int(reads))
+    for attempt in range(reads):
+        if attempt:
+            time.sleep(gap)
+        rows = cell_contents(x, z)
+        for b in rows:
+            if _norm_id(b.get("thingId")) in before:
+                continue
+            if b.get("isBlueprint"):
+                return "blueprint", b, attempt + 1
+            if b.get("isFrame"):
+                return "frame", b, attempt + 1
+            if other is None:
+                other = b
+        if other is None and rows:
+            other = rows[0]
+    return ("other" if other is not None else None), other, reads
+
+
+def report_placement(x, z, what, before_ids=None, reads=CONFIRM_READS,
+                     gap=CONFIRM_GAP, pad="   "):
+    """The outcome of a placing click, in three sentences that cannot be
+    confused for each other. -> 0 only when the blueprint is confirmed there.
+
+    One sentence used to cover both "nothing was placed" and "the game has not
+    committed it yet", and it was wrong at least nine times in one session.
+    """
+    kind, row, taken = confirm_placement(x, z, before_ids, reads, gap)
+    if kind in ("blueprint", "frame"):
+        print("%sPLACED -- CONFIRMED: %s is a %s at %d,%d, thingId %s, work left "
+              "%s. Seen on read %d of %d."
+              % (pad, row.get("buildLabel") or row.get("label") or what, kind,
+                 x, z, row.get("thingId"), _work_left(row), taken, reads))
+        print("%sA builder has to carry it; `python buildings.py --pending` "
+              "tracks it." % pad)
+        return 0
+    if kind == "other":
+        print("%sNOT PLACED -- SOMETHING ELSE IS THERE: %d,%d holds %s (%s, %s) "
+              "and nothing new appeared over %d reads."
+              % (pad, x, z, row.get("label") or "?", row.get("defName") or "?",
+                 _kind(row), reads))
+        print("%sThe designator may still be armed -- `python act.py clear` "
+              "drops it. Nothing else was changed." % pad)
+        return 1
+    print("%sNOT VISIBLE YET: no new blueprint at %d,%d after %d reads over "
+          "~%.1f s. That is 'not seen', NOT 'the cell is empty' -- the game "
+          "commits a placement a moment after the click returns."
+          % (pad, x, z, reads, gap * (reads - 1)))
+    print("%sVerify with `python buildings.py --near %d %d 2 --every`. If it is "
+          "genuinely not there the designator may still be armed -- `python "
+          "act.py clear` drops it." % (pad, x, z))
+    return 1
 
 
 def set_cmd(spec, kw, do=False, watch=True, as_json=False):
@@ -1456,6 +1959,74 @@ def _config_argv(argv):
     return spec, kw
 
 
+# Every flag the listing side takes. An unknown one is REFUSED rather than
+# ignored: `--rooms` used to print the whole worktable and power report and no
+# rooms, with nothing saying the flag had been dropped on the floor.
+BARE_FLAGS = {"--pending", "--blueprints", "--frames", "--built", "--rock",
+              "--all", "--player", "--every", "--inspect", "--power", "--json",
+              "--help", "-h"}
+VALUE_FLAGS = {"--damaged-below", "--near", "--match", "--center", "--centre",
+               "--radius"}
+UNKNOWN_ROUTE = {
+    "--rooms": "rooms are not buildings -- `python map.py --rooms` reads "
+               "home/list_rooms, and the Scout brief has a ROOMS section.",
+    "--zones": "zones are not buildings -- `python zones.py` reads them.",
+    "--things": "loose items are not buildings -- `python inv.py` reads them.",
+}
+
+
+def unknown_flags(argv):
+    """Every `-`-prefixed argument this parser does not know. [] when clean."""
+    known = BARE_FLAGS | VALUE_FLAGS
+    return [a for a in argv
+            if a.startswith("-") and a not in known and not a.lstrip("-").isdigit()]
+
+
+def rock_block(r):
+    """`--rock`: stone, smoothed rock and ore. Counts by def, cells when scoped.
+
+    A whole-map rock census is twelve thousand rows, so the cells are printed
+    only when the call named a scope; without one this is a count."""
+    f = r["filters"]
+    scoped = bool(f.get("radius"))
+    rows = {}
+    if f.get("aggregate"):
+        for a in r["aggregated"]:
+            cells = ["%d,%d" % (p["x"], p["z"]) for p in a.get("positions") or []]
+            rows[a.get("defName") or "?"] = [a.get("label") or "", a.get("count", 0),
+                                             cells, a.get("positionsNotListed") or 0]
+    else:
+        for b in r["buildings"]:
+            key = b.get("defName") or "?"
+            row = rows.setdefault(key, [b.get("label") or "", 0, [], 0])
+            row[1] += 1
+            row[2].append(_pos(b))
+    total = sum(v[1] for v in rows.values())
+    if not rows:
+        print("ROCK: %s" % _why_empty(r, "blueprint"))
+        print("   category=rock keeps natural rock, smoothed rock and mineable "
+              "ore and nothing else, so an empty answer here is about stone.")
+        print()
+        footer(r)
+        return 0
+    print("ROCK -- %d thing(s) across %d def(s)%s"
+          % (total, len(rows),
+             "" if not scoped else " within %d of %d,%d"
+             % (f["radius"], f["x"], f["z"])))
+    for defname, (label, count, cells, more) in sorted(
+            rows.items(), key=lambda kv: (-kv[1][1], kv[0])):
+        print("%6d  %-30s %s" % (count, (label or "")[:30], defname))
+        if scoped and cells:
+            print("        %s%s" % (" ".join(cells),
+                                    " (+%d more)" % more if more else ""))
+    if not scoped:
+        print("   cells are printed under a scope only. Add `--near x z r` or "
+              "`<x,z> --radius r` to get them.")
+    print()
+    footer(r)
+    return 0
+
+
 def main():
     argv = sys.argv[1:]
     kw = {}
@@ -1473,13 +2044,21 @@ def main():
         # and _config_argv would read it as one.
         rest = argv[1:]
         words = [a for a in rest if not a.startswith("-")]
-        if len(words) < 2:
+        if not words:
             print('buildings.py gizmo needs <thing> "<gizmo label>" [--do]')
+            print('   `buildings.py gizmo <thing>` with no label selects it '
+                  'and READS the bar, firing nothing.')
+            return 1
+        if len(words) < 2 and "--do" in rest:
+            print("buildings.py gizmo --do names no gizmo to fire. Read the "
+                  'bar first (`python buildings.py gizmo %s`), then name one '
+                  'exactly: `python buildings.py gizmo %s "<gizmo label>" '
+                  "--do`." % (words[0], words[0]))
             return 1
         try:
             rim.init()
-            return gizmo_cmd(words[0], words[1], do="--do" in rest,
-                             as_json="--json" in rest)
+            return gizmo_cmd(words[0], words[1] if len(words) > 1 else None,
+                             do="--do" in rest, as_json="--json" in rest)
         except Exception as e:
             print("buildings.py gizmo FAILED -- NOTHING WAS READ OR WRITTEN.")
             print("%s: %s" % (type(e).__name__, e))
@@ -1488,16 +2067,33 @@ def main():
     if argv and argv[0] == "reinstall":
         rest = argv[1:]
         words = [a for a in rest if not a.startswith("-")]
-        if len(words) < 3 or not words[1].lstrip("-").isdigit() \
-                or not words[2].lstrip("-").isdigit():
-            print("buildings.py reinstall <thing> <x> <z> [--do]")
+        spec, dest = reinstall_argv(words)
+        if spec is None:
+            print("buildings.py reinstall %s" % dest)
             return 1
         try:
             rim.init()
-            return reinstall_cmd(words[0], int(words[1]), int(words[2]),
-                                 do="--do" in rest)
+            return reinstall_cmd(spec, dest[0], dest[1], do="--do" in rest)
         except Exception as e:
             print("buildings.py reinstall FAILED.")
+            print("%s: %s" % (type(e).__name__, e))
+            return 1
+
+    if argv and argv[0] == "rotate":
+        rest = argv[1:]
+        words = [a for a in rest if not a.startswith("-")]
+        if len(words) < 2:
+            print("buildings.py rotate <thing> <north|east|south|west|0-3> [--do]")
+            print("   Blueprints and frames only. A standing building cannot be "
+                  "turned in RimWorld at all -- uninstall it and place it again.")
+            return 1
+        try:
+            rim.init()
+            return set_cmd(words[0], {"rotation": words[1]}, do="--do" in rest,
+                           watch="--no-watch" not in rest,
+                           as_json="--json" in rest)
+        except Exception as e:
+            print("buildings.py rotate FAILED -- NOTHING WAS READ OR WRITTEN.")
             print("%s: %s" % (type(e).__name__, e))
             return 1
 
@@ -1519,6 +2115,46 @@ def main():
             print("%s: %s" % (type(e).__name__, e))
             return 1
 
+    if argv and argv[0] == "at":
+        # 2026-09-08: `buildings.py at 139,123` read `at` as a --match
+        # SUBSTRING -- "at" is inside "Wall", "Gate", "Battery" -- and answered
+        # with a confident row for a building nowhere near 139,123. A word that
+        # reads as an English preposition in front of a coordinate is an
+        # ADDRESS, so it is one now.
+        rest, cell, taken = argv[1:], None, 0
+        if rest and not rest[0].startswith("-"):
+            cell = _cell(rest[0])
+            if cell:
+                taken = 1
+            elif (len(rest) > 1 and not rest[1].startswith("-")
+                  and rest[0].lstrip("-").isdigit()
+                  and rest[1].lstrip("-").isdigit()):
+                cell, taken = (int(rest[0]), int(rest[1])), 2
+        if cell is None:
+            print("buildings.py at needs a cell: `python buildings.py at "
+                  "139,123` or `python buildings.py at 139 123`. It is a "
+                  "COORDINATE query -- what stands on that one cell, "
+                  "blueprints and frames included -- not a name search; for a "
+                  "name use `python buildings.py --match %s`. NOTHING WAS READ."
+                  % (rest[0] if rest and not rest[0].startswith("-")
+                     else "<text>"))
+            return 2
+        # The rest of this parser already understands `x,z` as an address, and
+        # `at 139,123 --radius 4` must still become the SCAN that spelling
+        # means, so rewrite rather than branch.
+        argv = ["%d,%d" % cell] + rest[taken:]
+
+    bad = unknown_flags(argv)
+    if bad:
+        for flag in bad:
+            print(("buildings.py: unknown option %r. %s"
+                   % (flag, UNKNOWN_ROUTE.get(flag, ""))).rstrip())
+        print("   listing options: %s" % ", ".join(sorted(BARE_FLAGS)))
+        print("   options taking a value: %s" % ", ".join(sorted(VALUE_FLAGS)))
+        print("   NOTHING WAS READ. An unknown flag used to be ignored in "
+              "silence, so `--rooms` printed the whole worktable report instead.")
+        return 2
+
     if "--pending" in argv:
         kw["status"] = "pending"
     if "--blueprints" in argv:
@@ -1527,8 +2163,12 @@ def main():
         kw["status"] = "frame"
     if "--built" in argv:
         kw["status"] = "built"
-    if "--rock" in argv:
-        kw["category"] = "all"
+    want_rock = "--rock" in argv
+    if want_rock:
+        # Natural rock belongs to no faction, so the colony default removed
+        # every row of it and the call came back holding worktables.
+        kw["category"] = "rock"
+        kw["playerOnly"] = False
     if "--all" in argv:
         kw["playerOnly"] = False
     # `--player` was the old opt-IN and is now the default. Accepted so an old
@@ -1545,14 +2185,75 @@ def main():
         else:
             print("--damaged-below needs a percentage, e.g. --damaged-below 50")
             return 1
-    if "--near" in argv:
-        i = argv.index("--near")
-        nums = [int(v) for v in argv[i + 1:i + 4] if v.lstrip("-").isdigit()]
-        if len(nums) != 3:
-            print("--near needs x z radius")
+    if "--match" in argv:
+        i = argv.index("--match")
+        if i + 1 >= len(argv):
+            print("--match needs the text to match, e.g. --match door")
             return 1
-        kw["x"], kw["z"], kw["radius"] = nums
-        del argv[i:i + 4]
+        kw["match"] = argv[i + 1]
+        del argv[i:i + 2]
+    centre = None
+    if "--center" in argv or "--centre" in argv:
+        flag = "--center" if "--center" in argv else "--centre"
+        i = argv.index(flag)
+        rest = argv[i + 1:i + 3]
+        centre = _cell(rest[0]) if rest else None
+        if centre:
+            del argv[i:i + 2]
+        elif len(rest) == 2 and all(v.lstrip("-").isdigit() for v in rest):
+            centre = (int(rest[0]), int(rest[1]))
+            del argv[i:i + 3]
+        else:
+            print("%s needs a cell: %s 116,130 or %s 116 130" % (flag, flag, flag))
+            return 1
+    radius = None
+    if "--radius" in argv:
+        i = argv.index("--radius")
+        if i + 1 >= len(argv) or not argv[i + 1].lstrip("-").isdigit():
+            print("--radius needs a number of cells, e.g. --radius 12")
+            return 1
+        radius = int(argv[i + 1])
+        del argv[i:i + 2]
+    if "--near" in argv:
+        # 2026-09-08: `--near 139 123 --radius 4` was refused with "--near
+        # needs x z radius" although --radius says exactly that, and
+        # `--near 139 123 4 --radius 8` took the 4 and dropped the 8 in
+        # silence. The radius may now come from EITHER spelling; naming both
+        # with different numbers is a contradiction and is refused, not picked
+        # between.
+        i = argv.index("--near")
+        nums, j = [], i + 1
+        while j < len(argv) and len(nums) < 3 and argv[j].lstrip("-").isdigit():
+            nums.append(int(argv[j]))
+            j += 1
+        if len(nums) < 2:
+            print("--near needs a cell: `--near 139 123 --radius 4`, or "
+                  "`--near 139 123 4` with the radius as the third number. "
+                  "It took %d number(s). NOTHING WAS READ."
+                  % len(nums))
+            return 1
+        near_radius = nums[2] if len(nums) == 3 else radius
+        if len(nums) == 3 and radius is not None and radius != nums[2]:
+            print("--near %d %d %d says radius %d and --radius says %d. Name "
+                  "it once: `--near %d %d --radius %d`. NOTHING WAS READ."
+                  % (nums[0], nums[1], nums[2], nums[2], radius,
+                     nums[0], nums[1], radius))
+            return 1
+        if near_radius is None:
+            print("--near %d %d names a cell but no radius, which is not a "
+                  "scope. `--near %d %d --radius 4`, or `--near %d %d 4`. "
+                  "NOTHING WAS READ."
+                  % (nums[0], nums[1], nums[0], nums[1], nums[0], nums[1]))
+            return 1
+        kw["x"], kw["z"], kw["radius"] = nums[0], nums[1], near_radius
+        del argv[i:j]
+    if centre is not None:
+        if radius is None:
+            print("--center needs --radius: a centre with no radius is not a "
+                  "scope. `--center %d,%d --radius 12`, or the address form "
+                  "`%d,%d`." % (centre[0], centre[1], centre[0], centre[1]))
+            return 1
+        kw["x"], kw["z"], kw["radius"] = centre[0], centre[1], radius
     want_power = "--power" in argv
     # A bare positional is a --match substring UNLESS it is an address. A
     # coordinate is an address, and answering it with "none matched, 637
@@ -1566,6 +2267,30 @@ def main():
             return 2
         if target is None:
             kw["match"] = words[0]
+    if target is not None and target["kind"] == "cell" and radius is not None:
+        # A cell is an ADDRESS; a cell with a radius is a SCAN. Answering
+        # `106,127 --radius 9` with "NOTHING AT cell 106,127" after reading
+        # 12,981 buildings was the address form quietly winning.
+        print("SCAN of %d cell(s) around %d,%d -- `--radius` turns the address "
+              "%s into a search. Drop --radius for what is AT that one cell."
+              % (radius, target["x"], target["z"], target["spec"]))
+        kw["x"], kw["z"], kw["radius"] = target["x"], target["z"], radius
+        if target.get("match"):
+            kw["match"] = target["match"]
+        target = None
+    elif radius is not None and centre is None and not kw.get("radius"):
+        print("--radius needs a centre: pass a cell (`116,130 --radius 12`) or "
+              "`--center 116,130 --radius 12`, or use `--near x z radius`.")
+        return 1
+    # --inspect only ever attaches to a DETAILED row, so an aggregated answer
+    # reports "0 of 0 detailed rows had inspect text" -- a scope problem that
+    # reads like an empty result. Under a filter the rows are few enough to
+    # list one by one, which is where the text has somewhere to land.
+    if kw.get("inspect") and kw.get("aggregate") is not False and target is None \
+            and (kw.get("match") or kw.get("radius")):
+        kw["aggregate"] = False
+        print("--inspect lists every matching row (aggregation off): inspect "
+              "text only ever attaches to an individual row, never to a def.")
 
     try:
         rim.init()
@@ -1601,6 +2326,8 @@ def main():
         return 0
     if target is not None:
         return target_block(r, target, target_rows(r, target))
+    if want_rock:
+        return rock_block(r)
     if want_power:
         power_nets_block(r)
         power_block(r, warn=False)

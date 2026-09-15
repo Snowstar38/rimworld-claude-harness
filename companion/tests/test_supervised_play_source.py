@@ -72,12 +72,13 @@ class SupervisedPlaySourceTests(unittest.TestCase):
             self.assertIn(text, SOURCE)
 
     def test_injuries_are_baselined_and_emit_actionable_deltas(self):
-        self.assertIn("s.Injuries[p.thingIDNumber] = InjurySnapshot.Capture(p)", SOURCE)
+        self.assertIn("var snapshot = InjurySnapshot.Capture(p);", SOURCE)
+        self.assertIn("s.Injuries[p.thingIDNumber] = snapshot;", SOURCE)
         self.assertIn("after.Count > before.Count", SOURCE)
         self.assertIn("after.Severity > before.Severity + 0.01f", SOURCE)
         self.assertIn("after.BleedRate > before.BleedRate + 0.001f", SOURCE)
         self.assertIn("after.BloodLoss > before.BloodLoss + 0.001f", SOURCE)
-        self.assertIn('new Hit("colonist_injury"', SOURCE)
+        self.assertIn('? "colonist_injury" : "colonist_health"', SOURCE)
         self.assertIn('{ "pawnId", p.thingIDNumber }', SOURCE)
         self.assertIn('{ "position", Position(p) }', SOURCE)
 
@@ -124,7 +125,7 @@ class SupervisedPlaySourceTests(unittest.TestCase):
 
     def test_all_simultaneous_notifications_are_collected_before_stop(self):
         batch = SOURCE[SOURCE.index("var newLetters"):
-                       SOURCE.index("// An alert never stops play")]
+                       SOURCE.index("var pawns =")]
         self.assertNotIn('return new Hit("letter"', batch)
         self.assertNotIn('return new Hit("message"', batch)
         self.assertIn("if (newLetters.Count > 0 || newMessages.Count > 0)", batch)
@@ -179,28 +180,94 @@ class SupervisedPlaySourceTests(unittest.TestCase):
                        SOURCE.index("private static long InjuryCooldownRemainingMs(")]
         self.assertIn("var owedMs = InjuryCooldownRemainingMs(p.thingIDNumber, s.InjuryStopCooldownMs);",
                       probe)
-        self.assertIn("var suppressed = !threshold && (owedMs > 0 || acknowledged);", probe)
-        self.assertIn('if (((s.Mode == "colony" && newWound) || threshold) && !suppressed)', probe)
+        # The cooldown, the acknowledgement and a social fight suppress EVERY
+        # injury and health threshold for that pawn. Nothing about the stop
+        # condition can cancel a suppression -- that inversion is what let one
+        # fistfight stop four times inside its own cooldown window.
+        self.assertIn("var suppressed = acknowledged || owedMs > 0 || socialFight;", probe)
+        self.assertIn("if (severe && !suppressed)", probe)
+        self.assertNotIn("!threshold &&", probe)
         # blood-loss / severity creep on a known wound is an observation, never a stop
-        self.assertIn('var newWound = after.Count > before.Count', probe)
-        self.assertIn('known wound worsening', probe)
+        self.assertIn("var newWound = after.Count > before.Count", probe)
+        self.assertIn("known wound worsening", probe)
         self.assertIn('Add("injury_observed"', probe)
         # The same wound must not be re-reported every frame.
         self.assertIn("s.Injuries[p.thingIDNumber] = after;", probe)
-        self.assertIn('payload["suppressedBy"] = suppressed ? (acknowledged ? "acknowledged" : "cooldown") : null;',
-                      probe)
-        self.assertIn('payload["cooldownRemainingMs"] = owedMs;', probe)
+        self.assertIn('{ "suppressedBy", !suppressed ? null', probe)
+        self.assertIn('                                : acknowledged ? "acknowledged"', probe)
+        self.assertIn('                                : owedMs > 0 ? "cooldown" : "social_fight" }', probe)
+        self.assertIn('{ "cooldownRemainingMs", owedMs } };', probe)
 
-    def test_severity_downs_and_deaths_still_stop_a_suppressed_pawn(self):
+    def test_a_scratch_a_punch_and_an_animal_nip_never_stop_the_clock(self):
         probe = SOURCE[SOURCE.index("private static Hit Probe(State s)"):
                        SOURCE.index("private static long InjuryCooldownRemainingMs(")]
-        self.assertIn("var threshold = after.Health <= s.MinHealthFraction", probe)
-        self.assertIn("|| before.Health - after.Health >= s.HealthDropFraction;", probe)
+        # Hediff_Injury.Severity is hit points; a scratch or a punch is 2-6.
+        self.assertIn("private const float SeriousWoundSeverity = 10f;", SOURCE)
+        self.assertIn("private const float SeriousWoundBleedRate = 0.5f;", SOURCE)
+        self.assertIn("var woundSeverity = after.Severity - before.Severity;", probe)
+        self.assertIn("var seriousWound = newWound", probe)
+        self.assertIn("&& (woundSeverity >= SeriousWoundSeverity", probe)
+        self.assertIn("|| woundBleed >= SeriousWoundBleedRate);", probe)
+        # A bare new wound is no longer a colony stop on its own.
+        self.assertNotIn('s.Mode == "colony" && newWound', probe)
+        self.assertIn('|| (s.Mode == "colony" && seriousWound);', probe)
+
+    def test_a_social_fight_never_stops_the_clock(self):
+        probe = SOURCE[SOURCE.index("private static Hit Probe(State s)"):
+                       SOURCE.index("private static long InjuryCooldownRemainingMs(")]
+        self.assertIn("var socialFight = InSocialFight(p);", probe)
+        self.assertIn("private static bool InSocialFight(Pawn p)", SOURCE)
+        self.assertIn('p.MentalStateDef.defName == "SocialFighting"', SOURCE)
+        self.assertIn('{ "socialFight", socialFight },', probe)
+        self.assertIn("is in a social fight; play continues", probe)
+
+    def test_a_threshold_stop_rebaselines_so_it_cannot_repeat(self):
+        probe = SOURCE[SOURCE.index("private static Hit Probe(State s)"):
+                       SOURCE.index("private static long InjuryCooldownRemainingMs(")]
+        # Returning without writing the snapshot left the epoch baseline in
+        # place, so the same drop stayed true and stopped on every later tick.
+        stop = probe.index("if (severe && !suppressed)")
+        self.assertIn("s.Injuries[p.thingIDNumber] = after;",
+                      probe[stop:probe.index("Add(\"injury_observed\"")])
+        self.assertLess(probe.index("RecordInjuryStop(p);"),
+                        probe.index('return new Hit(condition == "serious_wound"'))
+        # A SUPPRESSED threshold re-baselines too, or the observation row
+        # fires ten times a second for as long as the pawn stays down there.
+        self.assertIn("if (!severe) after.Health = before.Health;", probe)
+
+    def test_downs_and_deaths_still_stop_a_suppressed_pawn(self):
+        probe = SOURCE[SOURCE.index("private static Hit Probe(State s)"):
+                       SOURCE.index("private static long InjuryCooldownRemainingMs(")]
+        self.assertIn("var crossedFloor = before.Health > s.MinHealthFraction", probe)
+        self.assertIn("&& after.Health <= s.MinHealthFraction;", probe)
+        self.assertIn("var bigDrop = before.Health - after.Health >= s.HealthDropFraction;", probe)
         # The downed/dead check is a separate hit and runs before the injury
-        # delta, so no cooldown can swallow it.
+        # delta, so no cooldown, acknowledgement or social fight can swallow it.
         downed = probe.index('return PawnHit("colonist_downed", p,')
-        injury = probe.index("var threshold = after.Health <= s.MinHealthFraction")
+        injury = probe.index("var crossedFloor = before.Health > s.MinHealthFraction")
         self.assertLess(downed, injury)
+
+    def test_minimum_health_is_an_edge_not_a_pause_loop(self):
+        probe = SOURCE[SOURCE.index("private static Hit Probe(State s)"):
+                       SOURCE.index("private static long InjuryCooldownRemainingMs(")]
+        # A pawn who starts an epoch below the floor must not stop again on
+        # every ordinary blood-loss or severity tick. Only crossing the floor
+        # from above is a minimum-health event -- in BOTH modes. The old
+        # combat-mode read was level-triggered and refused the start outright
+        # for a colonist already under 0.5.
+        crossing = ("var crossedFloor = before.Health > s.MinHealthFraction\n"
+                    "                        && after.Health <= s.MinHealthFraction;")
+        self.assertIn(crossing, probe)
+        self.assertNotIn('s.Mode == "combat"', probe)
+        self.assertNotIn("(after.Health <= s.MinHealthFraction", probe)
+
+    def test_a_pawn_below_the_floor_at_start_is_acknowledged_there(self):
+        start = SOURCE[SOURCE.index("internal static object Start("):
+                       SOURCE.index("internal static object Heartbeat(")]
+        self.assertIn("var below = snapshot.Health <= s.MinHealthFraction;", start)
+        self.assertIn("if (below) s.IgnoredInjured.Add(p.thingIDNumber);", start)
+        self.assertIn('{ "reason", below ? "below_health_floor"', start)
+        self.assertIn('{ "healthFraction", snapshot.Health },', start)
 
     def test_acknowledging_an_injured_colonist_is_explicit_and_id_based(self):
         self.assertIn("string ignoredInjuredColonistIds", SOURCE)
@@ -213,27 +280,36 @@ class SupervisedPlaySourceTests(unittest.TestCase):
                        SOURCE.index("internal static object Heartbeat(")]
         self.assertIn("var owed = InjuryCooldownRemainingMs(p.thingIDNumber, s.InjuryStopCooldownMs);",
                       start)
-        self.assertIn('{ "reason", owed > 0 ? "cooldown" : "acknowledged" }', start)
+        self.assertIn('                            : owed > 0 ? "cooldown" : "acknowledged" }', start)
         self.assertIn('{ "secondsRemaining", (int)((owed + 999) / 1000) }', start)
         self.assertIn('{ "pawnName", HomePlayUntilEventTools.SafeName(p) }', start)
         self.assertIn('{ "suppressedInjuryPawns", s != null ? (object)s.SuppressedInjuries : null }',
                       SOURCE)
 
-    def test_the_injury_stop_detail_is_one_actionable_line(self):
+    def test_the_injury_stop_detail_names_the_condition_that_fired(self):
         detail = SOURCE[SOURCE.index("private static string InjuryDetail("):
-                        SOURCE.index("private static string Num(float value)")]
-        self.assertIn('" was injured (injuries " + before.Count + " -> " + after.Count', detail)
+                        SOURCE.index("/// Two colonists brawling.")]
+        # Which of the three conditions fired, in words, before the numbers.
+        self.assertIn('var why = condition == "health_floor"', detail)
+        self.assertIn('"health fell to " + Num(after.Health) + ", at or under the "', detail)
+        self.assertIn(': condition == "health_drop"', detail)
+        self.assertIn('"health fell " + Num(before.Health - after.Health) + " from "', detail)
+        self.assertIn('"took a new wound worth " + Num(after.Severity - before.Severity)', detail)
+        self.assertIn('" stopped play: " + why + " (injuries " + before.Count + " -> " + after.Count',
+                      detail)
         self.assertIn('", bleed " + Num(before.BleedRate) + " -> " + Num(after.BleedRate)', detail)
         self.assertIn('", health " + Num(after.Health)', detail)
         self.assertIn('"). If this repeats, break the contact: "', detail)
         self.assertIn('"move them away or undraft them so they seek care; "', detail)
-        self.assertIn('"a restart within " + seconds + " s will not stop again on minor injuries for "',
+        self.assertIn('"a restart within " + seconds + " s will not stop again on any injury to "',
                       detail)
         self.assertIn('", or pass --allow-injured " + p.thingIDNumber', detail)
         # One line on screen: no newline may reach the detail string.
         self.assertNotIn(chr(92) + "n", detail)
-        self.assertIn('return new Hit("colonist_injury", InjuryDetail(s, p, before, after), payload);',
+        # The kind matches the condition, so a health slide is not filed as a wound.
+        self.assertIn('return new Hit(condition == "serious_wound" ? "colonist_injury" : "colonist_health",',
                       SOURCE)
+        self.assertIn("InjuryDetail(s, p, before, after, condition), payload);", SOURCE)
         # Culture-invariant, so a locale cannot put a comma inside a number.
         self.assertIn('value.ToString("0.00", CultureInfo.InvariantCulture)', SOURCE)
 
@@ -265,6 +341,109 @@ class SupervisedPlaySourceTests(unittest.TestCase):
         self.assertIn("CheckHostilesCleared(s, pawns);" + chr(10)
                       + " " * 12 + "foreach (var p in pawns)", SOURCE)
         self.assertIn("InjuryStops.Clear(); _priorEpochConsciousHostiles = 0;", SOURCE)
+
+    def test_a_wild_predator_is_classified_before_it_can_stop_the_clock(self):
+        """Threadneedle, 2026-09-08: a single wolverine stopped the clock on
+        four separate nights. The whole predator test was the job name plus a
+        40-cell radius -- `PredatorHunting(p) && p.Faction != Faction.OfPlayer
+        && colonists.Any(c => Distance(p, c) <= 40)` -- so an animal eating a
+        hare inside the home area was a stop, while `home/status` had excluded
+        exactly that case (`huntersIgnored[]`) since 2026-09-01."""
+        self.assertNotIn("PredatorHunt within 40 cells", SOURCE)
+        self.assertNotIn("colonists.Any(c => Distance(p, c) <= 40)", SOURCE)
+        body = SOURCE[SOURCE.index("private static string ClassifyThreat("):
+                      SOURCE.index("private static string StopKind(")]
+        # Manhunter and aggro are tested FIRST, before the player-faction
+        # short-circuit: our own tame animal going berserk is still a threat.
+        aggro = body.index("if (hostile || aggro)")
+        ours = body.index("if (IsPlayerFactionPawn(p)) return null;")
+        self.assertLess(aggro, ours)
+        self.assertIn("var aggro = SafeAggro(p);", body)
+        self.assertIn('return manhunter ? "manhunter" : "hostile";', body)
+        # Hunting one of ours is a stop at any distance; a hunt of wildlife is
+        # not a threat at any distance.
+        self.assertIn("TargetBelongsToPlayer(p, out prey)", body)
+        self.assertIn('return "predator_hunting_ours";', body)
+        # A predator that is merely near a colonist is not a category at all.
+        self.assertNotIn("predator_near", body)
+        self.assertNotIn("PredatorNearCells", SOURCE)
+        # The residual: classified, reported, and NOT a stop.
+        self.assertIn('return "predator";', body)
+
+    def test_a_hostile_asleep_across_the_map_is_listed_and_does_not_stop(self):
+        """Threadneedle, live: five insectoids asleep in a cave 74-78 cells from
+        every colonist refused a bare `start` every night. Asleep or dormant AND
+        past every weapon's range is "still on the map, not a threat" -- the
+        same rule combat.py's `end` uses, with the same JobDefs and the same 50
+        cells."""
+        self.assertIn("private const int DormantHostileCells = 50;", SOURCE)
+        for job in ("LayDown", "LayDownResting", "Wait_Asleep", "RevenantSleep",
+                    "Wait_AsleepDormancy", "ActivityDormant"):
+            self.assertIn('{ "%s", ' % job, SOURCE)
+        # Awake is awake: named in the comment, never a key.
+        self.assertNotIn('{ "LayDownAwake"', SOURCE)
+        body = SOURCE[SOURCE.index("private static string ClassifyThreat("):
+                      SOURCE.index("private static string StopKind(")]
+        # Both halves are required, and a manhunter is never dormant.
+        self.assertIn("if (!manhunter && DormantJobs.TryGetValue(SafeJobDef(p) ?? \"\", out sleeping)",
+                      body)
+        self.assertIn("&& away.HasValue && away.Value > DormantHostileCells)", body)
+        self.assertIn('reason = sleeping + " " + away.Value + " cells away; wakes -> stops";',
+                      body)
+        self.assertIn("stops = false;" + chr(10) + " " * 20 + 'return "hostile_dormant";',
+                      body)
+        # It is inside the hostile branch, so waking up or walking closer falls
+        # straight through to the ordinary `hostile` stop on the next probe.
+        self.assertLess(body.index('return "hostile_dormant";'),
+                        body.index('return manhunter ? "manhunter" : "hostile";'))
+        self.assertIn("private static string SafeJobDef(Pawn p)", SOURCE)
+
+    def test_the_stop_carries_the_classified_threats(self):
+        self.assertNotIn("predatorRadius", SOURCE)
+        self.assertIn('{ "stopThreats", s != null ? s.StopThreats : null }', SOURCE)
+        self.assertIn('if (payload != null && payload.ContainsKey("threats")) '
+                      "s.StopThreats = payload[" + chr(34) + "threats" + chr(34) + "];",
+                      SOURCE)
+
+    def test_every_stop_carries_a_category_and_the_whole_classified_list(self):
+        self.assertIn("return ThreatHit(s, p, category, reason, pawns, colonists);", SOURCE)
+        hit = SOURCE[SOURCE.index("private static Hit ThreatHit("):
+                     SOURCE.index("/// \"8 cells from Finn\"")]
+        for field in ('{ "category", category }', '{ "reason", reason }',
+                      '{ "threats", ThreatRows(s, pawns, colonists) }',
+                      '{ "thingId", BridgeCommon.SafeString(() => p.GetUniqueLoadID()) }'):
+            self.assertIn(field, hit)
+        rows = SOURCE[SOURCE.index("private static List<object> ThreatRows("):
+                      SOURCE.index("private static Hit ThreatHit(")]
+        # Non-stopping predators are in the list too: "why did it stop for that
+        # one and not this one" is the operator's actual question.
+        self.assertIn("if (category == null) continue;", rows)
+        self.assertIn('{ "stops", stops && !acked }', rows)
+        self.assertIn('{ "acknowledged", acked }', rows)
+        self.assertIn("if (rows.Count >= 40) break;", rows)
+
+    def test_ignore_predator_can_never_wave_through_a_raid(self):
+        body = SOURCE[SOURCE.index("private static bool Acknowledged("):
+                      SOURCE.index("/// Every classified non-colonist")]
+        # --ignore-hostile still covers everything, as PLAYBOOK promises.
+        self.assertIn("if (s.IgnoredHostiles.Contains(p.thingIDNumber)) return true;", body)
+        # --ignore-predator covers a hunt on one of ours and nothing else.
+        self.assertIn('if (category != "predator_hunting_ours") return false;', body)
+        self.assertIn("return s.IgnorePredatorsAll || s.IgnoredPredators.Contains", body)
+        self.assertIn('IgnorePredatorsAll = Csv(ignoredPredators).Contains("all")', SOURCE)
+        self.assertIn("IgnoredPredators = PawnIds(ignoredPredators)", SOURCE)
+        self.assertIn('string ignoredPredatorIds = ""', SOURCE)
+
+    def test_the_guard_never_asks_who_the_player_is_the_pausing_way(self):
+        """`Faction.OfPlayer` is `get_OfPlayerSilentFail` followed by
+        `Log.Error`, whose call path contains `TickManager.Pause()`. A guard
+        whose job is noticing pauses must not be able to cause one."""
+        import re
+        code = "\n".join(
+            line for line in SOURCE[SOURCE.index("internal static class Supervisor"):].splitlines()
+            if not line.strip().startswith("//"))
+        self.assertIsNone(re.search(r"Faction\.OfPlayer(?!SilentFail)", code))
+        self.assertIn("return Faction.OfPlayerSilentFail;", code)
 
     def test_short_and_persistent_guards_refuse_to_compete(self):
         play = (Path(__file__).parent.parent / "src" / "PlayUntilEventTool.cs").read_text(encoding="utf-8")

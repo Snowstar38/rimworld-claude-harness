@@ -52,6 +52,22 @@ the label RimWorld draws over the pawn. That is not a leak of the split.
   `python pawns.py --health` is the one bridge call that says who has which
   condition, and `verify.py` says so under any lead that makes the same join.
 
+## Creature claims are grounded before they are printed
+
+The prompt allows a named thing only where the screen carries its own label;
+anything read off shape or colour comes back as `unverified: ...`. On top of
+that, every LEAD or WEIRD line that claims a creature is checked here against
+the `home/list_pawns` payload `verify.survey()` already holds -- no extra bridge
+call, so the pass costs the same -- and gets one line under it when the data
+does not carry it: a species no pawn on the map has, an insect with no
+insectoid anywhere, or "beside" a colonist when the nearest animal is 70 cells
+away. **The lead is never deleted**; it is printed with what the data says
+under it, and the block ends with how many claims the payload matched.
+
+This is the one claim worth the extra rule: shape and colour resolve into an
+animal far more readily than an animal is actually there, and a named one reads
+as a sighting rather than as a guess.
+
 ## About one false lead per run is the deal, not a defect
 
 Do not filter them out: the lead that never fires is the lead you stopped
@@ -79,6 +95,7 @@ every failure -- no bridge, no game, Luna timing out, Codex missing -- is
 written into `state\\lookout-latest.txt` in the same shape as a success.
 """
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -169,6 +186,9 @@ PROMPT = (
     "in it is ever a lead. "
     "Letters and notices may be hours old: their wording is historical, not proof "
     "of a current attack. Distinguish visible evidence from inference. "
+    "Name a creature, building or item only when its own on-screen label says so; "
+    "anything you are inferring from shape, colour or silhouette goes as "
+    "'unverified: <what you actually see>', never as a named thing. "
     "Never call a pawn collapsed, downed or unconscious: lying, kneeling and "
     "crawling are ordinary work postures and only a health read tells them "
     "apart -- describe the posture and say it is a posture. "
@@ -459,6 +479,140 @@ def add_verdicts(body, thread, box, no_verify, who="luna"):
                       "are %s's, unchecked." % (type(e).__name__, str(e)[:100], who)
 
 
+# ---------------------------------------------------------- grounding leads
+#
+# A creature is the Lookout's worst channel: shape and colour resolve into an
+# animal on screen far more readily than an animal is actually there, and a
+# named one ("a large animal indoors beside Octave") reads as a sighting. So
+# every creature claim is checked against the pawn payload verify.survey()
+# already holds -- no extra bridge call -- and anything the payload does not
+# carry gets one line saying so. Nothing is ever deleted: the lead stands, with
+# what the data says under it.
+
+CREATURE_WORDS = ("animal", "creature", "beast", "wildlife", "insect", "bug",
+                  "spider", "critter", "livestock", "herd", "predator",
+                  "vermin", "rodent")
+
+# "beside", not "on the map": the claim these check is proximity.
+NEAR_WORDS = ("beside", "next to", "nearby", "near ", "among", "amongst",
+              "indoors", "inside", "in the room", "close to", "adjacent",
+              "standing over", "at the door")
+NEAR_CELLS = 10
+
+INSECT_WORDS = ("insect", "bug", "spider", "hive", "megaspider", "megascarab",
+                "spelopede")
+INSECT_DEFS = ("megaspider", "megascarab", "spelopede", "insect")
+
+# The species a lead has an on-screen label for. A word from this list that no
+# pawn on the map carries is a named animal that is not there.
+SPECIES = ("bear", "grizzly", "wolf", "warg", "cougar", "panther", "lynx",
+           "boar", "muffalo", "alpaca", "dromedary", "camel", "elephant",
+           "rhinoceros", "deer", "elk", "caribou", "ibex", "gazelle", "hare",
+           "squirrel", "rat", "boomrat", "boomalope", "tortoise", "cassowary",
+           "emu", "ostrich", "chicken", "cow", "pig", "horse", "donkey",
+           "goat", "sheep", "yak", "thrumbo", "cobra", "fox", "monkey",
+           "chinchilla", "capybara", "megaspider", "megascarab", "spelopede")
+
+PAWNS_TOOL = "home/list_pawns"
+
+
+def _is_animal(p):
+    """The row's own flag, or 'not a person' when the DLL predates it."""
+    if "animal" in p:
+        return bool(p["animal"])
+    return not (p.get("humanlike") or p.get("isColonist"))
+
+
+def _pawn_words(p):
+    return " ".join(str(p.get(k) or "")
+                    for k in ("name", "defName", "kindDef")).lower()
+
+
+def _kinds(beasts, cap=4):
+    seen = []
+    for p in beasts:
+        k = p.get("defName") or p.get("kindDef") or "?"
+        if k not in seen:
+            seen.append(k)
+    return ", ".join(seen[:cap]) + (" +%d" % (len(seen) - cap)
+                                    if len(seen) > cap else "")
+
+
+def ground_lead(lead, pawns):
+    """One `unverified` line for a creature claim the payload does not carry.
+
+    -> None when the lead makes no creature claim, or when the data supports it.
+    """
+    low = lead.lower()
+    if not any(w in low for w in CREATURE_WORDS + SPECIES):
+        return None
+    beasts = [p for p in (pawns or [])
+              if not p.get("dead") and not p.get("isColonist") and _is_animal(p)]
+    if not beasts:
+        return ("    -> unverified: %s carries no animal on this map at all, so "
+                "nothing on screen is one." % PAWNS_TOOL)
+    pool = " | ".join(_pawn_words(p) for p in beasts)
+    named = [s for s in SPECIES
+             if re.search(r"\b%s\b" % re.escape(s), low) and s not in pool]
+    if named:
+        return ("    -> unverified: this names %s; %s has no such pawn -- the "
+                "%d animal(s) on the map are %s. Do not name it on air."
+                % (", ".join(named), PAWNS_TOOL, len(beasts), _kinds(beasts)))
+    if any(w in low for w in INSECT_WORDS) and not any(
+            any(i in _pawn_words(p) for i in INSECT_DEFS) for p in beasts):
+        return ("    -> unverified: not one insect in %s -- the %d animal(s) on "
+                "the map are %s." % (PAWNS_TOOL, len(beasts), _kinds(beasts)))
+    if any(w in low for w in NEAR_WORDS):
+        dists = [p for p in beasts
+                 if p.get("nearestColonistDistance") is not None]
+        if dists:
+            closest = min(dists, key=lambda p: p["nearestColonistDistance"])
+            d = closest["nearestColonistDistance"]
+            if d > NEAR_CELLS:
+                return ("    -> unverified: the nearest animal to any colonist "
+                        "is %s, %d cells away (%s). Nothing is beside anyone."
+                        % (closest.get("defName") or closest.get("name") or "?",
+                           d, closest.get("nearestColonist") or "?"))
+    return None
+
+
+def ground_creatures(body, pawns):
+    """`body` with an `unverified` line under every ungrounded creature claim.
+
+    Costs no bridge call: `pawns` is the payload verify.survey() already read.
+    With no payload the leads are untouched and one line says they are unchecked.
+    """
+    if not body:
+        return body
+    out, claims, grounded = [], 0, 0
+    for raw in body.splitlines():
+        out.append(raw)
+        up = raw.strip().upper()
+        if not (up.startswith("LEAD:") or up.startswith("WEIRD:")):
+            continue
+        lead = raw.split(":", 1)[1].strip()
+        if not lead or "nothing unusual" in lead.lower():
+            continue
+        if not any(w in lead.lower() for w in CREATURE_WORDS + SPECIES):
+            continue
+        claims += 1
+        if pawns is None:
+            continue
+        note = ground_lead(lead, pawns)
+        if note:
+            out.append(note)
+        else:
+            grounded += 1
+    if claims and pawns is None:
+        out.append("grounding: no %s payload this pass, so the %d creature "
+                   "claim(s) above are unchecked." % (PAWNS_TOOL, claims))
+    elif claims:
+        out.append("grounding: %d of %d creature claim(s) match a pawn in %s; "
+                   "the rest are marked unverified above."
+                   % (grounded, claims, PAWNS_TOOL))
+    return "\n".join(out)
+
+
 def frame_block(label, text):
     """One frame's leads under a header. -> (block, raw_problem_note or '').
 
@@ -602,6 +756,9 @@ def main():
     if raw:
         tail = "\n" + "\n".join(raw) + tail
     body = add_verdicts(body, survey_thread, box, no_verify, who)
+    # The survey is joined by add_verdicts, so its pawn payload is in hand and
+    # this costs no bridge call.
+    body = ground_creatures(body, (box.get("s") or {}).get("pawns"))
     record("%s\n%s\n%s%s" % (head, LEAD_RULES % who, body, tail), out)
     return 0
 

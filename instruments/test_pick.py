@@ -167,5 +167,164 @@ class DesignatorTests(unittest.TestCase):
         self.assertIn("cleared an armed placement designator (wall)", out.getvalue())
 
 
+def pawn_sel(*ids):
+    return {"success": True, "hasSelection": bool(ids), "selectedCount": len(ids),
+            "selectedObjects": [{"id": i, "kind": "pawn", "label": i}
+                                for i in ids]}
+
+
+class PawnIdResolutionTests(unittest.TestCase):
+    """Live 2026-09-08: every pawn resolved with `thingId` None, so the click
+    check compared against a blank -- "expected Ernst [None]". The envelope of
+    `get_map_target_info` always names the id; `DescribePawn` never does."""
+
+    ENVELOPE = {"success": True, "kind": "pawn", "label": "Ernst",
+                "thingId": "Thing_Human618", "pawnId": "Thing_Human618",
+                "position": {"x": 138, "z": 110},
+                "target": {"pawnId": "Thing_Human618", "name": "Ernst",
+                           "label": "Ernst", "className": "Verse.Pawn",
+                           "defName": "Human", "spawned": True,
+                           "position": {"x": 138, "z": 110}}}
+
+    def test_a_resolved_pawn_carries_an_id_the_check_can_use(self):
+        with mock.patch.object(pick.rim, "game", return_value=self.ENVELOPE):
+            target = pick.resolve("Thing_Human618")
+        self.assertEqual("Thing_Human618", target["thingId"])
+        self.assertEqual("Thing_Human618", target["pawnId"])
+        self.assertEqual("pawn", target["kind"])
+        self.assertTrue(pick.is_pawn(target))
+
+    def test_a_thing_is_still_a_thing(self):
+        envelope = {"success": True, "kind": "thing", "thingId": "Shelf99",
+                    "pawnId": None,
+                    "target": {"thingId": "Shelf99", "label": "shelf",
+                               "className": "Verse.Building"}}
+        with mock.patch.object(pick.rim, "game", return_value=envelope):
+            target = pick.resolve("Shelf99")
+        self.assertEqual("Shelf99", target["thingId"])
+        self.assertFalse(pick.is_pawn(target))
+
+    def test_a_pawn_is_resolvable_by_name_not_only_by_id(self):
+        """`get_map_target_info {thingId:"Ernst"}` matches nothing; the same
+        tool takes pawnName, which is how a person says it."""
+        seen = []
+
+        def game(tool, args=None, **kw):
+            seen.append(args)
+            if args.get("pawnName") == "Ernst":
+                return self.ENVELOPE
+            return {"success": False, "message": "Could not find thing id"}
+
+        with mock.patch.object(pick.rim, "game", side_effect=game):
+            target = pick.resolve_pawn("Ernst")
+        self.assertEqual("Thing_Human618", target["thingId"])
+        self.assertIn({"pawnId": "Ernst"}, seen)      # id first, name second
+        self.assertIn({"pawnName": "Ernst"}, seen)
+
+    def test_a_name_that_is_nobody_resolves_to_nothing(self):
+        with mock.patch.object(pick.rim, "game",
+                               return_value={"success": False}):
+            self.assertIsNone(pick.resolve_pawn("Nobody"))
+            self.assertIsNone(pick.resolve_pawn(""))
+
+
+class SelectPawnTests(unittest.TestCase):
+    """Turns 1-14 of 2026-09-08: Samantha stood on Ernst's tile and every read
+    of his gizmo bar came back hers. A cell click cannot separate two pawns."""
+
+    def _run(self, selected="Thing_Human618", refuse=False, reply_extra=None):
+        calls = []
+
+        def game(tool, args=None, **kw):
+            calls.append((tool, args))
+            if tool == "rimworld/get_designator_state":
+                return {"success": True, "designatorState": {"hasSelection": False}}
+            if tool == "rimworld/get_selection_semantics":
+                if selected is None:
+                    return "Tool not found"
+                return pawn_sel(selected)
+            if tool == "rimworld/select_pawn":
+                if refuse:
+                    return {"success": False,
+                            "message": "No player-controlled colonist matches"}
+                out = {"success": True, "selectedCount": 1}
+                out.update(reply_extra or {})
+                return out
+            return {"success": True}
+
+        out = io.StringIO()
+        error = None
+        sel = None
+        with mock.patch.object(pick.rim, "game", side_effect=game), \
+             mock.patch.object(pick.cam, "state", return_value=camera()), \
+             mock.patch.object(pick.time, "sleep"), \
+             mock.patch("sys.stdout", out):
+            try:
+                sel = pick.select_pawn("Thing_Human618", label="Ernst")
+            except pick.ClickMissed as e:
+                error = str(e)
+        return calls, error, out.getvalue(), sel
+
+    def test_a_pawn_is_selected_by_id_and_never_clicked(self):
+        calls, error, text, sel = self._run()
+        self.assertIsNone(error)
+        tools = [t for t, _ in calls]
+        self.assertIn("rimworld/select_pawn", tools)
+        self.assertNotIn("rimworld/click_cell", tools)
+        self.assertIn(("rimworld/select_pawn", {"pawnId": "Thing_Human618"}),
+                      calls)
+        self.assertIn("selected by id, no click", text)
+
+    def test_the_neighbour_on_the_tile_is_refused_not_returned(self):
+        calls, error, text, sel = self._run(selected="Thing_Human702")
+        self.assertIn("SELECT MISSED", error)
+        self.assertIn("Thing_Human702", error)
+        self.assertIn("Thing_Human618", error)
+        self.assertIn("not by a click", error)
+
+    def test_a_non_colonist_is_refused_naming_why(self):
+        calls, error, text, sel = self._run(refuse=True)
+        self.assertIn("SELECT REFUSED", error)
+        self.assertIn("PLAYER COLONISTS only", error)
+
+    def test_no_id_is_refused_before_any_call(self):
+        with mock.patch.object(pick.rim, "game") as game:
+            with self.assertRaises(pick.ClickMissed) as caught:
+                pick.select_pawn(None, label="Ernst")
+        game.assert_not_called()
+        self.assertIn("pawnId", str(caught.exception))
+
+    def test_an_unreadable_selection_falls_back_to_select_pawns_own_read(self):
+        calls, error, text, sel = self._run(
+            selected=None,
+            reply_extra={"selected": {"pawnId": "Thing_Human618",
+                                      "name": "Ernst"}})
+        self.assertIsNone(error)
+        self.assertIn("select_pawn's own", text)
+        self.assertTrue(pick.holds(sel, "Thing_Human618"))
+
+    def test_select_thing_hands_a_pawn_straight_over(self):
+        calls = []
+
+        def game(tool, args=None, **kw):
+            calls.append((tool, args))
+            if tool == "rimworld/get_designator_state":
+                return {"success": True, "designatorState": {"hasSelection": False}}
+            if tool == "rimworld/get_selection_semantics":
+                return pawn_sel("Thing_Human618")
+            return {"success": True}
+
+        out = io.StringIO()
+        with mock.patch.object(pick.rim, "game", side_effect=game), \
+             mock.patch.object(pick.cam, "state", return_value=camera()), \
+             mock.patch.object(pick.time, "sleep"), \
+             mock.patch("sys.stdout", out):
+            pick.select_thing("Thing_Human618", 138, 110, label="Ernst",
+                              kind="pawn")
+        tools = [t for t, _ in calls]
+        self.assertIn("rimworld/select_pawn", tools)
+        self.assertNotIn("rimworld/click_cell", tools)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,8 +1,14 @@
 # HomeBridge.BridgeTools — build, install, load test, payload shapes
 
-A RimBridgeServer **companion DLL**. Twenty `home/` tools on the live bridge
+A RimBridgeServer **companion DLL**. Twenty-four `home/` tools on the live bridge
 surface, one DLL, no RimWorld mod. This file is the reference you build and
 install from; the source under `src\` is ground truth for every payload.
+
+The count was 22 until 2026-09-08, when `home/grid` and `home/starting_pawns`
+were added; count `[Tool(` in `src\` rather than trusting a number written down.
+The table below still lists 22 of them — `home/supervised_play` has its own
+section under **Payload shapes**, and `home/starting_pawns` (the new-colony
+starting pawns, read-only) has no section yet.
 
 ## What is here
 
@@ -22,13 +28,14 @@ install from; the source under `src\` is ground truth for every payload.
 | `home/list_zones` | Read-only zone census. Reports the zone's own cell count **and** what the zone grid assigns it, naming every cell where they disagree. Stockpile occupancy; growing-zone plant counts over both cell sets. `filter: true` adds each stockpile's storage filter. |
 | `home/zone_cells` | The zone write tool. `op` = `add` / `remove` / `create` / `delete` / `repair` / `filter` / `crop`, with a before/after summary and a per-cell verdict. `filter` sets a stockpile's storage filter from a preset and allow/disallow lists; `create` takes the same keys. `crop` sets a growing zone's plant with `plant` (a ThingDef defName or label) and reads the crop back off the private `plantDefToGrow` field, never the property whose getter writes. |
 | `home/place_building` | Placement check and placement, all four rotations by default. The game's own refusal reason, the occupied cells, what would be wiped, cooler/vent side temperatures. |
-| `home/pawn_config` | The write side of `list_pawns`: work priorities, schedule, medical care, hostility response, self-tend, follow toggles, allowed area, master, `nickname` (rename a colonist or a tamed animal), `drop` (one worn, wielded or packed item onto the pawn's cell, immediate even while paused), and on an animal training, slaughter and release to wild. `after` is read back from the game. |
+| `home/pawn_config` | The write side of `list_pawns`: work priorities, schedule, medical care, hostility response, self-tend, follow toggles, allowed area, master, `nickname` (rename a colonist or a tamed animal), `drop` (one worn, wielded or packed item onto the pawn's cell, immediate even while paused), and on an animal training, slaughter, release to wild, and — for a **wild** one — hunt and tame. `after` is read back from the game. |
 | `home/building_config` | The write side of `list_buildings`: forbidden, power, medical bed, prisoner bed, bed owner, plus the thing's gizmo bar as a read. `after` is read back from the game. |
 | `home/bills` | Worktable bills in one call: every bench's queue, each bill's configuration, and per ingredient how much is needed against how much is on the map, so a bill that cannot run says why. `action` = `list` / `recipes` / `add` / `set` / `delete` / `move`. |
 | `home/trade` | A whole trade with no dialog: `action` = `list_traders` / `open` / `sheet` / `set` / `preview` / `accept` / `cancel` / `close_dialog` / `status`. Counts are signed — positive = the colony buys. |
 | `home/dialog_text` | Type into the dialog that is on screen. Lists the top-most window's string fields, sets one, and optionally presses accept. Real keyboard input does not reach this game, so this is the only way to answer a name prompt. |
 | `home/research` | Research in one call: the current project (null IS the `Need research project` alert), every startable project, the benches and whether one is powered, the colonists with Research on and their Intellectual level. Opt-in `locked` (with what blocks each), `finished`, `unlocks`, `filter`. `set: "<name>"` chooses a project, dry run by default, `after` read back from the game. |
-| `home/order` | The order tool: vanilla pawn orders issued **as jobs**, with the float menu never opened. `action` = `resolve` / `draft` / `undraft` / `attack` / `goto` / `equip` / `rescue` / `tend` / `haul` / `work`. Pawn and target take five id forms each, so an explicit id can never be "ambiguous"; hostility is never a precondition; `dryRun` is the oracle for "can this pawn attack that thing". Every job shape is decompiled vanilla, and `job.verified` is `Pawn.CurJob` read back. |
+| `home/order` | The order tool: vanilla pawn orders issued **as jobs**, with the float menu never opened. `action` = `resolve` / `draft` / `undraft` / `attack` / `goto` / `equip` / `rescue` / `tend` / `haul` / `work` / `rest` / `deploy`. Pawn and target take five id forms each, so an explicit id can never be "ambiguous"; hostility is never a precondition; `dryRun` is the oracle for "can this pawn attack that thing" and for "can this pawn deploy onto that cell". Every job shape is decompiled vanilla, and `job.verified` is `Pawn.CurJob` read back. |
+| `home/grid` | A labelled coordinate grid drawn over the play area **inside the game**, so the capture carries it and a viewer can say "104,127". `enabled` / `step` / `labels` / `alpha` / `color`, dry run by default; no arguments at all is a read. The drawing is a Harmony **Prefix** on `MapInterface.MapInterfaceOnGUI_BeforeMainTabs`, installed on the first call, so the grid sits over the terrain and under every piece of UI; off, the hook is one flag read and a return. `render{}` reports what the last frame actually drew — the spacing thins with zoom rather than drawing thousands of lines. The label loops test strictly `<` the clamped far edge, because `x1`/`z1` is a boundary and not a cell: on a 250-wide map a label at 250 would name a cell no tool accepts. The line loops stay inclusive — a line at 250 is the correct east wall of cell 249. |
 
 ```
 C:\Home\rimworld\companion\
@@ -57,6 +64,7 @@ C:\Home\rimworld\companion\
 │   ├── BillsTool.cs                    home/bills
 │   ├── ResearchTool.cs                 home/research
 │   ├── OrderTool.cs                    home/order
+│   ├── GridOverlayTool.cs              home/grid + the per-frame draw hook
 │   └── TradeTool.cs                    home/trade
 ├── tests\
 │   ├── contract_test.py                every tool's promised keys, offline + live
@@ -110,7 +118,9 @@ reference is `<Private>false</Private>` for that reason; a local SDK copy in the
 bundle folder is what produces the `capability.sdk_mismatch` / "local SDK copy"
 warnings in `rimbridge/get_bridge_status`. The check is one line: after a build
 the output folder must hold **exactly one file**, our DLL. The current build is
-**1,047,552 bytes** (Release, 2026-09-07, SHA-256 `c15e946b…`), and its references are `mscorlib`, `System`, `System.Core`,
+**1,169,920 bytes** (Release, 2026-09-13 11:44, SHA-256
+`18e4711534728be0ae2a0d7cbed14b96fcd09dbac878f885f356a86a8bc75b4f` — the
+supervised-play stop-behavior build, verified live 2026-09-14), and its references are `mscorlib`, `System`, `System.Core`,
 `RimBridgeServer.Sdk 2.1.1.0`, `Assembly-CSharp 1.6.9676.17735` and
 `UnityEngine.CoreModule` — all resolved by the host, none copied.
 
@@ -142,7 +152,16 @@ so a bad build is one copy away from being undone. The four most recent are
 `HomeBridge.BridgeTools.dll.pre-phase3` (435,712 bytes) and
 `HomeBridge.BridgeTools.dll.pre-phase4` (545,280 bytes) — the builds that
 preceded the 779,776-byte phase-4 build; `installed-backup-20260904\HomeBridge.BridgeTools.dll.pre-combat-review` (882,176 bytes, Debug) and
-`installed-backup-20260904\HomeBridge.BridgeTools.dll.pre-nickname` (840,704 bytes) preceded the current 860,672-byte one, all installed with the game closed.
+`installed-backup-20260904\HomeBridge.BridgeTools.dll.pre-nickname` (840,704 bytes) preceded the 860,672-byte one;
+`installed-backup-bugpass-20260912\HomeBridge.BridgeTools.dll.pre-bugpass-20260912`
+(1,167,360 bytes, SHA-256 `6ad4dd10…`) preceded the 1,169,920-byte Sep 12 one;
+`installed-backup-20260913\` holds that build as `.pre-equipverify` (1,169,920)
+and the equip-verification build as `.pre-startingpawns-error` (1,169,408 — the
+starting_pawns error-key fix landed the same day), plus the equip/starting_pawns
+build again as `.pre-supervisedplay-fixes` (1,169,408, sha `1124ee52…`) from the
+Sep 13 11:30 install that was rolled back; `installed-backup-20260914\` holds
+that same verified build as `.pre-stopbehavior`, replaced when the stop-behavior
+build shipped after its live verification. All installed with the game closed.
 
 This is the SDK's documented "standalone global tool" layout
 (`upstream\skills\rimbridge-companion-tools\references\companion-dll-guide.md`).
@@ -177,10 +196,12 @@ connect, then:
 
 1. **`rimbridge/get_bridge_status`.** Expect a record for
    `…\BridgeTools\HomeBridge\HomeBridge.BridgeTools.dll` with
-   `status: "registered"`, `toolClassCount: 20`, **`toolCount: 20`**,
+   `status: "registered"`, `toolClassCount: 24`, **`toolCount: 24`**,
    `errors: []`, `warnings: []`, `localSdkPaths: []`, and
    `referencedSdkVersion 2.1.1.0 == hostSdkVersion 2.1.1.0`. A `toolCount` below
-   20 means the current DLL was never copied into the game.
+   24 means the current DLL was never copied into the game. That is what the
+   2026-09-12 install read back: `registered`, `ToolCount: 24`, no errors, no
+   warnings, `LocalSdkPaths: []`.
 2. **`home/ping`.** Expect `success: true`, `pong: "pong"`,
    `sdkVersion: "2.1.1.0"`, and **`onMainThread: false`** — false is the
    *expected* answer, see the main-thread note below.
@@ -329,7 +350,7 @@ and fails intermittently and unreproducibly at runtime, the worst failure mode
 available; `home/ping` returning `onMainThread: false` is what confirms the
 dispatch model is still what this assumes.
 
-### `unknownArguments[]` — on every reply of all twenty tools
+### `unknownArguments[]` — on every reply of all twenty-four tools
 
 The SDK binder (`AnnotatedExtensionCapabilityProvider.BindArguments`) hands a
 tool method only the parameters it declares, by name, and **drops every other key
@@ -354,9 +375,30 @@ fails the reply carries **`unknownArgumentsWarning`** and the empty
 `unknownArguments` means "not known", never "nothing unknown". That branch has not
 fired live.
 
+### Debug actions through the bridge
+
+`rimworld/execute_debug_action` is the host's tool, not one of ours, but two of
+its behaviours are worth writing down because nothing in the reply says them.
+
+**An incident's target is always the current map.**
+`Verse.DebugActionsIncidents.GetTarget()` returns a world object only when the
+World view is up — `WorldRendererUtility.WorldSelected` gives the selected world
+object, else `Find.World` — and otherwise returns `Find.CurrentMap`. The bridge
+never puts the World view up, so every incident fired through it targets the map.
+World-tagged incidents — `SolarFlare`, `Eclipse`, `Aurora`, `GiveQuest_Random` —
+therefore log `Incident target is null or not allowed.` and the node's own label
+ends `[NO]`, **while the bridge still answers `success: true`**: the call reached
+the action, and the action declined. The routes that do work from a map are
+`Actions\Add Game Condition...\<name>\<duration>` for a game condition and
+`Actions\Generate quest...\*Natural random` for a quest.
+
+**`Prefs.DevMode` is never checked** by `ExecuteDebugActionResponse`
+(`upstream\Source\RimWorldDebugActions.cs`). The dev-mode toggle gates the
+in-game menu, not this path, so a debug action runs with dev mode off.
+
 ## Payload shapes
 
-**What holds for all twenty.** Every reply carries `success`, `tool`,
+**What holds for all twenty-four.** Every reply carries `success`, `tool`,
 `unknownArguments[]` and, conditionally, `unknownArgumentsWarning`; those are not
 repeated below. `success: false` means a *tool* failure — "no game is loaded",
 "the trader refused", "a raider is standing there" are answers and come back
@@ -397,6 +439,15 @@ screen. Which menu each tool picks is stated in its section below.
 `Selector.Select` `Log.Error`s on a null, destroyed, unspawned or world pawn, so
 every target is pre-checked before it is selected.
 
+**One stock-tool shape is stated here, because reading it wrong cost fourteen
+turns.** `rimworld/get_map_target_info`'s **envelope** carries `kind`
+(`"pawn"` / `"thing"`), `thingId`, `pawnId`, `position` and `cellRect`. The
+nested `target` is `RimWorldState.DescribePawn` for a pawn and `DescribeThing`
+for a thing — and **`DescribePawn` names the id `pawnId` and carries no
+`thingId` at all**, so a caller that reads `target["thingId"]` gets `None` for
+every pawn, and every id check against it fails. `pick.resolve()` copies the
+envelope's ids onto the target for exactly this reason.
+
 ### `home/ping`
 
 Optional `label`. Returns `pong`, `companion`, `companionVersion`, `sdkVersion`,
@@ -423,13 +474,14 @@ answered with an empty list: `success: false`, `error` naming the pair,
 narrowed list can be checked against an unnarrowed one field for field.
 
 Top level: `pawnCount`, `pawnsListed`, `pawnsFiltered`, `spawnedPawnTotal`,
-`colonistCount`, `hostileCount`,
+`colonistCount`, `ghoulCount`, `hostileCount`, `ticksGame`,
 `animalCount`, `tameAnimalCount`, `skippedByDistance`, `filters{}`, `notes{}`,
 `pawns[]`, plus
 `unarmedColonists[]` with `equipment:true` and `pawnConfigOptions{}` with
-`settings:true`. A pawn row: `name`, `defName`, `kindDef`, `position`, `faction`,
+`settings:true`. A pawn row: `name`, `thingId`, `defName`, `kindDef`, `position`, `faction`,
 `hostile`, `hostileReason`, `animal`, `humanlike`, `mechanoid`, `tame`, `wild`,
-`isFreeColonist`, `isPrisoner`, `downed`, `drafted`, `job`,
+`isColonist`, `ghoul`, `playerFaction`, `isFreeColonist`, `isPrisoner`,
+`downed`, `drafted`, `job`,
 `mentalState`, `predator`, `manhunterOnDamageChance`, distance to the nearest
 colonist, and the blocks asked for.
 
@@ -445,6 +497,40 @@ fifteen cells from a colonist unreported on 2026-09-04. Beside it,
 what makes shooting a predator a combat decision and not a hunting one. It is the
 **raw race field** — RimWorld's own stat line routes through
 `PawnUtility.GetManhunterOnDamageChance`, which applies modifiers this does not.
+
+**`ghoul` and `playerFaction`, and why `isColonist` is not "one of ours".**
+`Verse.Pawn.IsColonist` is `Faction != null && Faction.IsPlayer &&
+RaceProps.Humanlike && (!IsSlave || guest.SlaveIsSecure) && !IsSubhuman`, and
+`IsSubhuman` is `IsMutant && mutant.Def.consideredSubhuman`, which a ghoul's
+MutantDef sets. So Anomaly's colony ghoul is humanlike, of the player faction,
+standing in your colony — and `isColonist: false`. This tool never dropped one;
+every caller did, by reading `isColonist` as "ours". The colony's ghoul Ben
+Cooper was in Threadneedle for its whole run and never once in `pawns.py
+--roster`. Read **`isColonist || (ghoul && playerFaction)`** for "one of ours".
+`playerFaction` is half of it on purpose: a ghoul raised against you by a ritual
+reports the same `ghoul: true`. `ghoul` is `Pawn.IsGhoul`, which tests
+`ModsConfig.AnomalyActive` before it touches `mutant.Def`, so it is false rather
+than throwing without Anomaly and reaches neither `Faction.OfPlayer` nor any
+`Log.Error` path. `ghoulCount` counts live player-faction ghouls and is **not**
+part of `colonistCount` — RimWorld does not count a ghoul as a colonist and
+neither does this number. `notes.ghoulIsNotAColonist` says all of this in the
+reply. `colonistsOnly` is unchanged and still means `Pawn.IsFreeColonist`.
+
+**`ticksGame`** is `Find.TickManager.TicksGame` read on the same main-thread hop
+as every row, so a caller printing "as of" prints this snapshot's own moment
+rather than a second bridge call's — the two-moments misread that turned 100
+cells into "8 from Longhoff" on 2026-09-07. `null` when no game is loaded.
+
+**`thingId` rides on every row, unasked.** `Verse.Thing.ThingID` —
+`Ibex404123` — the exact spelling `home/pawn_config`, `home/order`, `act.py`,
+`order.py` and `pick.py` take. It lived only inside `settings{}` and `animals{}`
+until 2026-09-11, so `list_pawns {wildOnly:true}` answered "which ibex" with a
+name five of them share and no address for any of them, and `act.py hunt <id>`
+had no id to be given. It is one short string per row, from the same
+`pawn.ThingID` call the two blocks make, so a row and a block can never
+disagree about how to address one pawn. Note that it is **not** the
+`GetUniqueLoadID()` form `home/status` prints: that one carries a `Thing_`
+prefix.
 
 `pawnsListed` is `pawns[]`'s length under the name that says what it counts and
 `pawnsFiltered` is `spawnedPawnTotal - pawnsListed`, counting every narrowing
@@ -498,7 +584,13 @@ counts keep their old meanings; `notes.whatEachCountCounts` spells that out.
   `milkFull`/`woolFull` (`activeAndFull`, the trustworthy one — `Active` is
   protected and unreadable), `pregnant`, `gestationProgress`.
 - **`work{}`, `schedule{}`, `settings{}`, `relations{}`** come from the same
-  reader `home/pawn_config` uses; keys are listed there.
+  reader `home/pawn_config` uses; keys are listed there. **`settings.thingId` is
+  `Pawn.ThingID`, with no `Thing_` prefix** — `Thing.GetUniqueLoadID()` is
+  literally `"Thing_" + ThingID`, so this id and `home/status`'s
+  `colonists[].thingId` are one prefix apart and a caller keying both has to
+  normalise. `combat.py` builds its roster from
+  `{humanlikeOnly|mechanoidsOnly, settings: true}` and depends on that, and on
+  the row bools `ghoul` / `playerFaction`.
 
 **Never-null is the contract** for all eight of `equipment`, `bio`, `thoughts`,
 `work`, `schedule`, `settings`, `relations`, `animals`: a block that does not
@@ -1026,11 +1118,34 @@ for". Top level: `status` (`game_loaded`/`no_map`/`no_game`), `time{}`,
   `selectedFirstLabel`, `modalOpen`, `modalWindow`, `windowsForcePause`,
   `anyWindowAbsorbingAllInput`, `nonImmediateDialogWindowOpen`, `windowCount`,
   `windows[]` (`type`, `layer`, `title`, `forcePause`,
-  `absorbInputAroundWindow`). `modalOpen` is the blocking-window check.
+  `absorbInputAroundWindow`), and **`targeter{}`**: `active`, `source`,
+  `caster`. `modalOpen` is the blocking-window check.
 - **`counts{}`**: `letterCount`, `letterChoiceCount`, `messageCount`,
   `alertCount`, `loudAlertCount`, `colonistCount`, `downedCount`,
   `hostileCount`, `huntingPredatorCount`, `wildPredatorsNearCount`,
   `downedNearCount`.
+
+**`ui.targeter` is the one piece of screen state a window diff cannot see.**
+A RimWorld targeter — the placement mode a `Command_VerbTarget` or
+`Command_Target` gizmo opens, e.g. `Deploy turret` on a worn turret pack — is
+**not a `Window`**, so `modalOpen`, `windows[]` and the bridge's own
+`click_ui_target` `changed` flag are all identical on both sides of the click
+that opened it. That is why `ui.py click` reported *"nothing opened or closed"*
+on a gizmo that had worked, for fourteen turns on 2026-09-08. `active` true
+means **the next map click is eaten as a target, not as a selection**. `source`
+is the gizmo/verb label (`verbProps.label` for a verb source; for a
+`Command_Target`, recovered from the gizmo that owns the targeter's
+`onUpdateAction` delegate, since that overload leaves `targetingSource` null).
+`caster` is a pawn `thingId` or null. **Hazards:** `Find.Targeter` is
+`((UIRoot_Play)UIRoot).mapUI.targeter`, a hard cast that throws outside a play
+UI root — it is read through `BridgeCommon.Try` and an unreadable one lands in
+`skipped[]` as `ui.targeter` rather than reporting `active:false`;
+`Targeter.caster` is private and is reached by reflection; `Command.LabelCap`
+is virtual, so the plain `defaultLabel` field is read first. **A targeter cannot
+be closed through the bridge's input tools** — `rimworld/press_cancel` is
+`WindowStack.Notify_PressedCancel()`, and a synthetic key or right-click never
+reaches `Targeter.ProcessInputEvents` (both confirmed dead live, 2026-09-11).
+`rimworld/clear_selection` does close it, through `ConfirmStillValid`.
 
 **`wildPredatorsNear[]` and `downedNear[]` exist because `hostiles[]` and
 `huntingPredators[]` structurally cannot hold them.** A wild wolf that has not
@@ -1218,6 +1333,81 @@ under a run, from an IL scan of every caller: `TimeControls.DoTimeControlsGUI`,
 quest / credits paths. **`TimeSlower` is not among them** — it changes
 `TickRateMultiplier`, not `curTimeSpeed`.
 
+### `home/supervised_play`
+
+The supervised-play guard — in this DLL, but not among the tools listed in the
+table at the top of this file. Every op answers with a status snapshot; only
+the fields this pass added are stated here.
+
+Two fields on the **status snapshot**:
+
+- **`predatorRadius`** — the guard's `PredatorNearCells`, currently `12`. The
+  Chebyshev radius inside which a conscious wild predator is a threat. Constant,
+  reported so the caller never has to guess it.
+- **`stopThreats`** — null until a threat stop; then the classified list,
+  exactly as the stop's `threats[]` below. It is the only way the classification
+  reaches a `start` refusal, because `start` answers with a snapshot and nothing
+  else.
+
+New **tool parameter**: `ignoredPredatorIds` (string, default `""`) —
+comma-separated stable IDs, or the literal `all`. Covers **only** the
+`predator_near` and `predator_hunting_ours` categories — its own parameter
+description said `predator_hunt`, which is the stop kind and not a category,
+until 2026-09-12; `ignoredHostileIds` still covers everything.
+
+A threat stop's ring row (`op: "events"`) and its `event` payload:
+
+```json
+{ "kind": "predator_near",
+  "detail": "wolverine [predator_near] wild predator within 12 cells of a colonist (8 cells from Finn)",
+  "event": {
+    "pawnId": 334862, "pawnName": "wolverine",
+    "thingId": "Thing_Wolverine334862",
+    "position": { "x": 118, "z": 131 },
+    "category": "predator_near",
+    "reason": "wild predator within 12 cells of a colonist (8 cells from Finn)",
+    "predatorRadius": 12,
+    "threats": [
+      { "pawnId": 334862, "thingId": "Thing_Wolverine334862", "name": "wolverine",
+        "defName": "Wolverine", "category": "predator_near",
+        "reason": "wild predator within 12 cells of a colonist (8 cells from Finn)",
+        "stops": true, "acknowledged": false, "downed": false,
+        "distanceToNearestColonist": 8 },
+      { "pawnId": 220114, "thingId": "Thing_Lynx220114", "name": "lynx",
+        "defName": "Lynx", "category": "predator",
+        "reason": "wild predator hunting wildlife, 34 cells from Finn; not a threat to the colony",
+        "stops": false, "acknowledged": false, "downed": false,
+        "distanceToNearestColonist": 34 }
+    ] } }
+```
+
+`threats[]` is **every classified non-colonist on the map**, capped at 40, not
+just the one that stopped the clock — including the `predator` rows that did
+not, because "why that wolverine and not this one" is the operator's actual
+question. `stops` is false on a row that is acknowledged
+(`acknowledged: true`). Stop kinds: `hostile` (covers `category: "hostile"` and
+`"manhunter"`), `predator_hunt` (`category: "predator_hunting_ours"`),
+`predator_near`. Categories, in test order: `manhunter`,
+`hostile_dormant`, `hostile`, `predator_hunting_ours`, `predator_near`,
+`predator`.
+
+**`hostile_dormant`** — a hostile whose current job is one of `LayDown`,
+`LayDownResting`, `Wait_Asleep`, `RevenantSleep`, `Wait_AsleepDormancy`,
+`ActivityDormant` **and** whose nearest colonist is more than
+`DormantHostileCells` (50) Chebyshev cells away. `stops: false`, reason
+`"asleep 76 cells away; wakes -> stops"`. Still a hostile and still in
+`threats[]`; it stops the clock on the first probe after its job changes or it
+walks inside 50 cells. A manhunter is never dormant — the aggro test runs
+first and returns before the dormant branch. 50 is past every vanilla weapon's
+range (44.9), and it is the same number and the same JobDef set `combat.py end`
+uses — except the guard requires BOTH conditions where `end` accepts either.
+A **downed** hostile more than 50 cells out holds `LayDown` and therefore
+classifies here too; `hostiles_cleared` still names it to finish off or capture.
+
+`Faction.OfPlayer` is never read here either: the predator line and
+`CheckHostilesCleared` both go through `Faction.OfPlayerSilentFail`, because a
+guard whose job is noticing pauses must not be able to cause one.
+
 ### `home/list_zones`
 
 Read-only census of every zone in the map's `ZoneManager`. Parameters: `match`,
@@ -1349,8 +1539,9 @@ database is checked before the call, never after.
 
 Placement check and placement; `rotation` defaults to `all`, so all four are
 evaluated in one call. Parameters: `def` (defName preferred, or label; ThingDefs
-searched before TerrainDefs), `x`, `z`, `rotation`, `stuff`, `godMode` (evaluates
-as though god mode were on, which skips the map-edge check; does not enable it),
+searched before TerrainDefs), `x`, `z`, `cells` (batch: `"141,130;142,130"`),
+`rotation`, `stuff`, `godMode` (evaluates as though god mode were on, which skips
+the map-edge check; does not enable it),
 `dryRun`, `watch`, `watchSeconds`.
 
 Response: `dryRun`, `def`, `stuff`, `size`, `rotatable`, `researchFinished`,
@@ -1396,6 +1587,34 @@ vents.
   `Log.Error`, so neither is used on its logging path. Stuff defaults to
   `GenStuff.DefaultStuffFor`; one the def cannot use is reported as
   `stuff.allowedForThisDef: false`, never silently swapped.
+- **`cells` — a wall line is ONE call.** `cells="141,130;142,130;…"` (x/z, when
+  given, is the first cell; duplicates collapse; order asked is order placed; cap
+  **200**, needs ONE rotation, never `"all"`). Sending `cells` always returns a
+  `batch{}` block: `requested`, `rotation`, `cellsPerHop`, `hops`, `hopGapMs`,
+  `placed`, `alreadyPresent`, `refused`, `errors`, `accepted`, `placedIds[]`,
+  `firstRefusal` and `rows[]` — one row per cell, each the same rotation row a
+  single-cell call returns plus `x`, `z`, `outcome`
+  (placed/already_present/refused/error/preview), `placed{}`, `wiped[]`,
+  `framesCancelled[]`, `error`. A refused cell never stops the batch, so
+  top-level `outcome` gains **`partial`**; top-level `placed` is the FIRST
+  blueprint made, `wiped`/`framesCancelled` are the whole batch's, `rotations[]`
+  is the first cell's row, and `alreadyPlaced` is true only when every cell was
+  already there. Before: 64 cells = 64 calls × ~1.8 s, 1.5 s of it the watch
+  lead. After: ~2 s for the batch.
+- **The batch never holds the main thread.** Placements are chunked **8 cells per
+  `MainThread.InvokeAsync` hop** with **20 ms** released between hops, because a
+  long synchronous loop inside one hop stalls `Verse.Root.Update` — the game's
+  tick and the queue every other bridge call is pumped from — which is the
+  "a 64-cell build delays every event" complaint moved rather than fixed. Eight
+  `CanPlaceBlueprintAt` + `PlaceBlueprintForBuild` pairs is less work than one
+  frame of a player dragging a wall. Every cell goes through the same `PlaceOne`
+  a single placement uses, so the two cannot drift apart.
+- **Watch on a batch**: ONE session — the camera jumps to the midpoint of the
+  batch's bounding rect before anything is placed, the lead is waited once, and
+  the FIRST blueprint made is selected when the batch finishes.
+- **`materials` on a batch is costed for every requested cell**: `needed` is
+  per-cell × `materials.forCells`, with `rows[].perCellNeeded` beside it. Still
+  one pass over the map per call.
 
 **`materials{}` — can the colony actually build it.** "The game will accept this
 blueprint here" and "there is steel to finish it" are different questions, and
@@ -1411,6 +1630,7 @@ entry of `def.CostListAdjusted(stuff, errorOnNullStuff: false)`:
 | `reservedByOtherBlueprints` | the outstanding deficit of every **other** blueprint and frame on the map |
 | `available` | `onMap − forbidden − reservedByOtherBlueprints`, floored at 0 |
 | `shortfall` | `max(0, needed − available)` |
+| `perCellNeeded` | what ONE of them costs; `needed` is this × `materials.forCells` (1 unless the call sent `cells`) |
 
 Beside them: `canBuildNow` (every `shortfall` is 0) and `missing`, one line —
 `missing: 25 steel (have 15, 10 forbidden), 3 components (have 0)` — and the
@@ -1472,13 +1692,16 @@ prints — case-insensitive, a unique substring is enough — or the exact Thing
 from `settings.thingId`), `work` (`"Cooking=1,Hauling=3"`), `schedule` (24
 letters, hour 0 first), `medCare`, `hostilityResponse`, `selfTend`,
 `followDrafted`, `followFieldwork`, `allowedArea`, `master`, `training`,
-`slaughter`, `releaseToWild`, `drop`, `nickname`, `dryRun`, `watch`,
+`slaughter`, `releaseToWild`, `hunt`, `tame`, `drop`, `nickname`, `dryRun`, `watch`,
 `watchSeconds`.
 
 Response: `dryRun`, `applied`, `afterIsPredicted`,
 `pawn{name,thingId,isColonist,isAnimal}`, `fields[]` (`field`, `requested`,
 `before`, `after`, `changed`, `refused`, `reason`, optional `note`; a `drop` row
-adds `item{}`, `carried[]` and `droppedAt`), `fieldCount`,
+adds `item{}`, `carried[]` and `droppedAt`; a `slaughter`/`releaseToWild` row
+adds `alsoRemoved[]` naming the one opposite designation cleared, and a
+`hunt`/`tame` row the same key naming **every** designation cleared),
+`fieldCount`,
 `changed[]`, `changeCount`, `refused[]`, `refusedCount`,
 `before{work,schedule,settings,animals}`, `after{…}`, `options{allowedAreas,
 allowedAreaUnrestricted, medCare, hostilityResponse, scheduleKey}`, `notes{}`.
@@ -1531,11 +1754,13 @@ tab; `medCare`, `hostilityResponse` and `selfTend` select the pawn and open
 `followDrafted` and `followFieldwork` select the pawn and open
 `ITab_Pawn_Training`; `drop` selects the pawn and opens `ITab_Pawn_Gear`;
 `nickname` selects the pawn and opens `ITab_Pawn_Character` (`ITab_Pawn_Training`
-on an animal). When
+on an animal); `hunt` and `tame` select the animal and move the camera to it
+with **no** inspect tab, because a wild animal draws neither an Animals-tab row
+nor an `ITab_Pawn_Training`. When
 one call writes several fields the view covering the most of them wins, and
 `watch.note` says so.
 
-**Three animal fields**, same dryRun / before / after / refusal contract as the
+**Five animal fields**, same dryRun / before / after / refusal contract as the
 rest:
 
 - **`training`** — `"Obedience=on,Release=off"`, the `work` grammar. It calls
@@ -1555,6 +1780,28 @@ rest:
   `canReleaseToWild` is false. Setting one already set is a no-op row, never a
   second `AddDesignation`, which is a `Log.Error`. `AddDesignation` throws a
   visible puff of particles at the target, which is left in.
+- **`hunt`** / **`tame`** — `"on"`/`"off"`, the **wild** pair. What
+  `Designator_Hunt` / `Designator_Tame` do minus the sound, the mouse icon and
+  the warning toasts (`FinalizeDesignationSucceeded` throws "no hunters
+  available", "this kind goes manhunter", "no handler skilled enough";
+  `TameUtility.ShowDesignationWarnings` reads `Faction.OfPlayer`, so it is
+  skipped rather than caught). The designation hangs on the **animal**, not on
+  a cell, so a caller that read the animal a tick ago still hits it after it
+  has walked. **Both designators call
+  `DesignationManager.RemoveAllDesignationsOn(t)` before adding**, so turning
+  either ON clears **every** designation standing on that animal — not one
+  named opposite the way slaughter/releaseToWild do — and `alsoRemoved[]`
+  names each defName it took, on a dry run as well. `hunt` and `tame` both
+  `"on"` in one call is **refused** for both, because the second would erase
+  the first. Gates, run one at a time so a refusal says which closed: `hunt`
+  needs `Pawn.AnimalOrWildMan()`, `!IsPrisonerInPrisonCell()` and
+  `Faction == null || !Faction.def.humanlikeFaction`; `tame` needs the same
+  faction test plus `GetStatValue(StatDefOf.Wildness) < 1f` and whatever else
+  `TameUtility.CanTame` wants (not a dryad, no Scaria). A dead animal is
+  refused. An animal of **ours** is refused with the sentence "the write you
+  want is slaughter" — our animals are slaughtered, never hunted, so the two
+  pairs cannot collide on one pawn. Setting one already set is a no-op row,
+  never a second `AddDesignation`, which is a `Log.Error`.
 
 **`drop`** — one item off the pawn, named by a case-insensitive substring of
 its label or by its exact ThingID. The row's `before` is the slot it was in
@@ -1791,9 +2038,49 @@ An **`ingredients[]`** row: `summary`, `label`, `needed`, `available` (the best
 `filterAllowsAny`, `excludedByFilter`, `excludedForbidden`,
 `excludedOutOfRadius`, `isFixedIngredient`, `mixingAllowed`, `wholeStacks`. The
 radius is measured from the bill giver's own position, and 999 means unlimited.
-The scan is **optimistic by construction** — it does not model reachability,
-reservations or a pawn's own forbid rules — and `notes.ingredientScan` says so,
-because a scan that guessed at those would be wrong quietly.
+The scan subtracts stacks with no route from the bench's interaction cell
+(`excludedUnreachable`, no door bashing), tallies
+reserved stacks without subtracting them (`excludedReserved` — the claimant is
+usually fetching it for this bill), and reports `reachabilityChecked` /
+`reservationChecked` per ingredient so a row past the 4000-check budget says so
+rather than reading `0 unreachable`. Each ingredient also carries `searchRadius`
+/ `radiusUnlimited`, and the payload carries `countedAtTick`, because two reads
+are two snapshots. It still does not model a pawn's own forbid rules, and
+`notes.ingredientScan` says so. `write{}` carries `requestedOptions` and
+`optionsNotApplied` (each requested field compared against the bill read back),
+and `watch{}` on a real `add` carries `scrolledToNewBill` / `scrollNote`.
+
+**The route test is a pawn's, not a fence's.** Until 2026-09-12 the scan asked
+`TraverseMode.PassDoors`, and `Verse.Region.Allows` answers `return !flag` in
+that mode — the door ignored entirely — so a locked door could never strand an
+ingredient, however loudly the note said it did. `NoPassClosedDoors` is the
+opposite mistake: its arm is `door == null || door.FreePassage`, which refuses
+every ordinary closed door in the colony. The scan now asks
+`TraverseMode.ByPawn` for the bill's own `PawnRestriction` worker when that pawn
+is usable, else for the first spawned free colonist, and only on a map with no
+colonist at all does it fall back to the old `PassDoors` call. Under `ByPawn`
+the door arm runs `Building_Door.CanPhysicallyPass` (free passage, or
+`PawnCanOpen`, or standing open) and then `IsForbiddenToPass`, both against that
+pawn, so **a locked or forbidden door now counts as unreachable for that pawn**.
+The representative colonist is walked by hand off `AllPawnsSpawned` filtered on
+`Pawn.IsFreeColonist`, never `MapPawns.FreeColonists`, which reaches
+`Faction.OfPlayer`. `UsableTraverser` screens the candidate first — null,
+unspawned, dead, or on another map — because `Reachability.CanReach` `Log.Error`s
+on a pawn spawned on another map and answers a flat false for one that is not
+spawned at all. The reach cache is keyed by **traverser** as well as by root and
+target cell: two bills on one bench can name two different workers, and a door
+one of them may open is a door the other may not.
+
+**The `blockedBy` lines that were never printed.** `BridgeCommon.Num` unboxed
+only `double`. `excludedUnreachable` and `excludedByFilter` are boxed `int`s and
+`BillCommon.IngredientRows` reads them straight back off the row it has just
+built, so both read as 0 and the two lines "N … have NO ROUTE from this bench's
+interaction cell" and "filter excludes N on map" could not be emitted at all —
+dead from the day they were written until 2026-09-12. `Num` now accepts any
+boxed numeric (`sbyte` through `decimal`, `int`, `long`, `float`, `double`) and
+never throws; a missing key, a null and a conversion that throws still read as 0,
+and `bool`, `char` and `string` still read as 0 **on purpose**, because answering
+1.0 for `true` would hide a mis-keyed lookup behind a number that looks read.
 
 `filter{}` is `allowedDefCount`, `allowsHumanMeat`, `allowsInsectMeat` (null
 when the recipe's fixed filter could never admit it at all),
@@ -2126,14 +2413,19 @@ those failures was in the float-menu path, not in the game. This issues the
 **job** vanilla issues and never opens a menu.
 
 Parameters: `action` (`resolve` default / `draft` / `undraft` / `attack` /
-`goto` / `equip` / `rescue` / `tend` / `haul` / `work`), `pawn`, `target`, `x`,
-`z`, `mode` (`auto` / `melee` / `ranged`), `draft` (default **true**), `dryRun`
-(default **false** -- this is the one write tool that defaults to doing the
-thing), `requireHostile` (default **false**), `watch` (default true),
+`goto` / `equip` / `rescue` / `tend` / `haul` / `work` / `rest` / `deploy`),
+`pawn`, `target`, `x`, `z`, `mode` (`auto` / `melee` / `ranged`), `draft`
+(default **true**), `dryRun` (default **false** -- this is the one write tool
+that defaults to doing the thing), `requireHostile` (default **false**),
+`watch` (default true),
 `watchSeconds`.
 
 Response: `action`, `dryRun`, `applied`, `pawn{}`, `target{}`, `job{}`,
 `wouldIssue{}`, `candidates[]`, `after{}`, `watch{}`, `error`, `errorKind`.
+`target{}` carries `isPlayerFaction` (compared against `Faction.OfPlayerSilentFail`,
+since `faction` is a colony name). `rest` lays the pawn down in the named bed, the
+bed covering `x`/`z`, or `RestUtility.FindBedFor`, undrafting first; `goto` with
+`draft: false` issues a plain undrafted Goto job.
 
 **Five id forms, and an explicit one never ties.** `Rat361788` matched nothing
 on the old path and `Rat` was "ambiguous" because two rats shared a label; both
@@ -2175,6 +2467,7 @@ wants it; `hostileToPlayer` is reported on every target either way.
 | `tend` | the `WorkGiver_Tend` prioritize job, or `TendPatient` + `draftedTend` on the ground | two paths, `job.tendPath` says which — see below |
 | `haul` | whatever `WorkGiver_Haul` builds (`HaulToCell` / `HaulToContainer`) | the giver's own job object, issued unmodified |
 | `work` | whatever `WorkGiver_DoBill` builds (`DoBill`, or `Refuel` / a haul-off) | likewise |
+| `deploy` | `UseVerbOnThingStaticReserve` (one-use packs), `UseVerbOnThingStatic`, or `Verb.OrderForceTarget`'s own `ai_IsWeapon ? AttackStatic : UseVerbOnThing` | `job.verbToUse` is the pack's own gizmo verb. The driver is `StopDead` then `CastVerb`: the pawn does **not** walk, it throws from where it stands |
 
 `mode: "auto"` asks the game's own predicate, `FloatMenuUtility.UseRangedAttack`
 -- which reads the equipped **verb**, not `ThingDef.IsRangedWeapon`.
@@ -2217,8 +2510,9 @@ wants it; `hostileToPlayer` is reported on every target either way.
 
 **`errorKind`** is one of `pawn_not_found`, `target_not_found`, `ambiguous`,
 `pawn_dead`, `pawn_downed`, `mental_state`, `incapable_of_violence`,
-`target_dead`, `not_reachable`, `draft_refused`, `job_refused`,
-`job_unverified`, `bad_arguments`, `work_disabled`, `no_storage`, `no_bill`.
+`target_dead`, `not_reachable`, `draft_refused`, `draft_cleanup_required`,
+`job_refused`, `job_unverified`, `bad_arguments`, `work_disabled`,
+`missing_haul_designation`, `no_storage`, `unreachable_storage`, `no_bill`.
 
 **`job.verified` is the point of the tool.** `TryTakeOrderedJob` returning true
 means the game accepted the job, not that it is running it. So `Pawn.CurJob` is
@@ -2265,6 +2559,63 @@ The one place the game's own code reaches `Faction.OfPlayer` from here is
 sitting in a building storage; that getter's `Log.Error` arm fires only when
 there is **no player faction**, which cannot be true on a loaded colony map.
 
+**`deploy` — the worn-pack gizmo, and the rule the UI refuses in silence.**
+`{action:"deploy", pawn, x, z, dryRun}`. `target` is optional and names *which*
+worn pack, only when the pawn wears more than one — a worn pack is not on
+`map.listerThings`, so it is matched against `pawn.apparel` by thingId, defName,
+label or gizmo label, never by cell.
+
+**A pack deploy is a thrown grenade, not a build order.** `Apparel_PackTurret`
+is **Anomaly**, not Odyssey (`Data\Anomaly\Defs\ThingDefs_Misc\Apparel_Packs.xml`),
+and like all DLC content its code is in the ordinary `Assembly-CSharp.dll`. It
+carries `CompProperties_ApparelVerbOwnerCharged` (1 charge, `destroyOnEmpty`,
+gizmo shown drafted and undrafted) and one verb,
+`Verb_LaunchProjectileStaticOneUse`, range 22.9, `canTargetLocations` only,
+`requireLineOfSight` defaulting **true**. Two gates decide the cell:
+
+| gate | rule | what the game does when it fails |
+|---|---|---|
+| `Verb_LaunchProjectileStaticOneUse.ValidateTarget` | `cell.GetFirstBuilding(map) == null` **and** `cell.Standable(map)` — ANY `Building` refuses: wall, door, **power conduit under the floor**, chair, unfinished `Frame` | the click is **swallowed** and the targeter **stays open** |
+| `Verb.CanHitTarget` (`TryFindShootLineFromTo`) | inside `EffectiveRange`, and `GenSight.LineOfSight` from the pawn's cell or a `ShootLeanUtility` lean-out cell | the targeter **CLOSES** and nothing is placed |
+
+**Neither posts a `Messages.Message`.** The only branch in the path that does
+is `ReloadableUtility.CanUseConsideringQueuedJobs`, for a pack with no charges
+— which is why `home/status` messages were empty for the four clicks lost on
+2026-09-08. Inside a mined-out mountain room, a cell on the far side of the rock
+is invisible however close it is. `EffectiveMinRange` is **0** for a plain cell,
+because `VerbUtility.AllowAdjacentShot` returns true when the target has no
+`Thing`, so "too close" is not a real refusal here.
+
+`ValidateTarget` is **never called by this tool**: it chains to
+`CanUseConsideringQueuedJobs`, which reads `Event.current.shift`, and
+`Event.current` is null outside `OnGUI`. Its two cell lines are run directly.
+`Pawn.CanReserve(cell)` is pre-checked because
+`JobDriver_CastVerbOnceStaticReserve.TryMakePreToilReservations` reserves the
+target cell. `Verb.Available()` is called only after
+`Faction.OfPlayerSilentFail` is proved non-null, because
+`Verb_LaunchProjectile.Available()` reaches `Faction.OfPlayer`, whose null arm
+is a `Log.Error` and therefore a `TickManager.Pause()`.
+
+`diagnostics.deploy` = `{ok, reason, reasonKind, rule, cell{x,z},
+pack{thingId, defName, label, gizmoLabel, verbClass, charges, maxCharges,
+oneUse}, checks{verbClass, requiresLineOfSight, mustCastOnOpenGround,
+availableChecked, charges, maxCharges, range, minRange, distance, fogged,
+buildingOnCell, standable, lineOfSight, inRange, canHitTarget, canReserve},
+validCellsNearby[≤8 of {x, z, distanceFromAsked, distanceFromPawn}],
+validCellsOrigin}`. `rule` is the plain-words statement above and is present on
+success and refusal alike. On any refusal `validCellsNearby` is filled by a
+radial scan around the cell asked for, falling back to a scan around the pawn
+out to the verb's range.
+
+New `errorKind`s: `no_deploy_pack`, `deploy_refused`, `deploy_cell_blocked`,
+`deploy_out_of_range`, `deploy_no_line_of_sight`, `deploy_cell_reserved`.
+
+**Three further silent closes**, all `Targeter.ConfirmStillValid`, which runs
+every frame: the caster stops being **selected**, its map changes, or
+`verb.Available()` goes false. A click-driven route that changes the selection
+between the gizmo click and the map click loses the targeter for that reason
+and no other.
+
 ## Decompiling the game
 
 When a tool has to match what the game does — zone bookkeeping, blueprint wipes,
@@ -2296,14 +2647,25 @@ writes `paused`; `Room.ContainedAndAdjacentThings` returns a cached buffer;
 `ThoughtHandler.GetDistinctMoodThoughtGroups` and
 `Pawn_RelationsTracker.OpinionOf` reach it; `TickManager.TicksAbs` and
 `GameCondition.TicksLeft` both route to `Log.Error`; `Pawn_WorkSettings.GetPriority`
-initialises a missing priority table.
+initialises a missing priority table; and `TraverseParms.For(pawn, …)` calls
+`pawn.CurJob.GetCachedDriver(pawn)`, a lazy same-pawn initialisation of
+`Job.cachedDriver` — benign, but a write.
 
-**Four more roads to `Faction.OfPlayer`**, each of which looks like an innocent
+**Five more roads to `Faction.OfPlayer`**, each of which looks like an innocent
 read: `MapPawns.FreeColonists` and `.FreeColonistsSpawned` (walk
 `AllPawnsSpawned` and test `Pawn.IsFreeColonist` instead); `Thing.GetGizmos()`,
-unconditionally and in six places; `RecipeDef.AvailableNow`, on three paths; and
+unconditionally and in six places; `RecipeDef.AvailableNow`, on three paths;
 `ForbidUtility.IsForbidden(Thing, Faction)` (read `CompForbiddable.Forbidden`
-directly). `Bill.ValidateSettings` is a fifth and is simply never called.
+directly); and `Building_Door.PawnCanOpen`, which reads it when
+`Map.Parent.doorsAlwaysOpenForPlayerPawns` is set — harmless under a `ByPawn`
+reach test, because a free colonist existing at all means the player faction
+does. `Bill.ValidateSettings` is a sixth and is simply never called.
+
+Two more `Log.Error` paths on the reachability side: `TraverseParms.For(pawn:
+null)` is one in itself, and `Reachability.CanReach` `Log.Error`s when handed a
+pawn spawned on another map — it answers a flat false for one that is not
+spawned at all, which is the quieter half of the same trap. Screen the traverser
+before passing it.
 
 And on the write side: `Zone.AddCell` never
 tells the previous owner, `Zone.RemoveCell` clears the *grid's* owner whoever that

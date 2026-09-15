@@ -4,6 +4,8 @@
   python inv.py steel                 # just what matches "steel"
   python inv.py food                  # every nutrition-giving ingestible,
                                       #   with NUTRITION and days of food
+  python inv.py --food                # the same thing
+  python inv.py food meat             # ... narrowed to a word as well
   python inv.py food --colonists 5    # ... against a colony size you name
   python inv.py --all-owners          # every item on the map, whoever owns it
   python inv.py --forbidden           # only things nobody is allowed to touch
@@ -75,8 +77,25 @@ reason, never a fabricated "fresh".
 
 `match` is a case-insensitive SUBSTRING of defName or label, and RimWorld's
 labels are singular -- `Component`, not `Components`. So a plural is retried as
-its singular (and back), loudly, and a word that still matches nothing prints
-the nearest labels this scope actually holds rather than a bare `0 kinds`.
+its singular (and back), loudly -- `berries` as `berry`, `bushes` as `bush` --
+and a word that still matches nothing prints the nearest labels this scope
+actually holds rather than a bare `0 kinds`.
+
+A zero in the default scope is then re-asked of the WHOLE map before anything
+is said about it, because most of these zeroes are the CATEGORY, not the map: a
+built sculpture is a Building and a berry bush is a plant, and neither is
+haulable. When the wider scope holds matches, the answer names them and the
+flag that reaches them -- `0 haulable matches; 98 plants (berry bush) match
+'berry' -- add --all` -- and the `nearest:` guess is not printed at all: it is
+for a word this map does not have, and this word it has.
+
+## An unknown flag is refused
+
+A flag this tool does not know is not a filter it forgot to apply, it is a
+question it never asked -- and an unfiltered census in the shape of a filtered
+one is a wrong answer wearing a right one's clothes. Every flag is in `FLAGS`;
+anything else stops the call and names the nearest flag that does exist
+(`--radius` is not one: the radius is the third number of `--near`).
 
 ## The ids on a row, and when they stop working
 
@@ -119,6 +138,19 @@ import rim
 import map as rimmap
 
 TOOL = "home/list_things"
+
+# Every flag this tool reads. Anything else starting with `-` stops the call:
+# an unknown flag narrows nothing, and a whole-inventory answer to a filtered
+# question reads exactly like a filtered one.
+FLAGS = ("--help", "-h", "--json", "--cells", "--all", "--all-owners",
+         "--everyone", "--ours", "--buildings", "--spawned-only",
+         "--forbidden", "--corpses", "--chunks-out", "--food", "--near",
+         "--colonists", "--match")
+
+# Flags this tool does not have, and the one it does. Named because the miss is
+# specific enough to answer rather than just reject.
+FLAG_HINTS = {"--radius": "the radius is the third number of `--near x z r`",
+              "--kind": "a bare word is the match: `inv.py steel`, or --match"}
 
 # The old sweep's filters, unchanged. Kept because --cells still uses them, and
 # kept LOUD because the pantry full of boulders was invisible for two days
@@ -665,11 +697,21 @@ def _variants(word):
     matches nothing and the honest answer is a useless 0.
     """
     w = (word or "").strip()
+    low = w.lower()
+    alts = []
+    if len(w) > 4 and low.endswith("ies"):
+        alts.append(w[:-3] + "y")           # berries -> berry
+    if len(w) > 3 and low.endswith("es"):
+        alts.append(w[:-2])                 # bushes -> bush
+    if len(w) > 2 and low.endswith("s"):
+        alts.append(w[:-1])                 # components -> component
+    if len(w) > 2 and low.endswith("y"):
+        alts.append(w[:-1] + "ies")         # berry -> berries
+    elif w and not low.endswith("s"):
+        alts.append(w + "s")
     out = [w]
-    for alt in ((w[:-2] if len(w) > 3 and w.lower().endswith("es") else None),
-                (w[:-1] if len(w) > 2 and w.lower().endswith("s") else None),
-                (None if w.lower().endswith("s") or not w else w + "s")):
-        if alt and alt not in out:
+    for alt in alts:
+        if alt not in out:
             out.append(alt)
     return out
 
@@ -689,6 +731,75 @@ def _retry_word(kw, r, wanted):
             return alt_r
     kw["match"] = wanted
     return r
+
+
+# What the WIDE scope holds that the default one structurally cannot. The
+# default census counts HAULABLE ITEMS: a built sculpture is a Building, a
+# berry bush is a plant, and a zero for either is the category answering, not
+# the map.
+WIDER_KINDS = (("Plant_", "plants"), ("Chunk", "chunks"),
+               ("Filth_", "filth"), ("Corpse_", "corpses"),
+               ("Mineable", "rock"))
+
+CATEGORY_WORDS = {"haulable": "HAULABLE ITEMS", "food": "FOOD",
+                  "buildings": "BUILDINGS", "all": "everything"}
+
+
+def _wider_kind(def_name, buildings):
+    d = def_name or ""
+    for prefix, word in WIDER_KINDS:
+        if d.startswith(prefix):
+            return word
+    return "buildings" if d in buildings else "other non-haulable things"
+
+
+def wider_look(kw, wanted, category="haulable"):
+    """The same word asked of the WHOLE map. -> lines, or [] if it is empty too.
+
+    Two reads on a dead end, and only on a dead end: `category=all` for what is
+    there and `category=buildings` to say which of it is a building.
+    """
+    probe = dict(kw, category="all", ownership="all")
+    try:
+        wide = census(**probe)
+    except Exception:
+        return []
+    rows = wide.get("things") or []
+    if not rows:
+        return []
+    try:
+        buildings = {row.get("defName") for row in
+                     (census(**dict(probe, category="buildings")).get("things") or [])}
+    except Exception:
+        buildings = set()
+    counts, names = collections.Counter(), {}
+    for row in rows:
+        k = _wider_kind(row.get("defName"), buildings)
+        counts[k] += _n(row, "total")
+        names.setdefault(k, []).append(row.get("label") or row.get("defName") or "?")
+    parts = ["%d %s (%s)" % (n, k, ", ".join(sorted(set(names[k]))[:3]))
+             for k, n in counts.most_common()]
+    return ["   0 %s matches; %s match %r -- add --all"
+            % (CATEGORY_WORDS.get(category, category), "; ".join(parts), wanted),
+            "   --all widens the category AND the owner; --buildings is "
+            "buildings only. Nothing is missing from the map."]
+
+
+def miss(kw, r, wanted):
+    """What a word that matched nothing gets told.
+
+    The wide scope first: when it holds the thing, `nearest:` is a guess at a
+    question that already has an answer, and is not printed.
+    """
+    cat = (r.get("filters") or {}).get("category") or "haulable"
+    lines = wider_look(kw, wanted, cat) if cat in ("haulable", "food") else []
+    if not lines:
+        _suggest(kw, wanted)
+        return
+    print("   no kind matched %s in this census."
+          % " / ".join(repr(v) for v in _variants(wanted)))
+    for l in lines:
+        print(l)
 
 
 def _suggest(kw, wanted, limit=8):
@@ -762,12 +873,47 @@ def scan(x0, z0, x1, z1, keep_all=False):
     return found
 
 
+def unknown_flags(argv, known=FLAGS):
+    """The tokens argv offers as flags that `known` does not hold.
+
+    A number is a value, not a flag: `--cells 100 120 150 170` and a negative
+    coordinate both pass through.
+    """
+    out = []
+    for a in argv:
+        if not a.startswith("-") or a in known:
+            continue
+        try:
+            float(a)
+        except ValueError:
+            out.append(a)
+    return out
+
+
+def refuse_unknown(argv, known=FLAGS):
+    """True, and said out loud, when argv carries a flag this tool cannot apply."""
+    bad = unknown_flags(argv, known)
+    if not bad:
+        return False
+    real = [f for f in known if f != "-h"]
+    for a in bad:
+        hint = FLAG_HINTS.get(a)
+        if not hint:
+            near = difflib.get_close_matches(a, real, n=2)
+            hint = "nearest: %s" % ", ".join(near) if near else None
+        print("inv.py: no such flag %s%s" % (a, " -- %s" % hint if hint else ""))
+    print("   nothing was read. Flags: %s" % " ".join(real))
+    return True
+
+
 def main():
     argv = sys.argv[1:]
 
     if "--help" in argv or "-h" in argv:
         print(__doc__)
         return 0
+    if refuse_unknown(argv):
+        return 1
 
     rim.init()
 
@@ -860,14 +1006,25 @@ def main():
             print("--colonists needs a number")
             return 1
         del argv[i:i + 2]
+    if "--match" in argv:
+        i = argv.index("--match")
+        if i + 1 >= len(argv):
+            print("--match needs a word")
+            return 1
+        kw["match"] = argv[i + 1]
+        del argv[i:i + 2]
     words = [a for a in argv if not a.startswith("-")]
-    food_alias = bool(words and words[0].lower() == "food")
-    if words:
-        if not food_alias:
-            kw["match"] = words[0]
-        else:
-            kw["category"] = "food"
-    if words and words[0].lower() == "fire":
+    # `food` is a CATEGORY, not a word to match, and it is the same request
+    # spelled either way. Any word left over still narrows it: `inv.py food
+    # meat` is the food census matched on "meat".
+    food_word = bool(words and words[0].lower() == "food")
+    food_alias = food_word or "--food" in argv
+    if food_alias:
+        kw["category"] = "food"
+        words = words[1:] if food_word else words
+    if words and "match" not in kw:
+        kw["match"] = words[0]
+    if words and not food_alias and words[0].lower() == "fire":
         # Fire is not haulable, so the default bridge category cannot see it.
         kw["category"] = "all"
 
@@ -893,7 +1050,7 @@ def main():
                                 else colony_size()):
                 print(l)
         if wanted and not r.get("defCount"):
-            _suggest(kw, wanted)
+            miss(kw, r, wanted)
         if "--corpses" in argv:
             corpses_block(r)
     except Exception as e:

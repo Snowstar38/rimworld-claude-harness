@@ -10,6 +10,7 @@
   python zones.py add "Stockpile zone 2" 113 140 4 3        # dry-run a 4x3 rect
   python zones.py add "Stockpile zone 2" 113 140 4 3 --do   # and apply it
   python zones.py create stockpile "Pantry" 113 140 4 3 --do
+  python zones.py create stockpile "Pantry" 113 140 4 3 --merge --do   # over a zone
   python zones.py create stockpile "Meals" 120 140 3 3 --preset food --priority Preferred --do
   python zones.py remove "Pantry" 113 140 --do
   python zones.py delete "Pantry" --do
@@ -38,6 +39,11 @@ Backed by `home/list_zones` and `home/zone_cells`.
 
 **Every write is a dry run unless you pass `--do`.** The dry run computes the
 exact plan the real call would execute; read it, then run it again with `--do`.
+
+`create` refuses a rectangle that overlaps an existing zone and names the cells
+and the zone: taking them is a real change to the other zone, and a zone that
+loses its last cell is deleted by the game. `--merge` takes them; `--replace` is
+the flag when a zone would be emptied.
 
 **Add cells here, never with the designator.** RimWorld's stockpile drag skips
 any cell that already has a zone, and `apply_architect_designator` calls
@@ -81,6 +87,81 @@ def _rect_or_cells(argv):
 
 
 _CELL = re.compile(r"^(-?\d+)\s*,\s*(-?\d+)$")
+
+
+USAGE = {
+    "create": 'zones.py create <stockpile|growing> "<label>" <x> <z> [w h] '
+              '[--preset food] [--priority Preferred] [--merge|--replace] [--do]',
+    "add": 'zones.py add "<zone>" <x> <z> [w h] [--do]',
+    "remove": 'zones.py remove "<zone>" <x> <z> [w h] [--do]',
+    "delete": 'zones.py delete "<zone>" [--do]',
+    "crop": "zones.py crop <zone-id|label|x,z> <PlantDefName> [--do]",
+    "filter": "zones.py filter <zone> --preset ... [--do]",
+}
+
+
+# The arguments each verb cannot run without, counted after the verb itself.
+NEEDS = {"create": 3, "add": 2, "remove": 2, "delete": 1, "crop": 2, "filter": 1}
+
+
+def check_usage(op, rest):
+    """Refuse a call with too little on it, in words, before the bridge."""
+    if op in NEEDS and len(rest) < NEEDS[op]:
+        raise SystemExit("%s needs %d more argument(s) -- usage: %s"
+                         % (op, NEEDS[op] - len(rest), USAGE[op]))
+
+
+def _cells_of(rect):
+    """Every cell of an x/z/width/height rect."""
+    return [(rect["x"] + dx, rect["z"] + dz)
+            for dx in range(rect["width"]) for dz in range(rect["height"])]
+
+
+def overlaps(rect):
+    """({"label (id N)": ([cells taken], cells left to that zone)}, truncated).
+
+    Both the zone's own cell list and the map's zone grid count: a cell the two
+    disagree about still belongs to somebody. `truncated` is True when a zone
+    listed more cells than the read returned, and then this is a FLOOR: an
+    overlap it did not see is possible.
+    """
+    want = set(_cells_of(rect))
+    listing = rim.game("home/list_zones", {"includeCells": True,
+                                           "includeContents": False})
+    hit, truncated = {}, False
+    for zone in listing.get("zones") or []:
+        if zone.get("cellsNotListed") or zone.get("gridCellsNotListed"):
+            truncated = True
+        owned = set()
+        for group in ("cells", "gridCells"):
+            for c in zone.get(group) or []:
+                cell = (c.get("x"), c.get("z"))
+                if cell in want:
+                    owned.add(cell)
+        if owned:
+            held = max(zone.get("listedCellCount") or 0,
+                       zone.get("gridCellCount") or 0)
+            hit["%s (id %s)" % (zone.get("label"), zone.get("id"))] = (
+                sorted(owned), held - len(owned))
+    return hit, truncated
+
+
+def print_overlap(clash, truncated, refusing):
+    """The overlap block, under a refusal or under a go-ahead."""
+    for name, (cells, left) in sorted(clash.items()):
+        shown = " ".join("%s,%s" % c for c in cells[:8])
+        print("  %s: %d cell(s)%s%s"
+              % (name, len(cells), (" -- " + shown) if shown else "",
+                 " ..." if len(cells) > 8 else ""))
+        if left <= 0:
+            print("    !! that is EVERY cell it has: %s that zone %s"
+                  % ("creating this zone would delete" if refusing else "this deletes",
+                     "" if refusing else "now"))
+        else:
+            print("    it keeps %d cell(s)" % left)
+    if truncated:
+        print("  (at least one zone listed more cells than the read returned, "
+              "so this is a floor, not a total)")
 
 
 def zone_at(spec):
@@ -401,7 +482,10 @@ def main(argv):
     do = "--do" in argv
     watch = "--no-watch" not in argv
     as_json = "--json" in argv
-    argv = [a for a in argv if a not in ("--do", "--no-watch", "--json")]
+    merge = "--merge" in argv
+    replace = "--replace" in argv
+    argv = [a for a in argv if a not in ("--do", "--no-watch", "--json",
+                                         "--merge", "--replace")]
     # Flags that carry a value come out first, so the positional rect parser
     # below never sees "Important" and tries to read it as a coordinate.
     match, argv = _take(argv, "--match")
@@ -415,6 +499,9 @@ def main(argv):
         if value:
             filt[key] = value
 
+    if argv and argv[0] in OPS:
+        # Before the bridge call -- a traceback is not a refusal.
+        check_usage(argv[0], argv[1:])
     rim.init()
     if not argv or argv[0].startswith("--"):
         r = list_zones(match=match, cells="--cells" in argv, filt="--filter" in argv)
@@ -439,8 +526,31 @@ def main(argv):
         r = zone_cells(op, argv[1], do, watch, **_rect_or_cells(argv[2:]))
     elif op == "create":
         ztype, label = argv[1], argv[2]
+        rect = _rect_or_cells(argv[3:])
+        # RimWorld's own stockpile drag skips a cell another zone owns; this
+        # tool takes it instead. Say what would be taken, and take it only
+        # when asked to.
+        clash, truncated = overlaps(rect)
+        # A zone that loses every cell is deregistered by the game, so that
+        # case wants the louder flag.
+        empties = [n for n, (_, left) in clash.items() if left <= 0]
+        allowed = replace or (merge and not empties)
+        if clash and not allowed:
+            taken = sum(len(cells) for cells, _ in clash.values())
+            print("CREATE REFUSED -- %d of the %d cell(s) asked for already "
+                  "belong to a zone:" % (taken, rect["width"] * rect["height"]))
+            print_overlap(clash, truncated, refusing=True)
+            print("nothing was created. Pass %s to take them anyway%s."
+                  % ("--replace" if empties else "--merge (or --replace)",
+                     ", or move the rectangle" if not empties else
+                     " and delete the emptied zone(s)"))
+            return 1
+        if clash:
+            print("TAKING %d cell(s) from %d existing zone(s):"
+                  % (sum(len(cells) for cells, _ in clash.values()), len(clash)))
+            print_overlap(clash, truncated, refusing=False)
         r = zone_cells("create", None, do, watch, zoneType=ztype, label=label,
-                       **dict(_rect_or_cells(argv[3:]), **filt))
+                       **dict(rect, **filt))
     elif op == "delete":
         r = zone_cells("delete", argv[1], do, watch)
     elif op == "crop":

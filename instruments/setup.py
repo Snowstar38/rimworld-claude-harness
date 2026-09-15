@@ -597,7 +597,7 @@ def ensure_game(notes):
             ",".join(map(str, pids)))
         print("\n*** STOP. A RimWorldWin64 process is running and our bridge is "
               "not connected to it.\n"
-              "*** That may be M playing in her own profile -- same exe "
+              "*** That may be MICHELLE playing in her own profile -- same exe "
               "name, different save folder.\n"
               "*** games_stop would kill it (gabs-config stops by process name) "
               "and games_start would\n"

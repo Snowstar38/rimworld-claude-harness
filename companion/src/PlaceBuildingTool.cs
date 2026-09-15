@@ -90,11 +90,58 @@ namespace HomeBridge.BridgeTools
     ///
     /// `Faction.OfPlayer` is likewise never used: its body is
     /// `get_OfPlayerSilentFail` followed by `Log.Error`.
+    ///
+    /// ## `cells` — a wall line is ONE call
+    ///
+    /// A 64-cell wall placed one call per cell cost ~1.8 s a cell, of which
+    /// 1.5 s was `Watch.DefaultLeadMs`: two minutes of wall time in which the
+    /// caller could answer nothing, which on a stream is dead air (found live on
+    /// Threadneedle, 2026-09-08). `cells="141,130;142,130;..."` places the whole
+    /// line in one call: one def resolution, ONE `materials` scan of the map,
+    /// one camera move, ONE 1.5 s watch lead, one close. Every cell is still
+    /// evaluated by `GenConstruct.CanPlaceBlueprintAt` and placed by
+    /// `GenConstruct.PlaceBlueprintForBuild` exactly as a single-cell call does
+    /// — `PlaceOne` is the one placement path both take — so a batch cannot
+    /// place anything a single call would not.
+    ///
+    /// **The main thread is never held for the batch.** A long synchronous loop
+    /// inside one `MainThread.InvokeAsync` hop stalls `Verse.Root.Update`, which
+    /// is the game's tick AND the queue every other bridge call is pumped from:
+    /// exactly the "delays every event" complaint, moved rather than fixed. So
+    /// the batch is chunked — at most `CellsPerHop` (8) cells per hop, with a
+    /// `HopGapMs` (20 ms, about one frame at 60 fps) gap between hops so the
+    /// game ticks, renders and delivers its letters in between. Each cell is a
+    /// `CanPlaceBlueprintAt`, a thing-grid read of its own footprint and a
+    /// `PlaceBlueprintForBuild` — the same work a player's click does, and eight
+    /// of them is well under a frame. Nothing map-wide runs per cell:
+    /// `materials` is computed once, before the first placement, for the whole
+    /// batch.
+    ///
+    /// A refused cell does not stop the batch — a wall line crossing one
+    /// doorway should lay the other 63 cells and say which one it skipped — so
+    /// the reply carries per-cell rows and `outcome: "partial"` when some cells
+    /// landed and some did not.
     /// </summary>
     public sealed class HomePlaceBuildingTools
     {
         private const string ToolName = "home/place_building";
         private static readonly string[] RotationNames = { "north", "east", "south", "west" };
+
+        /// <summary>Cells placed inside ONE main-thread hop. The bound on how
+        /// long a batch can hold Root.Update: eight CanPlaceBlueprintAt +
+        /// PlaceBlueprintForBuild pairs, which is less work than one frame of
+        /// a player dragging a wall line.</summary>
+        private const int CellsPerHop = 8;
+
+        /// <summary>Milliseconds released between hops, off the main thread, so
+        /// the game gets its frame: ticks, rendering and every other queued
+        /// bridge call run in the gap.</summary>
+        private const int HopGapMs = 20;
+
+        /// <summary>Refusal point for a single batch. 200 cells is ~4 s of
+        /// hops and a reply of a few tens of KB; beyond it the caller should
+        /// split, and is told so by name.</summary>
+        private const int MaxBatchCells = 200;
 
         [Tool(
             ToolName,
@@ -105,11 +152,13 @@ namespace HomeBridge.BridgeTools
                 + "would occupy, and everything standing in them. Coolers and vents additionally report which cell each face lands "
                 + "in, with that cell's room, whether the room uses outdoor temperature, and its current temperature -- so a caller "
                 + "can tell which way round puts the hot side outside. With dryRun:false and an accepted rotation it places "
-                + "the blueprint. It never touches the architect menu or any designator.",
+                + "the blueprint. Pass cells=\"x,z;x,z\" to do a whole wall line or room in ONE call, with one materials scan, "
+                + "one camera move and one watch lead for the batch; the placements are chunked across main-thread hops so the "
+                + "game keeps ticking. It never touches the architect menu or any designator.",
             ResultDescription =
                 "success, dryRun, def (defName/label/kind), stuff, size, rotatable, researchFinished, buildableByPlayer, costList[], "
                 + "rotations[] (one row per rotation evaluated), placed (the blueprint, when one was made), notes.")]
-        [ToolResponse("rotations", "array", "One row per rotation evaluated: rotation, accepted, reason, occupiedRect, occupiedCells[], blockingThings[], and sides for coolers/vents.", Always = true)]
+        [ToolResponse("rotations", "array", "One row per rotation evaluated: rotation, accepted, reason, occupiedRect, occupiedCells[], blockingThings[] (each with effectOnPlace: wiped/replaced/crop/cleared/hauled/frameCancelled/none), and sides for coolers/vents.", Always = true)]
         [ToolResponse("materials", "object", "Whether the colony can actually build this, answered at placement time and on a dry run alike -- 'the game accepts this blueprint here' and 'there is steel to finish it' are different questions. rows[] has one entry per cost entry of the def for the chosen stuff (def.CostListAdjusted(stuff, errorOnNullStuff:false)): defName, label, needed, onMap (spawned stacks on THIS map owned by the player or nobody -- a trader's crate does not count), forbidden (of those), reservedByOtherBlueprints (the outstanding deficit of every other blueprint and frame, the same number home/list_buildings reports as resourceDeficit), available (= onMap - forbidden - reservedByOtherBlueprints, floored at 0) and shortfall (= max(0, needed - available)). Beside them canBuildNow (every shortfall is 0) and missing (one line, e.g. 'missing: 25 steel (have 15, 10 forbidden), 3 components (have 0)', EMPTY STRING when nothing is missing). One pass over the map per call, never one per rotation. unreadable:true with canBuildNow NULL means the cost list could not be read -- not known, never 'yes'.", Always = true)]
         [ToolResponse("dryRun", "boolean", "True = nothing was placed. Callers must state true or false explicitly.", Always = true)]
         [ToolResponse("canPlace", "boolean", "True when at least one requested rotation is accepted by the game's placement validator. For rotation:'all', this means any listed rotation can be placed; inspect acceptedRotations for which ones.", Always = true)]
@@ -119,6 +168,7 @@ namespace HomeBridge.BridgeTools
         [ToolResponse("placed", "object", "The blueprint that was created: thingIDNumber, defName, position, rotation. Null on a dry run, a refusal, or when an identical blueprint already existed.", Always = true, Nullable = true)]
         [ToolResponse("unknownArguments", "array", "Every argument key the caller sent that this tool does not declare, sorted, case-sensitively. Empty array = every key was recognised. The host's own _rimBridgeTimeoutMs is never listed.", Always = true)]
         [ToolResponse("unknownArgumentsWarning", "string", "Present only when unknownArguments is non-empty, or when the caller's raw keys could not be read at all - in which case the empty unknownArguments means 'not known', not 'nothing unknown'. On a WRITE tool this matters twice over: a misspelled dryRun is the difference between a plan and a blueprint.", Nullable = true)]
+        [ToolResponse("batch", "object", "Present ONLY when the caller sent cells. requested, rotation, cellsPerHop, hops, placed, alreadyPresent, refused, errors, accepted (dry run), placedIds[], firstRefusal (null when nothing was refused) and rows[] -- one row per requested cell, in the order asked, each the same rotation row a single-cell call returns plus x, z, outcome (placed/already_present/refused/error/preview) and, on a real run, placed{} for that cell. A refused cell never stops the batch; top-level outcome is 'partial' when some cells landed and some did not. Top-level placed is the FIRST blueprint made, wiped/framesCancelled are the whole batch's, rotations[] is the first cell's row, and materials.needed is the cost for ALL requested cells (materials.forCells says how many, perCellNeeded the cost of one).", Nullable = true)]
         [ToolResponse("watch", "object", "The decorative half of the write: shown (bool), selected, inspectTab, mainTab, cameraMoved, leadMs, closesAfterSeconds, note and reason. On a real placement the camera jumps to the empty cell BEFORE the blueprint is made, then the new blueprint is selected and deselects itself. shown:false with a reason on a dry run, a refusal, or watch:false.", Always = true)]
         public async Task<object> PlaceBuilding(
             IRimBridgeContext ctx,
@@ -127,6 +177,7 @@ namespace HomeBridge.BridgeTools
             [ToolParameter(Description = "What to place: the defName (preferred) or label (case-insensitive) of a buildable ThingDef or TerrainDef. ThingDefs are searched first. If def is also sent, both must agree.")] string defName = null,
             [ToolParameter(Description = "Cell x (the building's anchor cell, the same one Thing.Position reports).", DefaultValue = -1)] int x = -1,
             [ToolParameter(Description = "Cell z.", DefaultValue = -1)] int z = -1,
+            [ToolParameter(Description = "Batch: an explicit cell list, \"141,130;142,130;143,130\" -- a wall line or a room in ONE call, with one materials scan, one camera move and one watch lead for the whole batch. x/z, when given, is the first cell; duplicates are collapsed and the order asked is the order placed. Needs ONE rotation, never \"all\". Max 200 cells. Every cell is still checked and placed one at a time, chunked 8 per main-thread hop so the game keeps ticking; a refused cell is reported and the rest still go in.")] string cells = null,
             [ToolParameter(Description = "north / east / south / west, or 'all' to evaluate every rotation. Defaults to 'all' for previews; a real placement needs a single value.", DefaultValue = "all")] string rotation = "all",
             [ToolParameter(Description = "Material defName or label. Defaults to GenStuff.DefaultStuffFor(def) when the def is made from stuff, and is ignored when it is not.")] string stuff = null,
             [ToolParameter(Description = "Evaluate as though god mode were on, which skips the map-edge check. Does not enable god mode.", DefaultValue = false)] bool godMode = false,
@@ -144,7 +195,7 @@ namespace HomeBridge.BridgeTools
 
             var requestedDef = string.IsNullOrWhiteSpace(defName) ? def : defName;
             return BridgeCommon.WithUnknownArguments(
-                await PlaceBuildingCore(ctx, cancellationToken, requestedDef, x, z, rotation, stuff, godMode, dryRun.Value, watch, watchSeconds).ConfigureAwait(false),
+                await PlaceBuildingCore(ctx, cancellationToken, requestedDef, x, z, cells, rotation, stuff, godMode, dryRun.Value, watch, watchSeconds).ConfigureAwait(false),
                 ctx, typeof(HomePlaceBuildingTools), ToolName);
         }
 
@@ -154,6 +205,7 @@ namespace HomeBridge.BridgeTools
             string def,
             int x,
             int z,
+            string cells,
             string rotation,
             string stuff,
             bool godMode,
@@ -163,6 +215,19 @@ namespace HomeBridge.BridgeTools
         {
             if (ctx?.MainThread == null)
                 return Failure("No RimBridge main-thread dispatcher is available for this invocation.");
+
+            // `cells` in, batch out: the reply shape follows the ASK, so a caller
+            // that sent a list always reads batch.rows and never has to work out
+            // which shape came back from how many cells it happened to contain.
+            if (!string.IsNullOrWhiteSpace(cells))
+            {
+                List<IntVec3> batchCells;
+                string cellsError;
+                if (!TryParseCellList(cells, x, z, out batchCells, out cellsError))
+                    return Failure(cellsError);
+                return await PlaceBatch(ctx, cancellationToken, def, batchCells, rotation, stuff,
+                                        godMode, dryRun, watch, watchSeconds).ConfigureAwait(false);
+            }
 
             // Companion tools are dispatched with MarshalToMainThread = false
             // (AnnotatedExtensionCapabilityProvider.InvokeAsync). The def database,
@@ -255,6 +320,512 @@ namespace HomeBridge.BridgeTools
                 return new Pass1Result { SkipReason = "nothing to place" };
 
             return new Pass1Result { Session = Watch.OpenAtCell(ctx, new IntVec3(x, 0, z)) };
+        }
+
+        // ================================================================= batch
+
+        /// <summary>One key per cell, so a duplicate in the list is collapsed
+        /// rather than placed twice.</summary>
+        private static long CellKey(int x, int z)
+        {
+            return ((long)x << 32) ^ (uint)z;
+        }
+
+        /// <summary>
+        /// `"141,130;142,130"` (or a comma-and-semicolon list with spaces) plus
+        /// the optional x/z anchor, in the order asked, duplicates collapsed.
+        /// A cell that cannot be read refuses the whole call by name: a list
+        /// silently short of one cell is a wall with a hole in it.
+        /// </summary>
+        private static bool TryParseCellList(string spec, int x, int z, out List<IntVec3> cells, out string error)
+        {
+            cells = new List<IntVec3>();
+            error = null;
+            var seen = new HashSet<long>();
+
+            if (x >= 0 && z >= 0 && seen.Add(CellKey(x, z)))
+                cells.Add(new IntVec3(x, 0, z));
+
+            var parts = (spec ?? string.Empty).Split(new[] { ';', '|', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+            foreach (var part in parts)
+            {
+                var text = part.Trim();
+                if (text.Length == 0)
+                    continue;
+                var bits = text.Split(',');
+                int cx, cz;
+                if (bits.Length != 2
+                    || !int.TryParse(bits[0].Trim(), out cx)
+                    || !int.TryParse(bits[1].Trim(), out cz))
+                {
+                    error = "cells must be \"x,z;x,z;x,z\" -- \"" + text + "\" is not a cell.";
+                    return false;
+                }
+                if (cx < 0 || cz < 0)
+                {
+                    error = "cells contains (" + cx + "," + cz + "), which is not a cell on any map.";
+                    return false;
+                }
+                if (seen.Add(CellKey(cx, cz)))
+                    cells.Add(new IntVec3(cx, 0, cz));
+            }
+
+            if (cells.Count == 0)
+            {
+                error = "cells was given but named no cell. Pass cells=\"x,z;x,z\", or drop it and pass x/z for a single placement.";
+                return false;
+            }
+            if (cells.Count > MaxBatchCells)
+            {
+                error = "cells names " + cells.Count + " cells and the cap is " + MaxBatchCells
+                      + " per call. Split it: the cap is there so one call cannot hold the game for longer than a caller expects.";
+                return false;
+            }
+            return true;
+        }
+
+        /// <summary>Everything the batch carries between its hops. One hop runs
+        /// at a time -- each is awaited before the next is queued -- so the
+        /// counters need no locking.</summary>
+        private sealed class BatchRun
+        {
+            internal Map Map;
+            internal BuildableDef EntDef;
+            internal ThingDef StuffDef;
+            internal ThingDef BlueprintDef;
+            internal Rot4 Rot;
+            internal bool GodMode;
+            internal bool IsCooler;
+            internal bool IsVent;
+            internal bool DryRun;
+            internal Faction Player;
+            internal List<IntVec3> Cells;
+            internal Dictionary<string, object> Payload;
+            internal readonly List<object> Rows = new List<object>();
+            internal readonly List<object> Wiped = new List<object>();
+            internal readonly List<object> FramesCancelled = new List<object>();
+            internal readonly List<object> PlacedIds = new List<object>();
+            internal Dictionary<string, object> FirstPlaced;
+            internal Thing FirstThing;
+            internal string FirstRefusal;
+            internal int Placed;
+            internal int AlreadyPresent;
+            internal int Refused;
+            internal int Errors;
+            internal int Accepted;
+            internal object Failure;
+            internal Watch.Session Session;
+            internal string SkipReason;
+        }
+
+        /// <summary>
+        /// The whole batch: one plan hop (resolve, one map-wide materials scan,
+        /// one camera move), ONE watch lead, then the cells in chunks of
+        /// <see cref="CellsPerHop"/> with <see cref="HopGapMs"/> of released
+        /// main thread between them, then one hop to select and schedule the
+        /// close. What a caller pays for the 64th cell is one more
+        /// CanPlaceBlueprintAt and one more PlaceBlueprintForBuild.
+        /// </summary>
+        private static async Task<object> PlaceBatch(
+            IRimBridgeContext ctx,
+            CancellationToken cancellationToken,
+            string def,
+            List<IntVec3> cells,
+            string rotation,
+            string stuff,
+            bool godMode,
+            bool dryRun,
+            bool watch,
+            int watchSeconds)
+        {
+            var run = await ctx.MainThread
+                .InvokeAsync(() => PlanBatch(ctx, def, cells, rotation, stuff, godMode, dryRun, watch), cancellationToken)
+                .ConfigureAwait(false);
+
+            if (run.Failure != null)
+            {
+                Stamp(run.Failure, Watch.Skipped("refused"));
+                return run.Failure;
+            }
+
+            // The batch's ONE lead: the camera is on the middle of the line and
+            // the viewer sees the ground before it fills, once, not 64 times.
+            if (!dryRun)
+                await Watch.Lead(run.Session, cancellationToken).ConfigureAwait(false);
+
+            var hops = 0;
+            for (var start = 0; start < run.Cells.Count; start += CellsPerHop)
+            {
+                if (hops > 0)
+                {
+                    // Off the main thread, uncancelled on purpose: 20 ms is not
+                    // worth a cancellation path that would strand a half-placed
+                    // batch and an open menu.
+                    await Task.Delay(HopGapMs).ConfigureAwait(false);
+                }
+                var from = start;
+                await ctx.MainThread
+                    .InvokeAsync(() => { RunChunk(run, from, CellsPerHop); return (object)null; }, cancellationToken)
+                    .ConfigureAwait(false);
+                hops++;
+            }
+
+            var payload = run.Payload;
+            var total = run.Cells.Count;
+            payload["wiped"] = run.Wiped;
+            payload["framesCancelled"] = run.FramesCancelled;
+            payload["placed"] = run.FirstPlaced;
+            payload["applied"] = run.Placed > 0;
+            payload["canPlace"] = run.Accepted > 0;
+            payload["alreadyPlaced"] = run.AlreadyPresent == total;
+            // The anchor cell's own row, so a reader of the single-cell shape
+            // still finds `rotations[0]`; every cell is in batch.rows.
+            payload["rotations"] = run.Rows.Count > 0 ? new List<object> { run.Rows[0] } : new List<object>();
+            payload["rotationsEvaluated"] = run.Rows.Count > 0 ? 1 : 0;
+            payload["acceptedRotations"] = run.Accepted > 0
+                ? new List<object> { RotationNames[run.Rot.AsInt & 3] }
+                : new List<object>();
+
+            string outcome;
+            if (dryRun)
+                outcome = "preview";
+            else if (run.Placed > 0 && run.Refused + run.Errors == 0)
+                outcome = "placed";
+            else if (run.Placed > 0)
+                outcome = "partial";
+            else if (run.AlreadyPresent > 0 && run.Refused + run.Errors == 0)
+                outcome = "already_present";
+            else if (run.Errors > 0)
+                outcome = "error";
+            else
+                outcome = "refused";
+            payload["outcome"] = outcome;
+            payload["detail"] = dryRun
+                ? "BATCH PREVIEW: NO blueprint placed; " + run.Accepted + " of " + total
+                  + " cells accepted, " + run.AlreadyPresent + " already there, " + run.Refused + " refused."
+                : "BATCH: " + run.Placed + " of " + total + " cells placed, " + run.AlreadyPresent
+                  + " already there, " + run.Refused + " refused, " + run.Errors + " errored."
+                  + (run.FirstRefusal == null ? string.Empty : " First refusal: " + run.FirstRefusal);
+
+            payload["batch"] = new Dictionary<string, object>(StringComparer.Ordinal)
+            {
+                { "requested", total },
+                { "rotation", RotationNames[run.Rot.AsInt & 3] },
+                { "cellsPerHop", CellsPerHop },
+                { "hops", hops },
+                { "hopGapMs", HopGapMs },
+                { "placed", run.Placed },
+                { "alreadyPresent", run.AlreadyPresent },
+                { "refused", run.Refused },
+                { "errors", run.Errors },
+                { "accepted", run.Accepted },
+                { "placedIds", run.PlacedIds },
+                { "firstRefusal", run.FirstRefusal },
+                { "rows", run.Rows }
+            };
+
+            if (dryRun)
+            {
+                Stamp(payload, Watch.Skipped("dry run"));
+                return payload;
+            }
+            if (run.Session == null)
+            {
+                Stamp(payload, Watch.Skipped(run.SkipReason));
+                return payload;
+            }
+
+            var finished = await ctx.MainThread
+                .InvokeAsync(() =>
+                {
+                    if (run.FirstThing != null)
+                        Watch.SelectNow(run.Session, run.FirstThing);
+                    return (object)Watch.Finish(run.Session, watchSeconds);
+                }, cancellationToken)
+                .ConfigureAwait(false);
+            payload["watch"] = finished;
+            return payload;
+        }
+
+        /// <summary>Main thread. Resolve everything the batch shares, scan the
+        /// map for materials ONCE, and put the camera on the middle of the
+        /// batch. Places nothing.</summary>
+        private static BatchRun PlanBatch(IRimBridgeContext ctx, string defSpec, List<IntVec3> cells,
+                                          string rotationSpec, string stuffSpec, bool godMode,
+                                          bool dryRun, bool wantWatch)
+        {
+            var run = new BatchRun { Cells = cells, GodMode = godMode, DryRun = dryRun };
+
+            Map map;
+            string mapError;
+            if (!TryGetMap(out map, out mapError))
+            {
+                run.Failure = Failure(mapError);
+                return run;
+            }
+            if (string.IsNullOrEmpty(defSpec))
+            {
+                run.Failure = Failure("def is required: the defName or label of a buildable ThingDef or TerrainDef.");
+                return run;
+            }
+            BuildableDef entDef;
+            string kind;
+            if (!TryResolveBuildable(defSpec, out entDef, out kind))
+            {
+                run.Failure = Failure("No ThingDef or TerrainDef matches \"" + defSpec + "\" by defName or label.");
+                return run;
+            }
+
+            List<int> rotations;
+            string rotationError;
+            if (!TryParseRotations(rotationSpec, out rotations, out rotationError))
+            {
+                run.Failure = Failure(rotationError);
+                return run;
+            }
+            if (rotations.Count != 1)
+            {
+                run.Failure = Failure("A batch needs exactly one rotation: pass rotation=north|east|south|west beside cells, not \""
+                                      + (rotationSpec ?? "all") + "\". Sweep the rotations with a single-cell dry run first.");
+                return run;
+            }
+
+            // Stuff, by exactly the rules a single-cell call uses.
+            ThingDef stuffDef = null;
+            string stuffNote = null;
+            var madeFromStuff = SafeMadeFromStuff(entDef);
+            if (!string.IsNullOrEmpty(stuffSpec))
+            {
+                stuffDef = ResolveThingDef(stuffSpec);
+                if (stuffDef == null)
+                {
+                    run.Failure = Failure("No ThingDef matches the stuff \"" + stuffSpec + "\".");
+                    return run;
+                }
+                if (!madeFromStuff)
+                    stuffNote = entDef.defName + " is not made from stuff; the stuff argument is recorded but has no effect.";
+            }
+            else if (madeFromStuff)
+            {
+                stuffDef = SafeDefaultStuff(entDef);
+                if (stuffDef == null)
+                    stuffNote = "This def is made from stuff and GenStuff.DefaultStuffFor returned nothing; placement would produce a blueprint with no material.";
+                else
+                    stuffNote = "stuff defaulted to GenStuff.DefaultStuffFor(" + entDef.defName + ") = " + stuffDef.defName + ".";
+            }
+
+            var blueprintDef = SafeBlueprintDef(entDef);
+            var thingDef = entDef as ThingDef;
+
+            Faction player = null;
+            if (!dryRun)
+            {
+                if (blueprintDef == null)
+                {
+                    run.Failure = Failure(entDef.defName + " has no blueprintDef, so no blueprint can be made for it.");
+                    return run;
+                }
+                // NOT Faction.OfPlayer: its body ends in Log.Error, which pauses.
+                try { player = Faction.OfPlayerSilentFail; }
+                catch { player = null; }
+                if (player == null)
+                {
+                    run.Failure = Failure("There is no player faction on this map, so the blueprint would belong to nobody.");
+                    return run;
+                }
+            }
+
+            run.Map = map;
+            run.EntDef = entDef;
+            run.StuffDef = stuffDef;
+            run.BlueprintDef = blueprintDef;
+            run.Rot = new Rot4(rotations[0]);
+            run.IsCooler = thingDef != null && IsClass(thingDef, typeof(Building_Cooler));
+            run.IsVent = thingDef != null && IsClass(thingDef, typeof(Building_Vent));
+            run.Player = player;
+
+            var payload = new Dictionary<string, object>
+            {
+                { "success", true },
+                { "tool", ToolName },
+                { "dryRun", dryRun },
+                { "def", new Dictionary<string, object>
+                    {
+                        { "defName", entDef.defName },
+                        { "label", entDef.label },
+                        { "kind", kind }
+                    } },
+                { "position", BridgeCommon.Pos(cells[0]) },
+                { "size", SizeBlock(entDef) },
+                { "rotatable", thingDef == null ? (bool?)null : SafeRotatable(thingDef) },
+                { "researchFinished", SafeResearchFinished(entDef) },
+                { "buildableByPlayer", SafeBuildableByPlayer(entDef) },
+                { "hasBlueprintDef", blueprintDef != null },
+                { "madeFromStuff", madeFromStuff },
+                { "stuff", stuffDef == null ? null : new Dictionary<string, object>
+                    {
+                        { "defName", stuffDef.defName },
+                        { "label", stuffDef.label },
+                        { "allowedForThisDef", StuffAllowed(entDef, stuffDef) }
+                    } },
+                { "costList", CostList(entDef, stuffDef) },
+                // ONE pass over the map for the whole batch, costed for every
+                // requested cell: 64 walls need 64 walls' worth of blocks, and
+                // reading one wall's cost beside a 64-cell ask is how a caller
+                // starts a line it cannot finish.
+                { "materials", Materials(map, entDef, stuffDef, cells.Count) },
+                { "thingClass", thingDef == null || thingDef.thingClass == null ? null : thingDef.thingClass.Name },
+                { "isCooler", run.IsCooler },
+                { "isVent", run.IsVent },
+                { "rotationsEvaluated", 0 },
+                { "acceptedRotations", new List<object>() },
+                { "rotations", new List<object>() },
+                { "canPlace", false },
+                { "applied", false },
+                { "outcome", dryRun ? "preview" : "pending" },
+                { "detail", "Batch planned; no cell has been evaluated yet." },
+                { "placed", null },
+                { "alreadyPlaced", false },
+                { "wiped", new List<object>() },
+                { "framesCancelled", new List<object>() },
+                { "notes", Notes() }
+            };
+            if (stuffNote != null)
+                payload["stuffNote"] = stuffNote;
+            run.Payload = payload;
+
+            if (dryRun)
+                run.SkipReason = "dry run";
+            else if (!wantWatch)
+                run.SkipReason = "watch:false";
+            else
+                run.Session = Watch.OpenAtCell(ctx, Midpoint(cells));
+
+            return run;
+        }
+
+        /// <summary>The middle of the batch's bounding rect: for a wall line the
+        /// camera then holds the whole line, not one end of it.</summary>
+        private static IntVec3 Midpoint(List<IntVec3> cells)
+        {
+            int minX = cells[0].x, maxX = cells[0].x, minZ = cells[0].z, maxZ = cells[0].z;
+            foreach (var c in cells)
+            {
+                if (c.x < minX) minX = c.x;
+                if (c.x > maxX) maxX = c.x;
+                if (c.z < minZ) minZ = c.z;
+                if (c.z > maxZ) maxZ = c.z;
+            }
+            return new IntVec3((minX + maxX) / 2, 0, (minZ + maxZ) / 2);
+        }
+
+        /// <summary>
+        /// Main thread, ONE chunk: up to <see cref="CellsPerHop"/> cells
+        /// evaluated and -- on a real run -- placed. Bounded on purpose. A hop
+        /// runs inside Verse.Root.Update, which is the game's own tick and the
+        /// queue every other bridge call is pumped from, so an unbounded loop
+        /// here would stall the colony and every event with it.
+        /// </summary>
+        private static void RunChunk(BatchRun run, int from, int count)
+        {
+            var map = run.Map;
+            var last = Math.Min(from + count, run.Cells.Count);
+            for (var i = from; i < last; i++)
+            {
+                var cell = run.Cells[i];
+                Dictionary<string, object> row;
+                if (!cell.InBounds(map))
+                {
+                    row = new Dictionary<string, object>
+                    {
+                        { "rotation", RotationNames[run.Rot.AsInt & 3] },
+                        { "rotationInt", run.Rot.AsInt },
+                        { "accepted", false },
+                        { "reason", "(" + cell.x + "," + cell.z + ") is not a cell on this map." },
+                        { "occupiedRect", null },
+                        { "occupiedCells", new List<object>() },
+                        { "blockingThings", new List<object>() },
+                        { "blockingThingCount", 0 },
+                        { "wipeOnPlace", new List<object>() },
+                        { "framesCancelledOnPlace", new List<object>() },
+                        { "identicalBlueprintExists", false }
+                    };
+                }
+                else
+                {
+                    row = EvaluateRotation(map, run.EntDef, run.BlueprintDef, cell, run.Rot,
+                                           run.StuffDef, run.GodMode, run.IsCooler, run.IsVent);
+                }
+
+                row["x"] = cell.x;
+                row["z"] = cell.z;
+                // Constant row shape: a cell that placed nothing still says so
+                // with the same keys, because absent and false read alike in JSON.
+                row["placed"] = null;
+                row["wiped"] = new List<object>();
+                row["framesCancelled"] = new List<object>();
+                row["error"] = null;
+
+                var accepted = Equals(row["accepted"], true);
+                if (accepted)
+                    run.Accepted++;
+
+                string outcome;
+                if (Equals(row["identicalBlueprintExists"], true))
+                {
+                    // The caller's end state already holds. Not an error, and
+                    // never a second blueprint on the same cell.
+                    outcome = "already_present";
+                    run.AlreadyPresent++;
+                }
+                else if (!accepted)
+                {
+                    outcome = "refused";
+                    run.Refused++;
+                    if (run.FirstRefusal == null)
+                    {
+                        var why = row["reason"] as string;
+                        run.FirstRefusal = string.IsNullOrEmpty(why)
+                            ? "(" + cell.x + "," + cell.z + "): no reason given"
+                            : "(" + cell.x + "," + cell.z + "): " + why;
+                    }
+                }
+                else if (run.DryRun)
+                {
+                    outcome = "preview";
+                }
+                else
+                {
+                    var result = PlaceOne(map, run.EntDef, cell, run.Rot, run.StuffDef, run.Player);
+                    row["wiped"] = result.Wiped;
+                    row["framesCancelled"] = result.FramesCancelled;
+                    run.Wiped.AddRange(result.Wiped);
+                    run.FramesCancelled.AddRange(result.FramesCancelled);
+                    if (result.Error != null)
+                    {
+                        outcome = "error";
+                        run.Errors++;
+                        row["error"] = result.Error;
+                    }
+                    else
+                    {
+                        outcome = "placed";
+                        run.Placed++;
+                        row["placed"] = result.Placed;
+                        object id;
+                        if (result.Placed != null && result.Placed.TryGetValue("thingIDNumber", out id))
+                            run.PlacedIds.Add(id);
+                        if (run.FirstPlaced == null)
+                        {
+                            run.FirstPlaced = result.Placed;
+                            run.FirstThing = result.Thing;
+                        }
+                    }
+                }
+
+                row["outcome"] = outcome;
+                run.Rows.Add(row);
+            }
         }
 
         /// <summary>Resolve, evaluate every rotation and - unless dryRun - place.
@@ -443,8 +1014,52 @@ namespace HomeBridge.BridgeTools
             if (planOnly)
                 return payload;
 
-            var wiped = new List<object>();
-            var cancelledFrames = new List<object>();
+            // ONE placement path for a single cell and for every cell of a batch:
+            // PlaceOne is the only code in this file that destroys or spawns.
+            var single = PlaceOne(map, entDef, center, chosen, stuffDef, player);
+            payload["wiped"] = single.Wiped;
+            payload["framesCancelled"] = single.FramesCancelled;
+            if (single.Error != null)
+            {
+                payload["success"] = false;
+                payload["error"] = single.Error;
+                payload["outcome"] = "error";
+                payload["detail"] = payload["error"];
+                return payload;
+            }
+            payload["placed"] = single.Placed;
+            payload["applied"] = true;
+            payload["outcome"] = "placed";
+            payload["detail"] = "PLACED: blueprint created at the requested cell and rotation.";
+            if (onPlaced != null)
+                onPlaced(single.Thing);
+            return payload;
+        }
+
+        /// <summary>What one placement did. Error non-null means nothing stands
+        /// there and the caller says so; Wiped and FramesCancelled are truthful
+        /// either way, because a throw can happen after the wipe.</summary>
+        private sealed class PlacementResult
+        {
+            internal Dictionary<string, object> Placed;
+            internal List<object> Wiped = new List<object>();
+            internal List<object> FramesCancelled = new List<object>();
+            internal Thing Thing;
+            internal string Error;
+        }
+
+        /// <summary>
+        /// Main thread. The three destructive steps, in
+        /// `Designator_Build.DesignateSingleCell`'s own order, for ONE cell. Every
+        /// placement this tool makes -- single or one cell of a batch -- comes
+        /// through here, so the two can never drift apart.
+        /// </summary>
+        private static PlacementResult PlaceOne(Map map, BuildableDef entDef, IntVec3 center,
+                                                Rot4 chosen, ThingDef stuffDef, Faction player)
+        {
+            var result = new PlacementResult();
+            var wiped = result.Wiped;
+            var cancelledFrames = result.FramesCancelled;
             var bpDef = SafeBlueprintDef(entDef);
 
             try
@@ -493,21 +1108,16 @@ namespace HomeBridge.BridgeTools
                     GenSpawn.WipeExistingThings(center, chosen, bpDef, map, DestroyMode.Deconstruct);
                 }
 
-                payload["wiped"] = wiped;
-                payload["framesCancelled"] = cancelledFrames;
-
                 // STEP 3.
                 var blueprint = GenConstruct.PlaceBlueprintForBuild(entDef, center, map, chosen, player, stuffDef);
                 if (blueprint == null)
                 {
-                    payload["success"] = false;
-                    payload["error"] = "PlaceBlueprintForBuild returned nothing.";
-                    payload["outcome"] = "error";
-                    payload["detail"] = payload["error"];
-                    return payload;
+                    result.Error = "PlaceBlueprintForBuild returned nothing.";
+                    return result;
                 }
 
-                payload["placed"] = new Dictionary<string, object>
+                result.Thing = blueprint;
+                result.Placed = new Dictionary<string, object>
                 {
                     { "thingIDNumber", SafeInt(() => blueprint.thingIDNumber) },
                     { "defName", blueprint.def != null ? blueprint.def.defName : null },
@@ -515,26 +1125,16 @@ namespace HomeBridge.BridgeTools
                     { "buildDefName", entDef.defName },
                     { "position", PositionOf(blueprint) },
                     { "rotation", SafeRotationHuman(blueprint) },
-                    { "rotationWord", RotationNames[rotations[0]] },
+                    { "rotationWord", RotationNames[chosen.AsInt & 3] },
                     { "stuff", stuffDef == null ? null : stuffDef.defName },
                     { "faction", SafeFactionName(player) }
                 };
-                payload["applied"] = true;
-                payload["outcome"] = "placed";
-                payload["detail"] = "PLACED: blueprint created at the requested cell and rotation.";
-                if (onPlaced != null)
-                    onPlaced(blueprint);
-                return payload;
+                return result;
             }
             catch (Exception e)
             {
-                payload["wiped"] = wiped;
-                payload["framesCancelled"] = cancelledFrames;
-                payload["success"] = false;
-                payload["error"] = "Placement threw: " + e.Message;
-                payload["outcome"] = "error";
-                payload["detail"] = payload["error"];
-                return payload;
+                result.Error = "Placement threw: " + e.Message;
+                return result;
             }
         }
 
@@ -629,12 +1229,16 @@ namespace HomeBridge.BridgeTools
                         // destroyed and they are not a refusal, but they do have to
                         // go, so they are named under their own flag rather than
                         // being reported as wiped.
+                        var finishedWipes = false;
+                        try { finishedWipes = GenSpawn.SpawningWipes(entDef, t.def); }
+                        catch { }
+
                         var haulFirst = false;
                         try
                         {
                             haulFirst = !wipes
                                         && t.def.category == ThingCategory.Item
-                                        && GenSpawn.SpawningWipes(entDef, t.def);
+                                        && finishedWipes;
                         }
                         catch { }
 
@@ -664,6 +1268,9 @@ namespace HomeBridge.BridgeTools
                             { "isBlueprint", t is Blueprint },
                             { "isFrame", t is Frame },
                             { "wouldBeWiped", wipes },
+                            { "wipedWhenBuilt", finishedWipes },
+                            { "isCrop", IsCrop(t) },
+                            { "effectOnPlace", EffectOnPlace(t, wipes, frameCancel, haulFirst, finishedWipes) },
                             { "mustBeHauledFirst", haulFirst },
                             { "frameWouldBeCancelled", frameCancel }
                         });
@@ -913,10 +1520,15 @@ namespace HomeBridge.BridgeTools
         /// `reservedByOtherBlueprints` genuinely means OTHER blueprints -- the
         /// one this call is about to create is not counted against itself.
         /// </summary>
-        private static Dictionary<string, object> Materials(Map map, BuildableDef entDef, ThingDef stuffDef)
+        private static Dictionary<string, object> Materials(Map map, BuildableDef entDef, ThingDef stuffDef, int forCells = 1)
         {
             var block = new Dictionary<string, object>(StringComparer.Ordinal);
             var rows = new List<object>();
+            // A batch costs its cell count: one wall's worth of blocks read
+            // beside a 64-cell ask is how a caller starts a line it cannot
+            // finish. perCellNeeded keeps the single-building number readable.
+            if (forCells < 1)
+                forCells = 1;
 
             List<ThingDefCountClass> cost = null;
             try
@@ -931,6 +1543,7 @@ namespace HomeBridge.BridgeTools
             if (cost == null)
             {
                 block["rows"] = rows;
+                block["forCells"] = forCells;
                 block["canBuildNow"] = null;
                 block["missing"] = null;
                 block["unreadable"] = true;
@@ -956,7 +1569,8 @@ namespace HomeBridge.BridgeTools
                 if (item == null || item.thingDef == null)
                     continue;
 
-                var needed = item.count;
+                var perCell = item.count;
+                var needed = perCell * forCells;
                 var onMap = 0;
                 var forbidden = 0;
 
@@ -1037,6 +1651,7 @@ namespace HomeBridge.BridgeTools
                     { "defName", item.thingDef.defName },
                     { "label", item.thingDef.label },
                     { "needed", needed },
+                    { "perCellNeeded", perCell },
                     { "onMap", onMap },
                     { "forbidden", forbidden },
                     { "reservedByOtherBlueprints", claimed },
@@ -1046,6 +1661,7 @@ namespace HomeBridge.BridgeTools
             }
 
             block["rows"] = rows;
+            block["forCells"] = forCells;
             block["canBuildNow"] = canBuildNow;
             // Empty string, not null, when nothing is missing: "" and "not asked"
             // must not read the same.
@@ -1070,9 +1686,11 @@ namespace HomeBridge.BridgeTools
                 { "wouldBeWiped", "Computed as GenSpawn.SpawningWipes(entDef.blueprintDef, thing.def) -- the BLUEPRINT's def, which is what actually spawns. Passing entDef instead reports loose items as doomed: an Impassable building with surfaceType None wipes items, a blueprint does not. An item the finished building would displace but the blueprint will not is flagged mustBeHauledFirst instead, which is what happens to it: a builder carries it out before work starts." },
                 { "noDesignators", "Find.DesignatorManager is never touched. Placement is GenConstruct.PlaceBlueprintForBuild directly, so the player's selected designator, stuff and rotation are left alone." },
                 { "identicalBlueprint", "identicalBlueprintExists is reported per rotation and a real run treats it as alreadyPlaced:true with success:true, because the caller's desired end state already holds." },
+                { "effectOnPlace", "Per blocking thing, what an ACCEPTED placement does to it: wiped (GenSpawn.SpawningWipes(blueprintDef, thing.def) -- gone the moment the blueprint lands), frameCancelled, hauled (a builder carries it out before work starts), replaced (a Building the FINISHED thing wipes -- GenSpawn.SpawningWipes(entDef, thing.def); stone-over-wood is legal, so an accepted rotation over one of our own walls is a replacement, not empty ground), crop (a sown Plant, destroyed when the thing is built), cleared (a wild plant or anything else the finished building removes at no cost), none. A caller can put the first four on its verdict line and leave cleared where it belongs." },
                 { "logErrorAvoided", "Rot4.FromString and CostListAdjusted's default errorOnNullStuff both call Verse.Log.Error, which calls TickManager.Pause(). Neither is used on its logging path here, and Faction.OfPlayer (whose body ends in Log.Error) is replaced by Faction.OfPlayerSilentFail." },
                 { "materialsAreNotAPlacementCheck", "materials.canBuildNow false does NOT stop a placement and is not meant to. A blueprint standing while the haulers bring steel is ordinary play; the point is that the shortfall is on screen when the blueprint is made rather than discovered later. rotations[].accepted answers whether the GAME will take the blueprint, which is a separate question and the only one that refuses." },
                 { "materialsOwnership", "onMap counts spawned stacks whose Faction is the player or null. Forbidden ones are counted in onMap AND in forbidden, then subtracted -- so onMap stays comparable with home/list_buildings resourceDeficit.onMapTotal, which also counts everything spawned. CompForbiddable.Forbidden is read directly: ForbidUtility.IsForbidden(Thing, Faction) reaches Faction.OfPlayer, which pauses the game." },
+                { "batching", "cells=\"x,z;x,z\" places a whole wall line or room in ONE call: one def resolution, one materials scan of the map, one camera move and ONE 1.5 s watch lead for the batch, where a call per cell paid all four every time (~1.8 s a cell, 1.5 s of it the watch lead). The placements are chunked 8 cells per main-thread hop with 20 ms released between hops, because a long synchronous loop inside one hop stalls Verse.Root.Update -- the game's tick and the queue every other bridge call is pumped from -- which is the 'a 64-cell build delays every event' complaint moved rather than fixed. Every cell still goes through the same CanPlaceBlueprintAt and the same PlaceOne a single-cell call uses; a refused cell is reported in batch.rows and does not stop the rest. materials.needed is the cost of ALL the requested cells (materials.forCells, rows[].perCellNeeded)." },
                 { "positionIs", "x,z is the anchor cell RimWorld reports as Thing.Position, not the min corner. For a multi-cell def see occupiedRect, which is GenAdj.OccupiedRect(center, rot, def.Size)." }
             };
         }
@@ -1190,6 +1808,51 @@ namespace HomeBridge.BridgeTools
         {
             try { return thing.Rotation.ToStringHuman(); }
             catch { return null; }
+        }
+
+        /// <summary>
+        /// A crop the colony sowed, as `Plant.sown` and `Plant.IsCrop` answer it.
+        /// A wild plant under a footprint costs nothing; a sown one is food.
+        /// </summary>
+        private static bool IsCrop(Thing thing)
+        {
+            var plant = thing as Plant;
+            if (plant == null)
+                return false;
+            try { if (plant.sown) return true; }
+            catch { }
+            try { return plant.IsCrop; }
+            catch { return false; }
+        }
+
+        /// <summary>
+        /// What an ACCEPTED placement does to one thing in the footprint, in one
+        /// word: wiped (the blueprint destroys it the moment it is placed),
+        /// frameCancelled, hauled (a builder carries it out first), replaced (a
+        /// building the finished thing takes the place of -- stone over wood is
+        /// legal and reads as empty ground without this), crop (a sown plant,
+        /// destroyed when the thing is built), cleared (a wild plant or anything
+        /// else the finished building removes at no cost), or none.
+        /// </summary>
+        private static string EffectOnPlace(Thing thing, bool wipes, bool frameCancel,
+                                            bool haulFirst, bool finishedWipes)
+        {
+            if (wipes)
+                return "wiped";
+            if (frameCancel)
+                return "frameCancelled";
+            if (haulFirst)
+                return "hauled";
+            if (!finishedWipes)
+                return "none";
+            var category = ThingCategory.None;
+            try { category = thing.def.category; }
+            catch { }
+            if (category == ThingCategory.Building)
+                return "replaced";
+            if (category == ThingCategory.Plant)
+                return IsCrop(thing) ? "crop" : "cleared";
+            return "cleared";
         }
 
         private static string SafeThingLabel(Thing thing)

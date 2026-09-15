@@ -34,6 +34,10 @@ the grid.
 `--full` prints the seven pure grids instead, and is the thing to reach for when
 a merged glyph is in your way.
 
+usage: map.py <x> <z> [WIDTH HEIGHT] [--size W [H]] [--corner] [--layers ...]
+       TWO numbers are a CENTRE; FOUR are `x z WIDTH HEIGHT`, NOT two corners
+       (`--corner` reads the second pair as the opposite corner).
+
   python map.py 112 140                 # 48x48 centred on 112,140
   python map.py 112 140 --size 96       # bigger, costs more calls
   python map.py 112 140 --size 96 48    # W H, when the interesting shape is wide
@@ -49,6 +53,8 @@ a merged glyph is in your way.
                                        # writes; no layer can show it
   python map.py 112 140 --full          # seven pure grids, nothing compacted
   python map.py 112 140 --legend        # the map AND the full key under it
+  python grid.py on --step 10 --do      # draw the coordinate grid IN the game
+                                       # (the stream sees it); grid.py off --do
   python map.py rooms                   # whole-map room census, one line each
   python map.py rooms --cold            # the same census, coldest indoor room first
   python map.py rooms --hot             # ... warmest first
@@ -580,8 +586,18 @@ def block(bx, bz, w, h, fields=None, thing_fields=None, sparse=False):
             print(degraded_line())
             r = None
     if r is None:
-        # The stock tool takes the rectangle and nothing else.
+        # The stock tool takes the rectangle and nothing else. Its 1024-cell
+        # reply is ~649KB, the largest payload anything here asks for, and a
+        # reply GABS splits across several MCP content items arrives as a LIST
+        # of fragments rather than a dict -- so check the shape before reading
+        # it, or the failure surfaces as `'list' object has no attribute 'get'`
+        # somewhere else.
         r = rim.game(STOCK_TOOL, args)
+        if not isinstance(r, dict) or "cells" not in r:
+            raise rim.BridgeError(
+                "%s answered with a %s and no 'cells' for the %dx%d block at"
+                " %d,%d: %s" % (STOCK_TOOL, type(r).__name__, w, h, bx, bz,
+                                str(r)[:160]))
     return r.get("cells") or []
 
 
@@ -625,7 +641,11 @@ def colonists():
     """
     out = {}
     try:
-        for c in rim.game("rimworld/list_colonists", {}).get("colonists") or []:
+        r = rim.game("rimworld/list_colonists", {})
+        if not isinstance(r, dict) or "colonists" not in r:
+            raise rim.BridgeError("no 'colonists' in a %s reply: %s"
+                                  % (type(r).__name__, str(r)[:160]))
+        for c in r.get("colonists") or []:
             if c.get("dead"):
                 continue
             p = c.get("position") or {}
@@ -715,6 +735,11 @@ def _identify_by_clicking(cells):
             r = pick.click(x, z, announce=False)
         except Exception:
             continue
+        if not isinstance(r, dict):
+            print(f"  ** the click at {x},{z} answered with a"
+                  f" {type(r).__name__}, not a payload -- the pawn there stays"
+                  " unidentified. **")
+            continue
         for o in ((r.get("selectionAfter") or {}).get("selectedObjects") or []):
             d = o.get("details") or {}
             p = d.get("position") or {}
@@ -745,7 +770,11 @@ def hostile_alerts():
     """
     try:
         out = []
-        for a in rim.game("rimworld/list_alerts", {}).get("alerts") or []:
+        r = rim.game("rimworld/list_alerts", {})
+        if not isinstance(r, dict) or "alerts" not in r:
+            raise rim.BridgeError("no 'alerts' in a %s reply: %s"
+                                  % (type(r).__name__, str(r)[:160]))
+        for a in r.get("alerts") or []:
             lab = a.get("label") or ""
             if any(k in lab.lower() for k in HOSTILE_ALERT):
                 out.append(f"{lab} [{a.get('priority')}]")
@@ -2096,12 +2125,17 @@ def cmd_areas(argv):
     does.  Coordinates are `x z WIDTH HEIGHT`, act.py's order, so the line
     act.py prints can be pasted.
     """
-    nums = [int(v) for v in argv if v.lstrip("-").isdigit()]
+    nums, unread = read_numbers(argv)
     if len(nums) < 2:
         print("map.py areas: needs at least a cell -- `python map.py areas <x>"
               " <z> [WIDTH] [HEIGHT]` (act.py's order; width and height default"
-              " to 1).")
+              " to 1)."
+              + (" Could not read " + ", ".join(repr(u) for u in unread) + "."
+                 if unread else ""))
         return 2
+    if unread:
+        print("map.py areas: IGNORED " + ", ".join(repr(u) for u in unread)
+              + " -- neither a flag nor a coordinate.")
     x0, z0 = nums[0], nums[1]
     w = nums[2] if len(nums) > 2 else 1
     h = nums[3] if len(nums) > 3 else 1
@@ -2232,9 +2266,11 @@ def cmd_rooms(argv):
 
 def cmd_room(argv):
     """`python map.py room <x> <z>` -- the room covering one cell, in full."""
-    nums = [int(v) for v in argv if v.lstrip("-").isdigit()]
+    nums, unread = read_numbers(argv)
     if len(nums) < 2:
-        print("usage: python map.py room <x> <z>")
+        print("usage: python map.py room <x> <z>"
+              + (" -- could not read " + ", ".join(repr(u) for u in unread)
+                 if unread else ""))
         return
     x, z = nums[0], nums[1]
     rim.init()
@@ -2480,6 +2516,7 @@ LAYER_ALIAS = {"terrain": 1, "roof": 1, "roofs": 1, "items": 2, "item": 2,
                "things": 2, "pawns": 3, "pawn": 3, "who": 3, "colonists": 3,
                "animals": 3, "stock": 4, "stockpile": 4, "stockpiles": 4,
                "zones": 4, "zone": 4, "build": 5, "buildings": 5, "building": 5,
+               "bldg": 5, "bldgs": 5,
                "furniture": 5, "beds": 5, "bed": 5, "walls": 5, "doors": 5,
                "desig": 6, "designations": 6, "designation": 6, "orders": 6,
                "rooms": 7, "room": 7}

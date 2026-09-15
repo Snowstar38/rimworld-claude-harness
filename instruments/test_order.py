@@ -209,6 +209,27 @@ class OrderCliTests(unittest.TestCase):
         self.assertEqual("tend", issued["action"])
         self.assertTrue(issued["allowPersistentDraft"])
 
+    def test_dry_run_names_the_rescue_route_and_issues_nothing(self):
+        # BUGS 2026-09-12: --dry-run printed only "would be accepted" and
+        # never said the real call would rescue first.
+        code, text, calls = self.tend_cli(["tend", "Finn", "Octave",
+                                           "--dry-run"])
+        self.assertEqual(0, code)
+        self.assertIn("ROUTE: RESCUE", text)
+        self.assertIn("DRY RUN", text)
+        sent = self.ordered(calls)
+        self.assertEqual(["tend"], [p["action"] for p in sent])
+        self.assertTrue(all(p.get("dryRun") for p in sent))
+
+    def test_dry_run_on_a_drafted_doctor_names_the_lie_route_and_stays_dry(self):
+        code, text, calls = self.tend_cli(["tend", "Finn", "Octave",
+                                           "--dry-run"], drafted=True)
+        self.assertEqual(0, code)
+        self.assertIn("TEND WHERE THEY LIE", text)
+        sent = self.ordered(calls)
+        self.assertTrue(all(p.get("dryRun") for p in sent))
+        self.assertTrue(sent[-1]["allowPersistentDraft"])
+
     def test_no_rescue_refuses_but_still_prints_every_route(self):
         code, text, calls = self.tend_cli(
             ["tend", "Finn", "Octave", "--no-rescue"])
@@ -245,7 +266,8 @@ class OrderCliTests(unittest.TestCase):
         self.assertIn("bill Cut stone blocks", text)
         self.assertEqual("TableStonecutter@126,140", calls[0][1]["target"])
 
-    def menu_cli(self, argv, options, menu_id=7, target_row=None, paused=False):
+    def menu_cli(self, argv, options, menu_id=7, target_row=None, paused=False,
+                 extra=None):
         """Run a menu/do/force command against a mocked float menu."""
         row = target_row or {"thingId": "Thing_Human9", "name": "Octave",
                              "kindDef": "Colonist", "position": {"x": 5, "z": 6}}
@@ -256,8 +278,10 @@ class OrderCliTests(unittest.TestCase):
             if tool == order.TOOL:
                 return reply(target=row)
             if tool == "rimworld/open_context_menu":
-                return {"success": True, "menuId": menu_id, "options": options,
+                menu = {"success": True, "menuId": menu_id, "options": options,
                         "optionCount": len(options), "target": "cell 5,6"}
+                menu.update(extra or {})
+                return menu
             if tool == "rimworld/get_selection_semantics":
                 return {"hasSelection": True, "selectedCount": 1,
                         "selectedObjects": [{"kind": "Zone", "label": "Stockpile 1",
@@ -457,6 +481,22 @@ class StoppedClockTests(unittest.TestCase):
                       text)
         self.assertNotIn("CLOCK IS STOPPED", text)
 
+    def test_a_verified_job_with_a_reason_prints_the_reason_not_the_job(self):
+        """A drafted pawn equips inside the frame, so the companion verifies
+        by EQUIPMENT and says so in verifiedReason (OrderTool, 2026-09-13).
+        Printing "the pawn's job is now Equip" there would be a lie -- the
+        job already ran."""
+        why = ("Verified by EQUIPMENT, not by job: a drafted pawn equips "
+               "instantly, and bolt-action rifle is now the pawn's primary "
+               "weapon.")
+        code, text, _ = self.run_cli(
+            ["equip", "Longhoff", "334862"],
+            reply(action="equip",
+                  job={"def": "Equip", "verified": True, "verifiedReason": why}))
+        self.assertEqual(0, code)
+        self.assertIn(why, text)
+        self.assertNotIn("the pawn's job is now", text)
+
     def test_force_do_on_a_paused_clock_says_queued(self):
         options = [{"index": 1, "label": "Prioritize hauling", "disabled": False}]
         code, text, _, _ = self.menu_cli(
@@ -596,24 +636,48 @@ class CameraBeforeTheClickTests(unittest.TestCase):
 
 
 class EmptyMenuDiagnosisTests(unittest.TestCase):
-    def test_it_names_the_work_type_and_that_the_pawn_is_incapable(self):
+    def diagnose(self, work, standing, at=(122, 140), types=None):
         out = io.StringIO()
         with mock.patch.object(order, "_work_at",
-                               return_value=[("blueprint power conduit",
-                                              "Construction")]),              mock.patch("pawns.live_work_types",
-                        return_value=[{"name": "Construction",
-                                       "disabled": True}]),              mock.patch("sys.stdout", out):
-            order.explain_empty_menu({"name": "Finn"}, (122, 140))
-        text = out.getvalue()
+                               return_value=(work, standing)), \
+             mock.patch("pawns.live_work_types", return_value=types or []), \
+             mock.patch("sys.stdout", out):
+            order.explain_empty_menu({"name": "Finn"}, at)
+        return out.getvalue()
+
+    def test_it_names_the_work_type_and_that_the_pawn_is_incapable(self):
+        text = self.diagnose([("blueprint power conduit", "Construction")], [],
+                             types=[{"name": "Construction", "disabled": True}])
         self.assertIn("at 122,140: blueprint power conduit", text)
         self.assertIn("Finn is INCAPABLE of it", text)
 
-    def test_an_empty_cell_says_there_is_no_work_there_at_all(self):
-        out = io.StringIO()
-        with mock.patch.object(order, "_work_at", return_value=[]),              mock.patch("sys.stdout", out):
-            order.explain_empty_menu({"name": "Finn"}, (10, 20))
-        self.assertIn("NO designation, blueprint or frame at 10,20",
-                      out.getvalue())
+    def test_a_truly_empty_cell_says_the_cell_is_empty_too(self):
+        text = self.diagnose([], [], at=(10, 20))
+        self.assertIn("NO designation, blueprint or frame at 10,20", text)
+        self.assertIn("the cell is EMPTY", text)
+
+    def test_a_finished_building_is_named_instead_of_reading_as_nothing(self):
+        # WEIRD 7 / 13 / 16, three sightings: "there is NO designation,
+        # blueprint or frame at 128,147" seconds after build.py returned
+        # PLACED. The blueprint had finished into a wall.
+        text = self.diagnose([], [("wall", "Building", False)], at=(128, 147))
+        self.assertIn("the cell is NOT empty", text)
+        self.assertIn("a built wall stands at 128,147", text)
+        self.assertIn("the blueprint FINISHED", text)
+        self.assertIn("buildings.py 128,147", text)
+
+    def test_a_bed_cell_names_the_rest_verb_rather_than_an_empty_menu(self):
+        # WEIRD 4: RimWorld auto-takes a click on a bed, so there is no menu
+        # and no "Rest" label anywhere in the game to match.
+        text = self.diagnose([], [("double bed", "Building_Bed", False)],
+                             at=(113, 139))
+        self.assertIn("AUTO-TAKES a click on a bed", text)
+        self.assertIn("python order.py rest <pawn> 113 139", text)
+
+    def test_a_loose_item_is_named_and_pointed_at_haul(self):
+        text = self.diagnose([], [("steel", "ThingWithComps", True)])
+        self.assertIn("steel (forbidden)", text)
+        self.assertIn("order.py haul", text)
 
 
 class HaulStorageVersusReachTests(unittest.TestCase):
@@ -649,6 +713,524 @@ class HaulStorageVersusReachTests(unittest.TestCase):
             self.refusal(betterStorageFoundIgnoringCarrier=False),
             {"name": "Lucas"}, {"name": "steel"})
         self.assertTrue(any("confirmed storage-side" in l for l in lines))
+
+
+class RestTests(unittest.TestCase):
+    """WEIRD 4: `force <pawn> <bed cell> "Rest"` returns 0 options, because
+    RimWorld auto-takes a click on a bed and there is no "Rest" label anywhere
+    in the game. `rest` is the verb that exists instead."""
+
+    run_cli = OrderCliTests.run_cli
+    ordered = OrderCliTests.ordered
+
+    def rested(self, **kw):
+        return reply(action="rest", job={"def": "LayDown", "verified": True},
+                     **kw)
+
+    def test_a_bed_cell_is_sent_as_x_z_not_as_an_ambiguous_target(self):
+        code, text, calls = self.run_cli(["rest", "Ian", "113", "139"],
+                                         self.rested())
+        self.assertEqual(0, code)
+        sent = self.ordered(calls)[0]
+        self.assertEqual("rest", sent["action"])
+        self.assertEqual((113, 139), (sent["x"], sent["z"]))
+        self.assertNotIn("target", sent)
+        self.assertIn("ORDER ISSUED", text)
+
+    def test_a_comma_cell_is_the_same_call_as_a_bare_pair(self):
+        _, _, calls = self.run_cli(["rest", "Ian", "113,139"], self.rested())
+        sent = self.ordered(calls)[0]
+        self.assertEqual((113, 139), (sent["x"], sent["z"]))
+
+    def test_a_named_bed_stays_a_target(self):
+        _, _, calls = self.run_cli(["rest", "Ian", "Bed@113,139"], self.rested())
+        sent = self.ordered(calls)[0]
+        self.assertEqual("Bed@113,139", sent["target"])
+        self.assertNotIn("x", sent)
+
+    def test_no_target_at_all_lets_the_game_find_the_pawns_own_bed(self):
+        _, _, calls = self.run_cli(["rest", "Ian"], self.rested())
+        sent = self.ordered(calls)[0]
+        self.assertEqual({"action", "pawn"}, set(sent) - {"watch", "draft"})
+
+    def test_rest_belongs_to_the_ledger_during_a_combat_session(self):
+        with mock.patch.object(order.rim, "init"), \
+             mock.patch.object(order, "combat_session", return_value={"active": True}), \
+             mock.patch.object(order.rim, "game",
+                               side_effect=AssertionError("called the game")), \
+             mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            code = order.main(["rest", "Ian", "113", "139"])
+        self.assertEqual(1, code)
+        self.assertIn("python combat.py end", out.getvalue())
+
+
+class MoveAndDraftTests(unittest.TestCase):
+    """WEIRD 4 and 64: `goto` auto-drafted and never undrafted, and there was
+    no `move`. Both halves are one verb with two names now, and what happens to
+    the draft is printed before the order is sent."""
+
+    run_cli = OrderCliTests.run_cli
+    ordered = OrderCliTests.ordered
+
+    def moved(self):
+        return reply(action="goto", job={"def": "Goto", "verified": True})
+
+    def test_move_is_the_same_verb_as_goto(self):
+        code, text, calls = self.run_cli(["move", "Ada", "140", "152"],
+                                         self.moved())
+        self.assertEqual(0, code)
+        self.assertEqual("goto", self.ordered(calls)[0]["action"])
+        self.assertEqual((140, 152), (self.ordered(calls)[0]["x"],
+                                      self.ordered(calls)[0]["z"]))
+
+    def test_the_default_says_the_pawn_stays_drafted(self):
+        _, text, calls = self.run_cli(["goto", "Ada", "140", "152"],
+                                      self.moved())
+        self.assertIn("DRAFTED MOVE", text)
+        self.assertIn("STAYS drafted", text)
+        self.assertIn("python order.py undraft Ada", text)
+        self.assertNotIn("draft", self.ordered(calls)[0])
+
+    def test_undraft_moves_them_without_drafting_at_all(self):
+        _, text, calls = self.run_cli(["move", "Ada", "140", "152", "--undraft"],
+                                      self.moved())
+        self.assertIn("UNDRAFTED MOVE", text)
+        self.assertIn("Nothing is left drafted", text)
+        self.assertFalse(self.ordered(calls)[0]["draft"])
+
+    def test_the_two_draft_flags_are_opposites_and_are_refused_together(self):
+        with mock.patch.object(order.rim, "init",
+                               side_effect=AssertionError("touched the game")), \
+             mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            code = order.main(["goto", "Ada", "1", "2", "--undraft",
+                               "--stay-drafted"])
+        self.assertEqual(1, code)
+        self.assertIn("opposites", out.getvalue())
+
+
+class PawnFirstTests(unittest.TestCase):
+    """WEIRD 64: `order.py force` needs a pawn id first, or it reads the
+    x-coordinate as a pawn name."""
+
+    def refuse(self, argv):
+        with mock.patch.object(order.rim, "init",
+                               side_effect=AssertionError("touched the game")), \
+             mock.patch.object(order.rim, "game",
+                               side_effect=AssertionError("touched the game")), \
+             mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            code = order.main(argv)
+        return code, out.getvalue()
+
+    def test_a_cell_with_no_pawn_is_refused_with_the_shape_it_wanted(self):
+        code, text = self.refuse(["force", "128", "147", "--do"])
+        self.assertEqual(1, code)
+        self.assertIn("takes the PAWN first", text)
+        self.assertIn("python order.py force <pawn> 128 147", text)
+
+    def test_a_real_bare_number_pawn_id_is_never_refused(self):
+        # A thingIDNumber is 5+ digits; the guard must not eat one.
+        with mock.patch.object(order.rim, "init",
+                               side_effect=RuntimeError("parsed")), \
+             mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            code = order.main(["force", "334862", "128", "147"])
+        self.assertEqual(1, code)
+        self.assertNotIn("takes the PAWN first", out.getvalue())
+
+    def test_a_named_pawn_is_never_refused(self):
+        with mock.patch.object(order.rim, "init",
+                               side_effect=RuntimeError("parsed")), \
+             mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            code = order.main(["force", "Finn", "128", "147"])
+        self.assertEqual(1, code)
+        self.assertNotIn("takes the PAWN first", out.getvalue())
+
+
+class SessionRefusalTests(unittest.TestCase):
+    """WEIRD 64 read "order.py refuses while a combat ledger is open" as the
+    whole tool being shut. Only the draft-changing verbs are."""
+
+    def test_the_refusal_names_what_still_works_and_what_closes_the_ledger(self):
+        with mock.patch.object(order.rim, "init"), \
+             mock.patch.object(order, "combat_session", return_value={"active": True}), \
+             mock.patch.object(order.rim, "game",
+                               side_effect=AssertionError("called the game")), \
+             mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            code = order.main(["goto", "Ada", "140", "152"])
+        text = out.getvalue()
+        self.assertEqual(1, code)
+        self.assertIn("ONLY the draft-changing verbs are refused", text)
+        for verb in ("haul", "work", "force", "menu"):
+            self.assertIn(verb, text)
+        self.assertIn("python combat.py end", text)
+
+
+class BenchLabelTests(unittest.TestCase):
+    """WEIRD 1: a recipe name is not a float-menu label. The stove's option is
+    "Prioritize cooking at fueled stove"."""
+
+    menu_cli = OrderCliTests.menu_cli
+
+    STOVE = [{"index": 1, "label": "Prioritize cooking at fueled stove",
+              "disabled": False},
+             {"index": 2, "label": "Go here", "disabled": False}]
+
+    def test_a_recipe_name_falls_back_to_the_one_work_at_bench_option(self):
+        code, text, _, calls = self.menu_cli(
+            ["force", "Ada", "126", "140", "Cook simple meal", "--do"],
+            self.STOVE)
+        self.assertEqual(0, code)
+        self.assertIn("is not a float-menu label", text)
+        self.assertIn("bills.py", text)
+        ran = [p for t, p in calls
+               if t == "rimworld/execute_context_menu_option"]
+        self.assertEqual([{"label": "Prioritize cooking at fueled stove"}], ran)
+
+    def test_two_work_at_bench_options_are_never_guessed_between(self):
+        options = self.STOVE + [{"index": 3,
+                                 "label": "Prioritize hauling at fueled stove",
+                                 "disabled": False}]
+        code, text, _, calls = self.menu_cli(
+            ["force", "Ada", "126", "140", "Cook simple meal", "--do"], options)
+        self.assertEqual(1, code)
+        self.assertNotIn("rimworld/execute_context_menu_option",
+                         [t for t, _ in calls])
+
+    def test_a_miss_prints_every_label_and_names_the_menu_command(self):
+        code, text, _, _ = self.menu_cli(
+            ["force", "Ada", "126", "140", "Cook simple meal", "--do"],
+            [{"index": 1, "label": "Go here", "disabled": False}])
+        self.assertEqual(1, code)
+        self.assertIn("'Go here'", text)
+        self.assertIn("python order.py menu Ada 126,140", text)
+
+
+class ReservedTargetTests(unittest.TestCase):
+    """WEIRD 30: "Prioritize tending to Lucas: Reserved by Longhoff" was
+    offered enabled and issued without a word. It is issued, loudly."""
+
+    menu_cli = OrderCliTests.menu_cli
+
+    OPTIONS = [{"index": 1,
+                "label": "Prioritize tending to Lucas: Reserved by Longhoff",
+                "disabled": False}]
+
+    def test_it_issues_and_says_the_other_pawn_loses_the_job(self):
+        code, text, _, calls = self.menu_cli(
+            ["force", "Finn", "Lucas", "--do"], self.OPTIONS)
+        self.assertEqual(0, code)
+        self.assertIn("!! PRE-EMPT", text)
+        self.assertIn("Longhoff", text)
+        self.assertIn("TWO pawns re-tasked", text)
+        self.assertTrue([p for t, p in calls
+                         if t == "rimworld/execute_context_menu_option"])
+
+    def test_the_dry_run_warns_before_the_do(self):
+        code, text, _, _ = self.menu_cli(["force", "Finn", "Lucas"],
+                                         self.OPTIONS)
+        self.assertEqual(0, code)
+        self.assertIn("!! PRE-EMPT", text)
+        self.assertIn("DRY RUN", text)
+
+    def test_an_unreserved_option_says_nothing_about_pre_empting(self):
+        code, text, _, _ = self.menu_cli(
+            ["force", "Finn", "Lucas"],
+            [{"index": 1, "label": "Prioritize tending to Lucas",
+              "disabled": False}])
+        self.assertNotIn("PRE-EMPT", text)
+
+
+class RefusalCarriesTheLabelsTests(unittest.TestCase):
+    """WEIRD 6: "3 enabled options" and "'conduit' matched 2 enabled options"
+    are refusals nobody can act on without the labels."""
+
+    menu_cli = OrderCliTests.menu_cli
+
+    def test_an_ambiguous_substring_names_both_labels(self):
+        options = [{"index": 1, "label": "Prioritize building conduit (A)",
+                    "disabled": False},
+                   {"index": 2, "label": "Prioritize building conduit (B)",
+                    "disabled": False}]
+        code, text, _, _ = self.menu_cli(
+            ["force", "Ada", "131", "139", "conduit", "--do"], options)
+        self.assertEqual(1, code)
+        self.assertIn("'Prioritize building conduit (A)'", text)
+        self.assertIn("'Prioritize building conduit (B)'", text)
+
+    def test_three_prioritize_options_with_no_substring_name_all_three(self):
+        options = [{"index": i, "label": "Prioritize thing %d" % i,
+                    "disabled": False} for i in (1, 2, 3)]
+        code, text, _, _ = self.menu_cli(
+            ["force", "Ada", "131", "139", "--do"], options)
+        self.assertEqual(1, code)
+        self.assertIn("3 enabled", text)
+        for i in (1, 2, 3):
+            self.assertIn("'Prioritize thing %d'" % i, text)
+
+    def test_no_prioritize_option_at_all_still_names_what_was_offered(self):
+        code, text, _, _ = self.menu_cli(
+            ["force", "Ada", "131", "139", "--do"],
+            [{"index": 1, "label": "Go here", "disabled": False}])
+        self.assertEqual(1, code)
+        self.assertIn("'Go here'", text)
+
+
+class EmptyMenuIsAnAnswerTests(unittest.TestCase):
+    """WEIRD 33 and 53: zero options is the game answering. It must not read
+    as the tool failing, and the payload's own reason must be printed."""
+
+    menu_cli = OrderCliTests.menu_cli
+
+    def test_the_bridge_reason_and_the_cell_it_clicked_are_printed(self):
+        code, text, _, _ = self.menu_cli(
+            ["menu", "Finn", "132", "142"], [], menu_id=0,
+            extra={"message": "no options were offered",
+                   "provider": "ui_event",
+                   "clickCell": {"x": 132, "z": 142}})
+        self.assertEqual(1, code)
+        self.assertIn("the click landed at 132,142", text)
+        self.assertIn("no options were offered", text)
+        self.assertIn("ANSWERED", text)
+
+    def test_a_caravan_member_is_named_as_the_wrong_person_not_a_failure(self):
+        row = {"thingId": "Thing_Human77", "name": "Kesi", "kindDef": "Trader",
+               "isPawn": True, "isPlayerFaction": False,
+               "faction": "Nathanite tribe", "hostileToPlayer": False,
+               "position": {"x": 20, "z": 30}}
+        code, text, _, _ = self.menu_cli(["menu", "Finn", "Thing_Human77"], [],
+                                         menu_id=0, target_row=row)
+        self.assertEqual(1, code)
+        self.assertIn("no options for this pawn", text)
+        self.assertIn("Nathanite tribe", text)
+        self.assertIn("python trade.py", text)
+
+    def test_one_of_our_own_pawns_gets_no_caravan_advice(self):
+        row = {"thingId": "Thing_Human9", "name": "Octave", "kindDef": "Colonist",
+               "isPawn": True, "isPlayerFaction": True, "faction": "New Arrival",
+               "position": {"x": 5, "z": 6}}
+        code, text, _, _ = self.menu_cli(["menu", "Finn", "Octave"], [],
+                                         menu_id=0, target_row=row)
+        self.assertNotIn("trade.py", text)
+
+    def test_an_older_companion_that_sends_no_flag_says_nothing_about_it(self):
+        row = {"thingId": "Thing_Human77", "name": "Kesi", "kindDef": "Trader",
+               "faction": "Nathanite tribe", "position": {"x": 20, "z": 30}}
+        code, text, _, _ = self.menu_cli(["menu", "Finn", "Thing_Human77"], [],
+                                         menu_id=0, target_row=row)
+        self.assertNotIn("trade.py", text)
+
+
+
+class DeployCliTests(unittest.TestCase):
+    """`order.py deploy` -- the worn-pack gizmo, WEIRD of 2026-09-08.
+
+    Two colonists wore turret packs and four map clicks were swallowed without
+    a word. The verdict lines below are the whole point of the verb: a refusal
+    must name WHICH of the two gates failed and print cells that would work.
+    """
+
+    def deploy_reply(self, success=True, error=None, kind=None, deploy=None,
+                     job=None):
+        block = {
+            "ok": success,
+            "reason": error,
+            "reasonKind": kind,
+            "rule": ("A pack deploy is a THROWN GRENADE, not a build order. "
+                     "The cell must (1) hold NO Building at all ... and (2) be "
+                     "inside the verb's range AND in LINE OF SIGHT of the pawn."),
+            "cell": {"x": 139, "z": 118},
+            "pack": {"thingId": "Thing_Apparel_PackTurret501", "oneUse": True,
+                     "defName": "Apparel_PackTurret", "label": "Turret pack",
+                     "gizmoLabel": "deploy turret", "charges": 1,
+                     "maxCharges": 1, "verbClass": "Verb_LaunchProjectileStaticOneUse"},
+            "checks": {"standable": True, "buildingOnCell": None,
+                       "distance": 11.2, "range": 22.9, "lineOfSight": True,
+                       "inRange": True, "canHitTarget": True, "canReserve": True},
+            "validCellsNearby": [],
+            "validCellsOrigin": None,
+        }
+        block.update(deploy or {})
+        return {
+            "success": success,
+            "action": "deploy",
+            "error": error,
+            "errorKind": kind,
+            "pawn": {"thingId": "Thing_Human618", "name": "Ernst",
+                     "drafted": False, "downed": False, "dead": False},
+            "target": {"thingId": "Thing_Apparel_PackTurret501",
+                       "name": "Turret pack", "hostileToPlayer": False,
+                       "downed": False},
+            "job": job,
+            "diagnostics": {"deploy": block},
+            "watch": {"shown": False},
+        }
+
+    def run_cli(self, argv, answer):
+        calls = []
+
+        def game(tool, params=None, strict=True):
+            calls.append((tool, params))
+            if tool == order.TOOL:
+                return answer
+            if tool == order.clock.TOOL:
+                return {"success": True,
+                        "time": {"paused": False, "forcePaused": False,
+                                 "timeSpeed": "Normal", "ticksGame": 5000}}
+            return {"success": True}
+
+        with mock.patch.object(order.rim, "game", side_effect=game), \
+             mock.patch.object(order.rim, "init"), \
+             mock.patch.object(order, "check_modal"), \
+             mock.patch.object(order, "combat_session", return_value=None), \
+             mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            code = order.main(argv)
+        return code, out.getvalue(), [p for t, p in calls if t == order.TOOL]
+
+    def test_a_bare_call_is_a_dry_run_because_the_pack_has_one_charge(self):
+        code, text, calls = self.run_cli(
+            ["deploy", "Ernst", "139", "118"], self.deploy_reply())
+        self.assertEqual(0, code)
+        self.assertIs(True, calls[0]["dryRun"])
+        self.assertEqual("deploy", calls[0]["action"])
+        self.assertEqual(139, calls[0]["x"])
+        self.assertEqual(118, calls[0]["z"])
+        self.assertIn("DRY RUN", text)
+        self.assertNotIn("ORDER ISSUED", text)
+
+    def test_do_is_what_spends_the_pack_and_says_so_before_sending(self):
+        code, text, calls = self.run_cli(
+            ["deploy", "Ernst", "139", "118", "--do"],
+            self.deploy_reply(job={"def": "UseVerbOnThingStaticReserve",
+                                   "verified": True}))
+        self.assertEqual(0, code)
+        self.assertNotIn("dryRun", calls[0])
+        self.assertIn("SPENDING THE PACK", text)
+        self.assertIn("ORDER ISSUED", text)
+        self.assertIn("UseVerbOnThingStaticReserve", text)
+
+    def test_dry_run_wins_over_do(self):
+        code, text, calls = self.run_cli(
+            ["deploy", "Ernst", "139", "118", "--do", "--dry-run"],
+            self.deploy_reply())
+        self.assertIs(True, calls[0]["dryRun"])
+        self.assertIn("DRY RUN", text)
+
+    def test_the_rule_is_printed_even_when_the_cell_is_accepted(self):
+        code, text, _ = self.run_cli(
+            ["deploy", "Ernst", "139", "118"], self.deploy_reply())
+        self.assertIn("THE RULE", text)
+        self.assertIn("THROWN GRENADE", text)
+        self.assertIn("deploy turret", text)
+
+    def test_a_dry_run_names_the_job_it_would_issue_and_says_it_did_not(self):
+        reply = self.deploy_reply()
+        reply["wouldIssue"] = {"def": "UseVerbOnThingStaticReserve",
+                               "issued": False, "verified": False}
+        code, text, _ = self.run_cli(["deploy", "Ernst", "139", "118"], reply)
+        self.assertEqual(0, code)
+        self.assertIn("UseVerbOnThingStaticReserve", text)
+        self.assertIn("nothing issued", text)
+        self.assertIn("job.verbToUse", text)
+
+    def test_no_line_of_sight_names_the_gate_and_exits_non_zero(self):
+        code, text, _ = self.run_cli(
+            ["deploy", "Ernst", "139", "118"],
+            self.deploy_reply(
+                success=False,
+                kind="deploy_no_line_of_sight",
+                error="Ernst cannot throw Turret pack to (139,118): it is IN "
+                      "range (11.2 of 22.9) but there is NO LINE OF SIGHT.",
+                deploy={"checks": {"standable": True, "buildingOnCell": None,
+                                   "distance": 11.2, "range": 22.9,
+                                   "lineOfSight": False, "inRange": True,
+                                   "canHitTarget": False, "canReserve": True},
+                        "validCellsNearby": [
+                            {"x": 139, "z": 124, "distanceFromAsked": 6,
+                             "distanceFromPawn": 7},
+                            {"x": 140, "z": 124, "distanceFromAsked": 6,
+                             "distanceFromPawn": 8}],
+                        "validCellsOrigin": "askedCell"}))
+        self.assertEqual(1, code)
+        self.assertIn("ORDER REFUSED  deploy_no_line_of_sight", text)
+        self.assertIn("NO LINE OF SIGHT", text)
+        self.assertIn("line of sight NO", text)
+        self.assertIn("2 cell(s) this pawn CAN deploy onto", text)
+        self.assertIn("139,124", text)
+
+    def test_a_building_on_the_cell_is_named_not_merely_refused(self):
+        code, text, _ = self.run_cli(
+            ["deploy", "Reikguard", "141", "119"],
+            self.deploy_reply(
+                success=False,
+                kind="deploy_cell_blocked",
+                error="(141,119) holds sandstone wall (Thing_Wall33). ANY "
+                      "Building refuses the cell.",
+                deploy={"checks": {"standable": False,
+                                   "buildingOnCell": "sandstone wall (Thing_Wall33)",
+                                   "distance": 3.0, "range": 22.9,
+                                   "lineOfSight": True, "canReserve": True},
+                        "validCellsNearby": [],
+                        "validCellsOrigin": None}))
+        self.assertEqual(1, code)
+        self.assertIn("ORDER REFUSED  deploy_cell_blocked", text)
+        self.assertIn("building sandstone wall", text)
+        self.assertIn("standable NO", text)
+
+    def test_an_old_companion_without_the_op_says_so_rather_than_going_quiet(self):
+        reply = self.deploy_reply(success=False, kind="bad_arguments",
+                                  error="'deploy' is not an action.")
+        reply["diagnostics"] = {}
+        code, text, _ = self.run_cli(["deploy", "Ernst", "139", "118"], reply)
+        self.assertEqual(1, code)
+        self.assertIn("has no `deploy` op", text)
+        self.assertIn("INSTALL.md", text)
+
+    def test_deploy_survives_an_open_combat_session_because_it_never_drafts(self):
+        self.assertIn("deploy", order.SESSION_SAFE)
+        self.assertNotIn("deploy", order.DRAFTING_VERBS)
+
+
+class ForeignTargetTest(unittest.TestCase):
+    """A caravan member who is not the trader must NAME the trader.
+
+    Live 2026-09-12 (Threadneedle, Allalljalor visitors): `order.py menu
+    Reikguard Paulo` answered correctly -- "a visiting caravan has exactly one
+    member you can act on" -- and then pointed at `python trade.py` instead of
+    saying "Kat". BUGS.md promises the name, and `home/trade` is a read the
+    refusal can afford.
+    """
+
+    ROW = {"isPawn": True, "name": "Paulo", "faction": "Allalljalor",
+           "isPlayerFaction": False, "hostileToPlayer": False}
+
+    TRADE = {"success": True,
+             "traders": [{"name": "Kat", "id": "Thing_Human49495",
+                          "faction": "Allalljalor", "canTradeNow": True}]}
+
+    def explain(self, game):
+        with mock.patch.object(order.rim, "game", side_effect=game),              mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            order.explain_foreign_target(self.ROW)
+        return out.getvalue()
+
+    def test_the_trader_is_named_on_the_refusal(self):
+        text = self.explain(lambda tool, args, **kw: self.TRADE)
+        self.assertIn("Kat", text)
+        self.assertIn("Thing_Human49495", text)
+        self.assertIn("belongs to Allalljalor", text)
+
+    def test_a_trader_of_another_faction_is_not_claimed_as_this_caravan(self):
+        other = {"success": True,
+                 "traders": [{"name": "Somebody", "id": "Thing_Human1",
+                              "faction": "Elsewhere", "canTradeNow": True}]}
+        text = self.explain(lambda tool, args, **kw: other)
+        self.assertNotIn("Somebody", text)
+        self.assertIn("python trade.py", text)
+
+    def test_a_dead_home_trade_falls_back_instead_of_raising(self):
+        def boom(tool, args, **kw):
+            raise RuntimeError("no such tool")
+        text = self.explain(boom)
+        self.assertIn("python trade.py", text)
+        self.assertIn("scenery", text)
 
 
 if __name__ == "__main__":

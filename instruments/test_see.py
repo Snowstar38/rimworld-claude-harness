@@ -19,7 +19,8 @@ class SeeTests(unittest.TestCase):
                     calls.append((name, args))
                     return result
                 return action
-            with patch.object(see.cam, "base_cell", return_value=(118, 144, "pinned")), \
+            with patch.object(see, "_entry_scene", return_value=False), \
+                 patch.object(see.cam, "base_cell", return_value=(118, 144, "pinned")), \
                  patch.object(see.camlock, "claim", side_effect=record("claim", None)), \
                  patch.object(see.cam, "set_zoom", side_effect=record("zoom", {"success": True})), \
                  patch.object(see.cam, "jump_to", side_effect=record("jump", {"success": moved})), \
@@ -34,6 +35,26 @@ class SeeTests(unittest.TestCase):
                 except (RuntimeError, ValueError) as exc:
                     error = str(exc)
             return calls, error
+
+    def test_entry_scene_skips_camera_and_still_captures(self):
+        with tempfile.TemporaryDirectory() as temp:
+            image = Path(temp) / "entry.png"
+            image.write_bytes(b"entry")
+            calls = []
+            with patch.object(see, "_entry_scene", return_value=True), \
+                 patch.object(see.cam, "set_zoom", side_effect=AssertionError("zoom")), \
+                 patch.object(see.cam, "jump_to", side_effect=AssertionError("jump")), \
+                 patch.object(see.cam, "shoot", side_effect=lambda name: (calls.append(name), str(image))[1]), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                result = see.capture(118, 144)
+        self.assertEqual(str(image), result)
+        self.assertEqual(1, len(calls))
+
+    def test_entry_probe_accepts_real_screen_targets_envelope(self):
+        reply = {"success": True, "targets": {"uiState": {
+            "programState": "Entry", "inEntryScene": True}}}
+        with patch.object(see.rim, "game", return_value=reply):
+            self.assertTrue(see._entry_scene())
 
     def test_default_claims_then_centres_base_then_takes_one_image(self):
         calls, error = self.run_capture()
@@ -92,6 +113,47 @@ class FreshnessTests(unittest.TestCase):
             fresh.write_bytes(b"new")
             self.assertEqual(fresh.resolve(),
                              see._fresh_file(Path(temp) / "never-written.png", started))
+
+
+class CoordinateFormTests(unittest.TestCase):
+    """`x z` and `x,z` are the same cell. Every instrument here takes one of the
+    two and refuses the other, so the form a turn types is a coin flip."""
+
+    def test_both_forms_parse_to_the_same_cell(self):
+        self.assertEqual([118, 144], see.cells(["118", "144"]))
+        self.assertEqual([118, 144], see.cells(["118,144"]))
+        self.assertEqual([118, 144], see.cells(["118, 144"]))
+        self.assertEqual([], see.cells([]))
+
+    def test_a_word_is_not_a_coordinate(self):
+        with self.assertRaises(ValueError):
+            see.cells(["middle"])
+
+    def _main(self, argv):
+        import sys
+        from unittest.mock import patch
+        with patch.object(sys, "argv", ["see.py"] + argv),              patch.object(see.rim, "init"),              patch.object(see, "capture", return_value="x.png") as capture,              contextlib.redirect_stderr(io.StringIO()),              contextlib.redirect_stdout(io.StringIO()):
+            code = see.main()
+        return code, capture
+
+    def test_the_comma_form_reaches_capture(self):
+        code, capture = self._main(["118,144"])
+        self.assertEqual(0, code)
+        self.assertEqual((118, 144), capture.call_args.args)
+
+    def test_the_space_form_reaches_capture_unchanged(self):
+        code, capture = self._main(["118", "144"])
+        self.assertEqual(0, code)
+        self.assertEqual((118, 144), capture.call_args.args)
+
+    def test_no_coordinates_still_means_base(self):
+        code, capture = self._main([])
+        self.assertEqual(0, code)
+        self.assertEqual((None, None), capture.call_args.args)
+
+    def test_a_half_cell_is_refused_rather_than_guessed_at(self):
+        with self.assertRaises(SystemExit):
+            self._main(["118"])
 
 
 if __name__ == "__main__":

@@ -1366,7 +1366,130 @@ def rooms_section(cap=ROOM_CAP):
                                  "%s: %s" % (type(e).__name__, e))
 
 
+# ----------------------------------------------------------- the line budget
+
+# A Scout reads this brief with a small context and one job, so the brief has a
+# LINE BUDGET as well as the per-group row caps each section already keeps. The
+# policy is written out at the top of scout_brief()'s docstring, which is where
+# somebody holding a printed brief will look for it; these are the numbers it
+# names. Raising one is a decision about what a reader can hold, not a typo.
+SECTION_CAPS = {"BUILDINGS": 12, "COLONISTS": 14, "ROOMS": 8}
+
+
+def _is_head(line):
+    """A group heading inside a section: exactly two spaces of indent."""
+    return line.startswith("  ") and not line.startswith("   ")
+
+
+def _is_detail(line):
+    """A row underneath a heading: three or more spaces of indent."""
+    return line.startswith("   ")
+
+
+# A detail row that must survive the budget whatever else goes: it says a check
+# DID NOT RUN, and a dropped one of those reads as an all-clear -- the exact
+# silent zero every section in this file is written against.
+PROTECTED = ("DID NOT RUN", "UNAVAILABLE", "UNCHECKED", "NOT CHECKED", "UNREAD")
+
+
+def _protected(line):
+    return any(w in line for w in PROTECTED)
+
+
+def _cap(lines, n, label):
+    """Hold one section to n lines, ending with `... and N more` when it cut.
+
+    SHEDS SAMPLE ROWS BEFORE IT DROPS GROUPS, which is the whole point of
+    having a budget rather than a slice. Each section is a short list of group
+    HEADLINES -- "POWER/FUEL: 6 flagged -- unpowered 6, out of fuel 0" -- with
+    a few indented SAMPLE ROWS under each naming individuals. The headline
+    carries a complete count; a sample row carries one name. So when the
+    section is over budget the rows go first, from the bottom group upward,
+    and every group keeps the line that says how many. A Scout who reads
+    "POWER/FUEL: 6 flagged" can go look; a Scout whose POWER/FUEL group was
+    sliced off entirely reads the silence as "nothing unpowered", which is the
+    failure this file exists to prevent.
+
+    Three rules:
+
+      * the cap STATES ITSELF in the text it truncated -- a Scout who cannot see
+        the rest must at least be told the rest exists, and told the command
+        that prints it. An absent tail reads as "that was everything";
+      * a row saying a check DID NOT RUN is never shed (see PROTECTED). It is
+        not a sample, it is the absence of one;
+      * if headlines alone still overrun the budget the section is cut from the
+        bottom -- sections write themselves most-relevant-first -- and the cut
+        backs up rather than leave a heading standing over rows that are gone.
+    """
+    lines = list(lines)
+    if len(lines) <= n:
+        return lines
+
+    keep = [True] * len(lines)
+    for i in range(len(lines) - 1, 0, -1):
+        if sum(keep) <= n:
+            break
+        if _is_detail(lines[i]) and not _protected(lines[i]):
+            keep[i] = False
+    kept = [l for l, k in zip(lines, keep) if k]
+    gone = len(lines) - len(kept)
+
+    if len(kept) > n:
+        cut = n
+        while cut > 1 and _is_head(kept[cut - 1]) and _is_detail(kept[cut]):
+            cut -= 1
+        gone += len(kept) - cut
+        kept = kept[:cut]
+
+    return kept + [
+        "  ... and %d more %s line(s) not shown -- %s is budgeted at %d lines "
+        "for a reader with limited context, and sample rows go before group "
+        "headlines do. Every headline above still carries its complete "
+        "count; `python rota.py %s` prints the section in full."
+        % (gone, label.lower(), label, n, label.lower())]
+
+
+def _capped(text, label):
+    """One composed section, held to its budget in SECTION_CAPS."""
+    return "\n".join(_cap(str(text).splitlines(), SECTION_CAPS[label], label))
+
+
 def scout_brief(which):
+    """One Scout brief: the question, the Hands seed, three read sections, rules.
+
+    ## The line budget
+
+    Each read section is held to a fixed number of lines by _cap(). The caps are
+    here to keep the USEFUL rows on top, not merely to make the brief shorter:
+    every section below already writes itself most-relevant-first, so the cap
+    cuts from the bottom and what survives is the part that changes what a Scout
+    notices.
+
+      BUILDINGS  12 lines, in the order buildings_summary() writes them --
+                 the starving frame (pending work SHORT OF MATERIALS, with the
+                 per-resource shortfall), the rolled-up resource deficit, the
+                 flagged bill queues, the live queues that CANNOT RUN for want
+                 of ingredients, then unpowered / switched off / broken down /
+                 out of fuel, then the scope line. Sample rows inside each of
+                 those groups are capped again at BUILD_CAP (3).
+      COLONISTS  14 lines -- the pawn alerts that name a colonist, High and
+                 Critical first, ALERT_CAP (6) of them; then weapons (who is
+                 holding nothing), then apparel (what is bare or falling
+                 apart), then the scope line. The gear lines are the ANSWER to
+                 the alert lines and tag pawns `[alerted]`, so they are never
+                 reordered ahead of them. Rows inside a group: PAWN_CAP (4).
+      ROOMS       8 lines -- the rooms actually holding colonists, coldest
+                 first; the two ends of the indoor temperature range; the rooms
+                 that would not report a temperature at all; one count line for
+                 everything else; then the scope line. Names per line:
+                 ROOM_CAP (3).
+
+    When a cap cuts anything, the section ends with one `... and N more` line
+    that says how many lines went and the command that prints the section in
+    full. A section whose read FAILED is a five-to-seven-line loud marker and
+    fits every budget above intact -- a truncated failure marker would be the
+    one truncation that could be read as an all-clear.
+    """
     body = SCOUT_A if which == 0 else SCOUT_B
     seed = ""
     try:
@@ -1401,8 +1524,11 @@ def scout_brief(which):
     # standing in a -14C room" has to arrive there unasked or it does not
     # arrive at all.
     return "%s%s\n%s\n\n%s\n\n%s\n\n%s\n" % (
-        body, seed, buildings_section(), colonists_section(),
-        rooms_section(), SCOUT_RULES)
+        body, seed,
+        _capped(buildings_section(), "BUILDINGS"),
+        _capped(colonists_section(), "COLONISTS"),
+        _capped(rooms_section(), "ROOMS"),
+        SCOUT_RULES)
 
 
 # ------------------------------------------------------------- scouts by Sol
@@ -2257,6 +2383,22 @@ def _self_test():
     print(rooms_summary({"success": False, "tool": "home/list_rooms",
                          "error": "home/list_rooms requires an active map."},
                         when="00:00:00"))
+    print("\n--- the line budget: what a Scout actually receives ---")
+    print("Sections compose in full for `python rota.py buildings|colonists|"
+          "rooms`; scout_brief() holds each to SECTION_CAPS. Sample rows shed "
+          "from the lower groups up, so every headline keeps its count.")
+    for label, txt in (
+            ("BUILDINGS", buildings_summary(_fixture("flood"), when="00:00:00")),
+            ("COLONISTS", colonists_summary(_pawn_fixture("flood"),
+                                            _alert_fixture("truncated"),
+                                            when="00:00:00")),
+            ("ROOMS", rooms_summary(_room_fixture("flood"), when="00:00:00"))):
+        capped = _capped(txt, label)
+        print("\n%s: %d line(s) composed, %d in the brief (budget %d)"
+              % (label, len(txt.splitlines()), len(capped.splitlines()),
+                 SECTION_CAPS[label]))
+        print(capped)
+
     print("\n" + BANNER)
     return 0
 

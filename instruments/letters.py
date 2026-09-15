@@ -7,8 +7,20 @@
   python letters.py decide           # acknowledge it: click its own Close/OK
   python letters.py sweep [seconds]  # auto-dismiss stale announcements (see below)
   python letters.py dismiss <id>     # explicit right-click dismissal, game validates
+                                     #   (refused on a letter somebody has to
+                                     #   answer; --anyway overrides)
   python letters.py --windows        # the raw window list, and what the scan made of it
   (add --no-hold to skip the viewer hold, below)
+
+## The dialog force-pauses the game
+
+Every letter dialog is a `Verse.Dialog_NodeTree`, which sets `forcePause`, and
+supervised play's watcher stops on any force pause without saying so. `open` and
+`decide` read the play service before and after and print the restart line when
+it went. `decide` also reads the window stack back: an option can resolve into a
+SECOND node-tree dialog, and one of those left standing holds the clock forever.
+A letter whose every decision is DISABLED is refused rather than opened -- see
+`is_expired` -- because opening it would force-pause for nothing.
 
 Letters are the game's only synchronous "you choose" channel, and the two fields
 that classify one are `choices[]` -- what the letter's dialog will offer -- and
@@ -188,9 +200,16 @@ def pending(limit=STACK_ALL):
             "auto": bool(l.get("shouldAutomaticallyOpenLetter")),
             "dismissible": bool(l.get("canDismissWithRightClick")),
             "text": _clean(l.get("text")),
+            # `closesDialog` is the option's `resolveTree`: false means clicking
+            # it does NOT close the box, it links to another page of the same
+            # dialog. That is the difference between answering a letter and
+            # leaving a force-pausing modal standing.
             "choices": [{"index": c.get("index"), "text": c.get("text"),
                          "disabled": bool(c.get("disabled")),
-                         "disabledReason": c.get("disabledReason")}
+                         "disabledReason": c.get("disabledReason"),
+                         "closesDialog": c.get("closesDialog"),
+                         "hasAction": c.get("hasAction"),
+                         "hasLink": c.get("hasLink")}
                         for c in (l.get("choices") or [])],
         })
     return out
@@ -218,6 +237,39 @@ def real_choices(row):
     """
     return [c for c in (row.get("choices") or [])
             if _opt(c) not in ACKNOWLEDGE and _opt(c) not in NAVIGATE]
+
+
+def answerable_choices(row):
+    """The real choices the game will still let anybody click."""
+    return [c for c in real_choices(row) if not c.get("disabled")]
+
+
+def is_expired(row):
+    """True when this letter offers decisions and every one of them is DISABLED.
+
+    A quest that ran out of time still lists its Accept, with `disabled` set and
+    a reason. There is nothing left to click, and opening it only puts a
+    force-pausing `Dialog_NodeTree` on screen for nothing.
+
+    The reason can also be temporary -- too few colonists, no drop spot -- so
+    this is never grounds to throw the letter away. It is grounds not to open
+    it. `keep_reason` still keeps it, because `real_choices` is non-empty.
+    """
+    return bool(real_choices(row)) and not answerable_choices(row)
+
+
+def expired_note(row):
+    """The one line for a letter whose decisions are all greyed out, or None."""
+    if not is_expired(row):
+        return None
+    why = next((c.get("disabledReason") for c in real_choices(row)
+                if c.get("disabledReason")), None)
+    return ("every decision on this letter is DISABLED%s -- nothing on it can be"
+            " clicked, and opening it only puts a force-pausing dialog on screen."
+            " If that reason is permanent, `python letters.py dismiss %s` clears"
+            " it; if it can lift, leave the letter standing."
+            % ((": %s" % why) if why else " and the game gave no reason",
+               row.get("id")))
 
 
 def navigate_only(row):
@@ -348,7 +400,39 @@ def windows_ranked(s):
     return [w for _, _, w in cands]
 
 
-def dialog_window():
+def ui_state():
+    """One `rimworld/get_ui_state`, or UNKNOWN when nothing was read.
+
+    A refusal is a dict with `success: false` and none of the keys asked for,
+    and a split or truncated reply arrives as a bare string. Both read as an
+    empty screen if you go straight to `.get`.
+    """
+    try:
+        s = rim.game("rimworld/get_ui_state", {}, strict=False)
+    except Exception:
+        return UNKNOWN
+    if not isinstance(s, dict) or s.get("success") is False:
+        return UNKNOWN
+    if not any(k in s for k in ("windows", "focusedWindowType",
+                                "nonImmediateDialogWindowOpen")):
+        return UNKNOWN
+    return s
+
+
+def force_pausing(state=None):
+    """The types of open windows holding the clock with `forcePause`.
+
+    Every letter dialog is a `Verse.Dialog_NodeTree`, which force-pauses, so an
+    open letter stops the clock and supervised play's watcher stops with it.
+    """
+    s = ui_state() if state is None else state
+    if s is UNKNOWN or not isinstance(s, dict):
+        return []
+    return [w.get("type") or UNNAMED for w in (s.get("windows") or [])
+            if w.get("forcePause")]
+
+
+def dialog_window(state=None):
     """The modal dialog absorbing input. Read from the window LIST.
 
     Three answers, never two -- see UNKNOWN above: the window's `type` if a
@@ -383,18 +467,12 @@ def dialog_window():
     debug log used to win the scan and get reported as the dialog. `python
     letters.py --windows` prints the raw list the game reports, which is the
     only way to see this from outside.
+
+    `state` is a `get_ui_state` reply already in hand, so a caller asking two
+    questions of one screen pays for one read.
     """
-    try:
-        s = rim.game("rimworld/get_ui_state", {}, strict=False)
-    except Exception:
-        return UNKNOWN
-    # A refusal is a dict with `success: false` and none of the keys asked for,
-    # and a split or truncated reply arrives as a bare string. Both read as an
-    # empty screen if you go straight to `.get`.
-    if not isinstance(s, dict) or s.get("success") is False:
-        return UNKNOWN
-    if not any(k in s for k in ("windows", "focusedWindowType",
-                                "nonImmediateDialogWindowOpen")):
+    s = ui_state() if state is None else state
+    if s is UNKNOWN or not isinstance(s, dict):
         return UNKNOWN
     wins = s.get("windows") or []
     for w in windows_ranked(s):
@@ -433,13 +511,20 @@ class Option(tuple):
     screen cannot say. The scrape can only ever fill the first two.
     """
 
-    def __new__(cls, text, actionable, index=None, disabled=False, reason=None):
+    def __new__(cls, text, actionable, index=None, disabled=False, reason=None,
+                closes=None, has_action=None, has_link=None):
         o = tuple.__new__(cls, (text, bool(actionable)))
         o.text = text
         o.actionable = bool(actionable)
         o.index = index
         o.disabled = bool(disabled)
         o.disabledReason = reason
+        # `closes` is the payload's `closesDialog` (`DiaOption.resolveTree`):
+        # False means this button opens another page instead of closing the box.
+        # None means unread -- the scrape cannot see any of these three.
+        o.closes = closes
+        o.has_action = has_action
+        o.has_link = has_link
         return o
 
 
@@ -473,7 +558,8 @@ def options(letter=None):
     choices = (row or {}).get("choices") or []
     if choices:
         return [Option(c.get("text"), not c.get("disabled"), c.get("index"),
-                       c.get("disabled"), c.get("disabledReason"))
+                       c.get("disabled"), c.get("disabledReason"),
+                       c.get("closesDialog"), c.get("hasAction"), c.get("hasLink"))
                 for c in sorted(choices, key=lambda c: (c.get("index") is None,
                                                         c.get("index") or 0))]
     return _scrape_options()
@@ -515,7 +601,15 @@ def open_letter(letter_id, hold=True, poll=0.3, timeout=4.0, letter=None):
     dialog that was on its way up (Aug 31), and a false negative here is the
     worst thing this file can print: it tells you no decision is waiting when
     one is. Wait for the window up to `timeout` before saying it never came.
+
+    A letter whose every decision is disabled is REFUSED rather than opened:
+    the dialog force-pauses the game and there would be nothing to click on it.
     """
+    if isinstance(letter, dict) and is_expired(letter):
+        print("   ~~ open_letter(%s) REFUSED, nothing was opened -- %s"
+              % (letter_id, expired_note(letter)))
+        return None
+    alive = ui.supervised_play_alive()
     rim.game("rimworld/open_letter", {"letterId": letter_id})
     deadline, win = time.time() + timeout, None
     while True:
@@ -544,6 +638,7 @@ def open_letter(letter_id, hold=True, poll=0.3, timeout=4.0, letter=None):
               "it, use `python letters.py dismiss %s` (the game can refuse).%s"
               % (letter_id, timeout, letter_id, ("\n      " + note) if note else ""))
         return None
+    report_force_pause(alive)
     hold_for(hold)
     # The letter's own `choices[]` say what the dialog offers; pass `letter` (a
     # `pending()` row) if you already have it and even the lookup is saved.
@@ -587,10 +682,95 @@ def _pick(opts, option_text):
               % (pick.text, (" -- %s" % pick.disabledReason)
                  if pick.disabledReason else ""))
         return None
+    if pick.closes is False:
+        print("   ~~ decide: %r does NOT close the dialog (resolveTree false) --"
+              " it opens another page of it. The box stays up and keeps the game"
+              " force-paused; whatever it leads to is closed after the click."
+              % pick.text)
+    if pick.closes is False and not pick.has_action and not pick.has_link:
+        print("   ~~ decide: %r has no action and no link -- clicking it does"
+              " nothing at all. Nothing clicked." % pick.text)
+        return None
     return pick
 
 
-def decide(option_text=None, hold=True, settle=0.8, letter=None):
+# The line that gets the clock going again. Every letter dialog is a
+# `Verse.Dialog_NodeTree`, which force-pauses the game, and supervised play's
+# watcher stops on any force pause without saying so.
+RESTART_LINE = "Supervised play does NOT resume itself:  python play.py start"
+
+# The buttons that only CLOSE a box. Deliberately narrower than ACKNOWLEDGE --
+# "jump to location" acknowledges a letter and moves the camera instead of
+# closing -- and it will never contain a word that answers anything.
+CLOSE_BUTTONS = frozenset(("close", "ok"))
+
+
+def report_force_pause(alive, what="the letter dialog"):
+    """Say what a force-pausing dialog costs supervised play. -> True if said.
+
+    `alive` is `ui.supervised_play_alive()` read BEFORE the dialog went up. The
+    check is a disk read, so it costs nothing.
+
+    **The service does not die at the moment the dialog goes up.** The watcher
+    tolerates a force pause before it gives up -- measured live 2026-09-12 at
+    9.5 s between `rimworld/open_letter` and the pid going -- and this function
+    is called the instant the dialog is confirmed. Reading `supervised_play_alive`
+    once therefore answered True, and `open`/`decide` printed nothing at all
+    while the clock was already held and the service was on its way out. A poll
+    is not the fix either: nobody is waiting ten seconds for a letter.
+
+    So the dialog itself is the evidence. A `Dialog_NodeTree` force-pauses the
+    game and the watcher stops on any force pause, so a service that was alive
+    when the dialog went up is stopped or stopping, and the restart line is
+    printed either way -- WILL STOP while the pid is still there, STOPPED once
+    it has gone.
+    """
+    if not alive:
+        return False
+    if ui.supervised_play_alive() is False:
+        print("   !! supervised play STOPPED -- %s force-pauses the game and the"
+              " watcher stops on any force pause. %s" % (what, RESTART_LINE))
+        return True
+    print("   !! supervised play WILL STOP -- %s force-pauses the game and the"
+          " watcher stops on any force pause; the service takes a few seconds"
+          " to notice and its pid is still up at this instant. %s"
+          % (what, RESTART_LINE))
+    return True
+
+
+def close_open_dialog(tries=3, settle=0.6):
+    """Close whatever box is still standing. -> (still_open, [closed types]).
+
+    An option can resolve into a SECOND `Dialog_NodeTree` -- an expired quest's
+    Close did on 2026-09-07, and it force-paused the game and killed the play
+    service with nothing on screen saying so. Only Close and OK are pressed
+    here: nothing in CLOSE_BUTTONS can answer anything.
+    """
+    closed, win = [], dialog_window()
+    for _ in range(tries):
+        if win is None or win is UNKNOWN:
+            break
+        ack = next((o for o in _scrape_options()
+                    if (o.text or "").strip().lower() in CLOSE_BUTTONS), None)
+        if ack is None:
+            break
+        try:
+            ui.click(ui.printed_text(ack.text), exact=True)
+        except Exception:
+            break
+        time.sleep(settle)
+        # Read back BEFORE claiming it. The click not raising is not evidence
+        # the window went: a Close that links to another page of the same node
+        # tree left this loop reporting the same type closed three times and
+        # then reporting it still open, in one breath.
+        was, win = win, dialog_window()
+        if win is was:
+            break
+        closed.append(was)
+    return win, closed
+
+
+def decide(option_text=None, hold=True, settle=0.8, letter=None, close_extra=True):
     """Answer the open dialog: click `option_text`, or acknowledge it bare.
 
     **Matched against the dialog's own options, not against every label on
@@ -615,7 +795,14 @@ def decide(option_text=None, hold=True, settle=0.8, letter=None):
     Clicking `Close` closed it and took the letter off the stack. A success
     string is not evidence; the window count is. `press_accept` is kept only as
     the last resort for a dialog that shows no acknowledging button at all.
+
+    **Nothing modal is ever left standing silently.** An option can resolve into
+    a second `Dialog_NodeTree`, and one of those force-pauses the game and stops
+    supervised play with no message anywhere. The window stack is read back
+    after the click, anything the decision opened is closed (`close_extra`), and
+    the line that restarts the clock is printed when the service went with it.
     """
+    alive = ui.supervised_play_alive()
     win = dialog_window()
     if win is UNKNOWN:
         print("   ~~ decide: UNVERIFIED -- the bridge did not answer, so whether"
@@ -633,32 +820,65 @@ def decide(option_text=None, hold=True, settle=0.8, letter=None):
         pick = _pick(options(letter), option_text)
         if pick is None:
             return False
-        ui.click((pick.text or "").strip(), exact=True)
+        target = ui.printed_text(pick.text)
     else:
-        ack = next((lab for lab, _ in options()
-                    if lab.strip().lower() in ACKNOWLEDGE), None)
-        if ack:
-            ui.click(ack)
-        else:
-            rim.game("rimworld/press_accept", {}, strict=False)
-            time.sleep(settle)
+        target = next((o.text for o in options(letter)
+                       if (o.text or "").strip().lower() in ACKNOWLEDGE), None)
+        target = ui.printed_text(target) if target else None
+    if target:
+        try:
+            ui.click(target, exact=True)
+        except Exception as e:
+            print("   ~~ decide: %r is on the letter's option list but nothing"
+                  " clickable on screen carries it. NOTHING WAS CLICKED. %s: %s"
+                  % (target, type(e).__name__, e))
+            return False
+    else:
+        rim.game("rimworld/press_accept", {}, strict=False)
+        time.sleep(settle)
     left = dialog_window()
     if left is UNKNOWN:
         print("   ~~ decide: UNVERIFIED -- the bridge did not answer after the"
               " click, so whether the dialog closed is UNKNOWN. The letter may"
               " still be on the stack; `python letters.py` says.")
+        report_force_pause(alive)
+        return False
+    if left and left != win:
+        # A modal left standing here is not clutter: a Dialog_NodeTree holds the
+        # clock, so one nobody closed stops the colony. Only a box that was NOT
+        # there before is closed -- pressing Close on the dialog the decision was
+        # aimed at would take the letter off the stack unanswered.
+        print("   -- decide: the click opened %s on top of %s." % (left, win))
+        if close_extra:
+            left, shut = close_open_dialog()
+            for t in shut:
+                print("   -- decide: closed %s behind the decision." % t)
+    if left is UNKNOWN:
+        print("   ~~ decide: a dialog is open and the bridge stopped answering."
+              " Whether the screen is clear is UNKNOWN: `python letters.py"
+              " --windows`.")
+        report_force_pause(alive)
         return False
     if left:
-        print("   ~~ decide: %s is STILL OPEN -- whatever that pressed did not"
-              " close the dialog, and the letter is still on the stack. Read"
-              " options() again: a second box may have stacked on top of the"
-              " first, or the button is named something else." % left)
+        print("   ~~ decide: %s is STILL OPEN and it force-pauses the game."
+              " Read `python ui.py` for its buttons and click the one that"
+              " closes it (`python ui.py click \"<text>\"`); the letter is still"
+              " on the stack." % left)
+    report_force_pause(alive)
     return left is None
 
 
 def dismiss(letter_id):
-    """Right-click a letter off the stack. Announcements only -- see watch.py."""
-    return rim.game("rimworld/dismiss_letter", {"letterId": letter_id})
+    """Right-click a letter off the stack. Announcements only -- see watch.py.
+
+    strict=False: a letter whose `CanDismissWithRightClick` is false answers
+    `success: false` with no `dismissed` key, and that IS the answer -- the
+    caller prints it and exits 1. Strict made rim.game raise instead, so the
+    quest-letter case the line above the call promises to handle came out as a
+    BridgeError traceback.
+    """
+    return rim.game("rimworld/dismiss_letter", {"letterId": letter_id},
+                    strict=False)
 
 
 # --- auto-dismiss -------------------------------------------------------------
@@ -954,9 +1174,9 @@ def show(rows):
               % (_kind(l), (l["label"] or "")[:40], hours,
                  "STALE" if is_stale(l) else "     ",
                  l["id"], "" if l["dismissible"] else "  [not dismissible]"))
-        note = opportunity_note(l)
-        if note:
-            print("           " + note)
+        for note in (opportunity_note(l), expired_note(l)):
+            if note:
+                print("           " + note)
         if not is_decision(l):
             continue
         if l["text"]:
@@ -968,21 +1188,32 @@ def show(rows):
 
 
 if __name__ == "__main__":
-    a = [x for x in sys.argv[1:] if x != "--no-hold"]
+    a = [x for x in sys.argv[1:] if x not in ("--no-hold", "--anyway")]
     hold = "--no-hold" not in sys.argv[1:]
+    anyway = "--anyway" in sys.argv[1:]
     cmd = a[0] if a else "list"
     if cmd in ("--windows", "windows"):
         # The raw window list, unranked and unfiltered. Added 2026-09-02: when
         # dialog_window() names something surprising, this is what it saw.
         rim.init()
-        st = rim.game("rimworld/get_ui_state", {}, strict=False)
-        ws = (st or {}).get("windows") or []
+        # Through ui_state(), not a bare rim.game: strict=False is exactly the
+        # mode in which a split or truncated reply arrives as a STRING, which
+        # is the flakiness you open --windows to diagnose -- and it used to be
+        # an AttributeError one line down. A refusal is UNKNOWN too, and must
+        # never print as "none reported (checked)".
+        st = ui_state()
+        if st is UNKNOWN:
+            print("windows: NOT READ -- rimworld/get_ui_state did not come back "
+                  "as a payload. This is not an empty screen and it is not "
+                  "'no modal'; nothing below was measured.")
+            sys.exit(1)
+        ws = st.get("windows") or []
         print("focusedWindowType: %r   nonImmediateDialogWindowOpen: %r"
-              % ((st or {}).get("focusedWindowType"),
-                 (st or {}).get("nonImmediateDialogWindowOpen")))
+              % (st.get("focusedWindowType"),
+                 st.get("nonImmediateDialogWindowOpen")))
         if not ws:
             print("windows: none reported (checked, not assumed)")
-        ranked = [id(w) for w in windows_ranked(st or {})]
+        ranked = [id(w) for w in windows_ranked(st)]
         for i, w in enumerate(ws):
             t = w.get("type") or "?"
             marks = []
@@ -993,7 +1224,9 @@ if __name__ == "__main__":
             print("  [%d] %-52s layer=%-8s absorb=%-5s forcePause=%-5s %s"
                   % (i, t, w.get("layer"), w.get("absorbInputAroundWindow"),
                      w.get("forcePause"), "  ".join(marks)))
-        print("-- dialog_window() -> %r" % dialog_window())
+        # Same `st`: the candidate marks above and this verdict used to come
+        # from two separate reads and could contradict each other.
+        print("-- dialog_window() -> %r" % dialog_window(st))
         sys.exit(0)
     if cmd == "sweep":
         # The sweep by hand. Added 2026-09-02 with auto_dismiss: `watch.py` and
@@ -1018,6 +1251,19 @@ if __name__ == "__main__":
         sys.exit(2)
     rim.init()
     if cmd == "dismiss":
+        # Right-clicking a letter that somebody has to answer ANSWERS it by
+        # throwing it away. Look the row up first and refuse those; an expired
+        # letter is exempt, because its decisions cannot be clicked at all.
+        row = next((l for l in pending() if str(l.get("id")) == str(a[1])), None)
+        why = keep_reason(row) if row is not None else None
+        if why and not is_expired(row) and not anyway:
+            print("dismiss REFUSED, nothing was thrown away: %s. Answer it with"
+                  " `python letters.py open %s`, or repeat this with --anyway if"
+                  " it really is dead." % (why, a[1]))
+            sys.exit(2)
+        if row is not None and not row.get("dismissible"):
+            print("   ~~ the game reports this letter cannot be dismissed with a"
+                  " right-click; the call below will answer dismissed: false.")
         result = dismiss(a[1])
         print(json.dumps(result, indent=1))
         sys.exit(0 if isinstance(result, dict) and result.get("dismissed") is True else 1)
@@ -1039,7 +1285,18 @@ if __name__ == "__main__":
                                       "   [DISABLED: %s]" % why if why else ""))
             print("-- decide with: python letters.py decide \"<option text>\"")
     elif cmd == "decide":
-        ok = decide(a[1] if len(a) > 1 else None, hold=hold)
+        # Look the row up, the way `open` does. Without it options() falls
+        # through to the screen scrape, which knows the texts but builds every
+        # Option with disabled=False -- so the guard against clicking a
+        # greyed-out decision was dead on the only path a person uses.
+        want = a[1] if len(a) > 1 else None
+        row = None
+        try:
+            row = next((l for l in pending()
+                        if not navigate_only(l) and real_choices(l)), None)
+        except Exception:
+            row = None
+        ok = decide(want, hold=hold, letter=row)
         # Not "still open": a False also covers a refusal and an unverified
         # read, and both are printed above with what they actually mean.
         print("dialog closed" if ok else "NOT closed -- see the line above")

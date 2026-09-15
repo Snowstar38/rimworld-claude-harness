@@ -37,6 +37,94 @@ class PlaceBuildingSourceTests(unittest.TestCase):
         self.assertIn('payload["outcome"] = "placed"', SOURCE)
 
 
+class BlockingThingEffectTests(unittest.TestCase):
+    """What an ACCEPTED placement removes has to reach the verdict line."""
+
+    def test_every_blocker_carries_what_the_placement_does_to_it(self):
+        self.assertIn('{ "effectOnPlace", EffectOnPlace(t, wipes, frameCancel, haulFirst, finishedWipes) }',
+                      SOURCE)
+        self.assertIn('{ "wipedWhenBuilt", finishedWipes }', SOURCE)
+        self.assertIn('{ "isCrop", IsCrop(t) }', SOURCE)
+
+    def test_the_effect_words_are_the_ones_the_client_reads(self):
+        for word in ("wiped", "frameCancelled", "hauled", "replaced", "none"):
+            self.assertIn('return "%s";' % word, SOURCE)
+        self.assertIn('IsCrop(thing) ? "crop" : "cleared"', SOURCE)
+
+    def test_replacement_is_measured_against_the_finished_building(self):
+        """A blueprint wipes nothing; stone-over-wood is a replacement."""
+        self.assertIn("finishedWipes = GenSpawn.SpawningWipes(entDef, t.def)", SOURCE)
+        self.assertIn("if (category == ThingCategory.Building)", SOURCE)
+
+    def test_a_crop_is_the_games_own_test_not_a_label_guess(self):
+        self.assertIn("var plant = thing as Plant;", SOURCE)
+        self.assertIn("plant.sown", SOURCE)
+        self.assertIn("plant.IsCrop", SOURCE)
+
+
+class BatchSourceTests(unittest.TestCase):
+    """A 64-cell wall was 64 calls, each paying its own 1.5 s watch lead."""
+
+    def test_the_tool_takes_a_cell_list(self):
+        self.assertIn("string cells = null", SOURCE)
+        self.assertIn("if (!string.IsNullOrWhiteSpace(cells))", SOURCE)
+        self.assertIn("TryParseCellList(cells, x, z, out batchCells, out cellsError)",
+                      SOURCE)
+
+    def test_a_batch_is_chunked_across_main_thread_hops(self):
+        """One long synchronous loop inside a hop stalls Root.Update, which is
+        the tick AND the queue every other bridge call is pumped from."""
+        self.assertIn("private const int CellsPerHop = 8;", SOURCE)
+        self.assertIn("private const int HopGapMs = 20;", SOURCE)
+        self.assertIn("start += CellsPerHop", SOURCE)
+        self.assertIn("await Task.Delay(HopGapMs).ConfigureAwait(false)", SOURCE)
+        self.assertIn("RunChunk(run, from, CellsPerHop)", SOURCE)
+
+    def test_one_watch_lead_for_the_whole_batch(self):
+        """Not one 1.5 s lead per cell: that was 96 s of the two minutes."""
+        lead = SOURCE.count("await Watch.Lead(")
+        self.assertEqual(2, lead)          # the single-cell path, and the batch
+        self.assertIn("Watch.OpenAtCell(ctx, Midpoint(cells))", SOURCE)
+
+    def test_one_materials_scan_for_the_whole_batch(self):
+        self.assertIn("Materials(map, entDef, stuffDef, cells.Count)", SOURCE)
+        self.assertIn("int forCells = 1", SOURCE)
+        self.assertIn("var needed = perCell * forCells;", SOURCE)
+        self.assertIn('{ "perCellNeeded", perCell }', SOURCE)
+
+    def test_one_placement_path_for_a_cell_and_for_a_batch(self):
+        self.assertIn("private static PlacementResult PlaceOne(", SOURCE)
+        self.assertIn("var single = PlaceOne(map, entDef, center, chosen, stuffDef, player);",
+                      SOURCE)
+        self.assertIn("var result = PlaceOne(map, run.EntDef, cell, run.Rot, run.StuffDef, run.Player);",
+                      SOURCE)
+        # One call site in the code; the other hit is the class comment.
+        self.assertEqual(1, len([line for line in SOURCE.splitlines()
+                                 if "GenConstruct.PlaceBlueprintForBuild(" in line
+                                 and not line.strip().startswith("///")]))
+
+    def test_a_batch_needs_one_rotation_and_is_capped(self):
+        self.assertIn("private const int MaxBatchCells = 200;", SOURCE)
+        self.assertIn("A batch needs exactly one rotation", SOURCE)
+        self.assertIn("and the cap is ", SOURCE)
+
+    def test_a_refused_cell_does_not_stop_the_batch(self):
+        self.assertIn('outcome = "refused";', SOURCE)
+        self.assertIn('run.Refused++;', SOURCE)
+        self.assertIn('outcome = "partial"', SOURCE)
+        self.assertIn('{ "firstRefusal", run.FirstRefusal }', SOURCE)
+
+    def test_every_cell_row_keeps_the_same_shape(self):
+        for key in ('row["x"] = cell.x;', 'row["z"] = cell.z;',
+                    'row["placed"] = null;', 'row["error"] = null;',
+                    'row["outcome"] = outcome;'):
+            self.assertIn(key, SOURCE)
+
+    def test_an_unreadable_cell_list_refuses_the_whole_call(self):
+        self.assertIn('is not a cell.', SOURCE)
+        self.assertIn("cells was given but named no cell", SOURCE)
+
+
 class BuildClientArgumentTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -92,11 +180,14 @@ class BuildClientArgumentTests(unittest.TestCase):
         with redirect_stdout(output):
             self.build.report(reply)
         lines = output.getvalue().splitlines()
-        self.assertIn("DRY RUN", lines[0])
+        # The first line is the one a reader who reads nothing else will read.
+        self.assertEqual("DRY RUN -- nothing placed; add --do", lines[0])
+        self.assertIn("DRY RUN", lines[1])
         self.assertEqual(
             "PREVIEW ONLY: no blueprint placed; 0/1 rotations accepted.",
-            lines[1].strip(),
+            lines[2].strip(),
         )
+        self.assertNotIn("PLACED --", output.getvalue())
 
 
 if __name__ == "__main__":
