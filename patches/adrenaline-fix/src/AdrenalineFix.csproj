@@ -1,0 +1,49 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net472</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>AdrenalineFix</AssemblyName>
+    <RootNamespace>AdrenalineFix</RootNamespace>
+    <OutputPath>..\mod\1.6\Assemblies\</OutputPath>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
+    <AssemblyVersion>1.0.0.0</AssemblyVersion>
+    <FileVersion>1.0.0.0</FileVersion>
+    <Version>1.0.0</Version>
+    <DebugType>none</DebugType>
+  </PropertyGroup>
+
+  <!-- Override on the command line if RimWorld moves. -->
+  <PropertyGroup>
+    <RimWorldManagedDir Condition="'$(RimWorldManagedDir)' == ''">C:\Program Files (x86)\Steam\steamapps\common\RimWorld\RimWorldWin64_Data\Managed</RimWorldManagedDir>
+    <AdrenalineDir Condition="'$(AdrenalineDir)' == ''">C:\Program Files (x86)\Steam\steamapps\workshop\content\294100\2037728879\1.6\Assemblies</AdrenalineDir>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- net472 targeting pack is not installed system-wide; this supplies the reference assemblies. -->
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies.net472" Version="1.0.3">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+    <PackageReference Include="Lib.Harmony.Ref" Version="2.4.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Private=false everywhere: we ship only our own DLL. -->
+    <Reference Include="Assembly-CSharp">
+      <HintPath>$(RimWorldManagedDir)\Assembly-CSharp.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine">
+      <HintPath>$(RimWorldManagedDir)\UnityEngine.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.CoreModule">
+      <HintPath>$(RimWorldManagedDir)\UnityEngine.CoreModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ModMetaData>
+  <name>Adrenaline Threat-Power Fix</name>
+  <packageId>home.adrenalinefix</packageId>
+  <author>Opus 5</author>
+  <supportedVersions>
+    <li>1.6</li>
+  </supportedVersions>
+  <modDependencies>
+    <li>
+      <packageId>brrainz.harmony</packageId>
+      <displayName>Harmony</displayName>
+      <steamWorkshopUrl>steam://url/CommunityFilePage/2009463077</steamWorkshopUrl>
+    </li>
+  </modDependencies>
+  <loadAfter>
+    <li>brrainz.harmony</li>
+    <li>Mlie.XNDAdrenaline</li>
+  </loadAfter>
+  <description>Stops the "Sequence contains no elements" error spam from [XND] Adrenaline! (Continued).
+
+Adrenaline rates a colonist's own combat power against the wealth of your richest home map, and finds that map by searching world-map Settlement objects. On any player home that is not a Settlement world object -- a claimable site, an Odyssey asteroid or space map, a pocket map -- that search comes back empty and RimWorld's MaxBy throws.
+
+The usual way to get there is a gravship. Launching abandons the origin colony's Settlement outright unless you left a grav anchor behind, and landing anywhere whose world object is not already a settlement just re-factions what is there rather than founding one. So you end up with a live player home and no player Settlement anywhere on the world map. It is not about what kind of terrain you landed on, and not about anything on the map with you.
+
+It throws for the perceiving pawn, so it does not matter what the threat is: on such a map every colonist fails on the adrenaline hediff's very first tick, and RimWorld responds to a hediff that throws while ticking by removing it. The mod stops working in exactly the fights it exists for, and the log fills with red.
+
+This is one Harmony patch that looks the map up through Find.Maps instead, which sees every loaded player-home map whatever its parent, plus a safety net so a future case of the same bug degrades quietly instead of stripping the hediff. It adds no defs and changes no save data; removing it leaves the save exactly as it was.</description>
+</ModMetaData>

@@ -1,0 +1,789 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>errata overlay</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:ital,wght@0,400;0,700;1,400&family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,600;1,9..144,400&display=swap" rel="stylesheet">
+<style>
+  /* The current mood color is animatable because it is a registered property. */
+  @property --mood { syntax: '<color>'; inherits: true; initial-value: #E0A33B; }
+
+  :root {
+    --W: 1920px;
+    --H: 1080px;
+    --side: 380px;      /* right column width  — override with ?side=  */
+    --bottom: 268px;    /* goals bar height     — override with ?bottom= */
+    /* Bottom-bar zone widths. The two goals share what's left, so these two
+       numbers and the goal fr ratio are the only ones that have to change if
+       the bar is re-balanced. */
+    --turn-w: 702px;    /* turn numeral + the last summary, side by side */
+    --events-w: 310px;
+    --gutter: 28px;     /* padding either side of a bar separator */
+    --panel: rgba(30, 38, 43, 0.88);
+    --edge: rgba(232, 220, 196, 0.12);
+    --ink: #E8DCC4;
+    --ink-dim: rgba(232, 220, 196, 0.55);
+    --human: #E89A8A;
+    --mood: #E0A33B;
+    /* Letter tones. Muted on purpose: these sit on stream for hours and must
+       read as information, not as alarm lights. */
+    --tone-good: #8FBE76;
+    --tone-bad: #CC6F58;
+    --tone-neutral: rgba(232, 220, 196, 0.50);
+    --serif: "Fraunces", Georgia, "Times New Roman", serif;
+    --sans: "Atkinson Hyperlegible", "Segoe UI", system-ui, sans-serif;
+    --emoji: "Segoe UI Emoji", "Apple Color Emoji", "Noto Color Emoji", sans-serif;
+    transition: --mood 0.6s ease;
+  }
+
+  html, body {
+    margin: 0;
+    width: var(--W);
+    height: var(--H);
+    overflow: hidden;
+    background: transparent;
+    font-family: var(--sans);
+    color: var(--ink);
+  }
+
+  #stage { position: relative; width: var(--W); height: var(--H); }
+
+  /* ---------- right column ---------- */
+  #side {
+    position: absolute; top: 0; right: 0;
+    width: var(--side); height: var(--H);
+    background: var(--panel);
+    box-shadow: inset 1px 0 0 var(--edge);
+    display: flex; flex-direction: column;
+    overflow: hidden;
+  }
+
+  #head {
+    position: relative;
+    /* 25% shorter than the original 34/94/46/17 stack (M, 2026-09-01):
+       the face was eating the top of the column and the feed wanted the room. */
+    padding: 25px 12px 14px;
+    text-align: center;
+    flex: none;
+  }
+  #glow {
+    position: absolute; left: 50%; top: 62px;
+    width: 155px; height: 155px;
+    transform: translate(-50%, -50%);
+    border-radius: 50%;
+    background: radial-gradient(circle, var(--mood) 0%, transparent 62%);
+    opacity: 0.34;
+    filter: blur(16px);
+    pointer-events: none;
+  }
+  #face {
+    position: relative;
+    font-family: var(--emoji);
+    font-size: 70px;
+    line-height: 1;
+    display: inline-block;
+  }
+  #face.pop { animation: pop 0.42s cubic-bezier(.3,1.6,.5,1); }
+  @keyframes pop {
+    0%   { transform: scale(1); }
+    45%  { transform: scale(1.17) rotate(-3deg); }
+    100% { transform: scale(1); }
+  }
+  #name {
+    position: relative;
+    font-family: var(--serif);
+    font-size: 35px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    line-height: 1.1;
+    margin-top: 9px;
+  }
+  #status {
+    position: relative;
+    font-size: 18px;
+    color: var(--ink-dim);
+    margin-top: 5px;
+  }
+
+  /* ---------- colony-clock badges (added 2026-09-02) ----------
+     `game.paused` and `game.stale` have been in /state since 2026-09-01 and
+     nothing drew them, so a viewer watching a paused game saw a live-looking
+     overlay whose event ages had simply stopped moving.
+
+     Absolutely positioned, and that is the point: they hang below #head over
+     the top of the feed, where the feed's own mask has already faded anything
+     behind them to near nothing, so appearing and disappearing moves neither
+     the face above nor a single line of the feed below. Same palette as the
+     rest of the bar -- panel fill, hairline edge, one tone dot -- because a
+     viewer should read these as information, not as an error dialog. */
+  #clock {
+    position: absolute;
+    left: 0; right: 0; top: 100%;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    pointer-events: none;
+    /* Above the feed, not behind it. #feed carries a mask-image, which makes it
+       a stacking context painted in the same pass as a positioned sibling, and
+       it comes later in the document -- so without this the topmost thought
+       drew straight through the middle of the pill. */
+    z-index: 3;
+  }
+  .badge {
+    display: none;               /* .on shows it; nothing here reserves space */
+    align-items: center;
+    gap: 8px;
+    padding: 5px 13px 6px;
+    border-radius: 999px;
+    background: var(--panel);
+    box-shadow: inset 0 0 0 1px var(--edge);
+    font-size: 16px;
+    font-weight: 700;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    line-height: 1;
+    white-space: nowrap;
+  }
+  .badge.on { display: flex; animation: rise 0.32s ease-out both; }
+  /* Two bars, the universal pause mark, drawn rather than typed: the emoji
+     ⏸ picks up a different font and a different baseline on every machine. */
+  #badge-paused .mark {
+    width: 13px; height: 14px;
+    background:
+      linear-gradient(var(--ink), var(--ink)) left / 4px 100% no-repeat,
+      linear-gradient(var(--ink), var(--ink)) right / 4px 100% no-repeat;
+  }
+  #badge-stale { color: #E9B29C; }
+  #badge-stale .mark {
+    width: 10px; height: 10px;
+    border-radius: 50%;
+    background: var(--tone-bad);
+    animation: fade 2.2s ease-in-out infinite;
+  }
+  #badge-chat .mark {
+    width: 10px; height: 10px;
+    border-radius: 50%;
+    background: var(--tone-neutral);
+  }
+  #badge-chat[data-status="ready"] .mark,
+  #badge-chat[data-status="screening"] .mark,
+  #badge-chat[data-status="connected"] .mark { background: var(--tone-good); }
+  #badge-chat[data-status="connecting"] .mark { background: var(--mood); }
+  #badge-chat[data-status="error"] { color: #E9B29C; }
+  #badge-chat[data-status="error"] .mark { background: var(--tone-bad); }
+  @keyframes fade {
+    0%, 100% { opacity: 1; }
+    50%      { opacity: 0.25; }
+  }
+
+  /* The turn summary used to live here, above the feed. It moved into the
+     bottom bar's Turn zone on 2026-09-01 (M) so the whole column is
+     thoughts — see #turn-wrap. */
+  .summary.pinned {
+    font-size: 20px;   /* one under a feed summary: it is context, not news */
+  }
+  .summary.pinned .ptext {
+    display: -webkit-box;
+    -webkit-line-clamp: 9;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+
+  /* ---------- feed ---------- */
+  #feed {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-end;
+    gap: 14px;
+    padding: 10px 0 26px;   /* cards run edge to edge; thoughts pad themselves */
+    overflow: hidden;
+    -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 22%);
+            mask-image: linear-gradient(to bottom, transparent 0, #000 22%);
+  }
+  .item {
+    flex: none;
+    animation: rise 0.32s ease-out both;
+  }
+  @keyframes rise {
+    from { opacity: 0; transform: translateY(10px); }
+    to   { opacity: 1; transform: none; }
+  }
+  .thought {
+    display: grid;
+    grid-template-columns: 30px 1fr;
+    column-gap: 10px;
+    padding: 0 10px 0 8px;   /* bare text shouldn't kiss the screen edge */
+    font-size: 22px;
+    line-height: 1.35;
+  }
+  .thought .em {
+    font-family: var(--emoji);
+    font-size: 21px;
+    line-height: 1.35;
+    opacity: 0.92;
+  }
+  .summary {
+    background: rgba(232, 220, 196, 0.07);
+    border-left: 3px solid var(--c, var(--mood));
+    padding: 13px 16px 14px;
+    border-radius: 2px;
+    font-family: var(--serif);
+    font-size: 21px;
+    line-height: 1.42;
+  }
+  .summary .turn {
+    display: block;
+    font-family: var(--sans);
+    font-size: 14px;
+    color: var(--ink-dim);
+    margin-bottom: 4px;
+  }
+  .human, .chat {
+    border-left: 3px solid var(--human);
+    background: rgba(232, 154, 138, 0.09);
+    padding: 11px 14px 12px;
+    border-radius: 2px;
+    font-size: 21px;
+    line-height: 1.35;
+  }
+  .human .who { color: var(--human); font-weight: 700; }
+  .chat { border-left-color: var(--ink-dim); background: rgba(232, 220, 196, 0.05); }
+  .chat .who { color: var(--ink-dim); font-weight: 700; }
+
+  /* ---------- bottom bar: long term | right now | turn | recent events ------ */
+  #bottom {
+    position: absolute; left: 0; bottom: 0;
+    width: calc(var(--W) - var(--side));
+    height: var(--bottom);
+    background: var(--panel);
+    box-shadow: inset 0 1px 0 var(--edge);
+    box-sizing: border-box;
+    padding: 10px 28px;
+    display: grid;
+    grid-template-columns: 0.86fr 1fr var(--turn-w) var(--events-w);
+    align-content: center;
+  }
+  .zone { min-width: 0; padding-right: var(--gutter); }
+  .zone + .zone { border-left: 1px solid var(--edge); padding-left: var(--gutter); }
+  .zone:last-child { padding-right: 0; }
+  .zone h2 {
+    margin: 0 0 10px;
+    font: 400 20px/1 var(--sans);
+    color: var(--ink-dim);
+  }
+  .goal p {
+    margin: 0;
+    font-family: var(--serif);
+    /* 27/1.26 x 6 lines = 204px, inside the 218px the zone has below its h2. */
+    font-size: 27px;
+    line-height: 1.26;
+    transition: opacity 0.25s ease;
+    overflow: hidden;
+    display: -webkit-box;
+    -webkit-line-clamp: 6;
+    -webkit-box-orient: vertical;
+  }
+  .goal p.swap { opacity: 0; }
+  .goal p.empty { color: var(--ink-dim); font-style: italic; }
+
+  /* ---- turn: the numeral, and beside it the last thing the Core said ---- */
+  #turn-wrap {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    column-gap: 18px;
+    align-items: start;
+  }
+  #turn-sum {
+    /* Sans, not serif: this is the block viewers read on a phone.
+       22/1.4 x 7 lines = 215.6px, inside the 218px the zone has below its h2.
+       Handbacks cap at 320 chars; at this width (486px) that is 7 lines. */
+    font-family: var(--sans);
+    font-size: 22px;
+    line-height: 1.4;
+    border-left: 3px solid var(--c, var(--mood));
+    padding-left: 13px;
+    transition: opacity 0.25s ease;
+    overflow: hidden;
+    display: -webkit-box;
+    -webkit-line-clamp: 7;
+    -webkit-box-orient: vertical;
+  }
+  #turn-sum.swap { opacity: 0; }
+  #turn-sum .tsum-empty { color: var(--ink-dim); font-style: italic; }
+  #turn-box { transition: opacity 0.25s ease; }
+  #turn-box.swap { opacity: 0; }
+  #turn-num {
+    font-family: var(--serif);
+    font-size: 58px;
+    font-weight: 600;
+    line-height: 1;
+    letter-spacing: -0.02em;
+    white-space: nowrap;
+    overflow: hidden;
+  }
+  #turn-phase {
+    font-size: 15px;
+    line-height: 1.2;
+    color: var(--ink-dim);
+    margin-top: 9px;
+  }
+
+  /* ---- recent events ---- */
+  #events { display: flex; flex-direction: column; gap: 9px; }
+  .ev {
+    display: grid;
+    grid-template-columns: 10px minmax(0, 1fr) auto;
+    column-gap: 11px;
+    align-items: center;
+  }
+  .ev.fresh { animation: rise 0.36s ease-out both; }
+  .ev-dot {
+    width: 10px; height: 10px; border-radius: 50%;
+    background: var(--tone-neutral);
+  }
+  .ev-dot.good { background: var(--tone-good); }
+  .ev-dot.bad  { background: var(--tone-bad); }
+  .ev-label {
+    font-family: var(--serif);
+    font-size: 22px;
+    line-height: 1.25;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .ev-age {
+    font-size: 15px;
+    color: var(--ink-dim);
+    font-variant-numeric: tabular-nums;
+    letter-spacing: 0.03em;   /* "2d0h" needs the air to not read as "2dOh" */
+    white-space: nowrap;
+  }
+  .ev-empty {
+    font-family: var(--serif);
+    font-size: 22px;
+    line-height: 1.25;
+    color: var(--ink-dim);
+    font-style: italic;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    :root { transition: none; }
+    #face.pop, .item, .ev.fresh { animation: none; }
+    .goal p, #feed, #turn-box, #turn-sum { transition: none; }
+    /* The badges still have to appear -- only the movement and the pulse go. */
+    .badge.on { animation: none; }
+    #badge-stale .mark { animation: none; }
+  }
+</style>
+</head>
+<body>
+<div id="stage">
+  <aside id="side">
+    <div id="head">
+      <div id="glow"></div>
+      <div id="face">🙂</div>
+      <div id="name">errata</div>
+      <div id="status">Getting ready</div>
+      <div id="clock">
+        <div id="badge-paused" class="badge"><span class="mark"></span>Paused</div>
+        <div id="badge-stale" class="badge"><span class="mark"></span>No game data</div>
+        <div id="badge-chat" class="badge"><span class="mark"></span><span id="badge-chat-label">Chat connection live</span></div>
+      </div>
+    </div>
+    <div id="feed"></div>
+  </aside>
+
+  <footer id="bottom">
+    <div class="zone goal">
+      <h2>Long term</h2>
+      <p id="goal-long" class="empty">No long-term goal yet</p>
+    </div>
+    <div class="zone goal">
+      <h2>Right now</h2>
+      <p id="goal-short" class="empty">Nothing planned yet</p>
+    </div>
+    <div class="zone">
+      <h2>Turn</h2>
+      <div id="turn-wrap">
+        <div id="turn-box">
+          <div id="turn-num">—</div>
+          <div id="turn-phase">getting ready</div>
+        </div>
+        <div id="turn-sum"><span class="tsum-empty">Nothing summarised yet</span></div>
+      </div>
+    </div>
+    <div class="zone">
+      <h2>Recent events</h2>
+      <div id="events"><div class="ev-empty">No events yet</div></div>
+    </div>
+  </footer>
+</div>
+
+<script>
+(() => {
+  const MOODS = {
+    happy: '🙂', thinking: '🤔', sad: '😭', scared: '😨',
+    welp: '😐', excited: '🤩', angry: '😠', veryhappy: '😁',
+  };
+  const COLORS = {
+    happy: '#E0A33B', thinking: '#9C8CE0', sad: '#6D9DD0', scared: '#78C8D8',
+    welp: '#9A9A90', excited: '#E86AA0', angry: '#D9503F', veryhappy: '#7DC66A',
+  };
+  // Minimum time each kind of item holds the "newest" spot, so bursts stay readable.
+  // `letter: 0` is not a pace, it is a correction: letters render NOTHING in
+  // this feed (they live in the bottom bar -- see render()), so the 2000 ms
+  // default was time the feed spent holding the newest spot for a blank. See
+  // the enqueue note below; this is the belt to that pair of braces.
+  const PACE = { thought: 2600, summary: 4200, chat: 1800, mood: 700, letter: 0 };
+  const MAX_ITEMS = 40;
+  // If more than this many items are waiting, the oldest queued thoughts are
+  // dropped (never summaries) so the feed can't fall far behind the game.
+  const MAX_BACKLOG = 5;
+  const EVENTS_SHOWN = 3;
+  // RimWorld's clock: 2500 ticks to the hour, 60000 to the day.
+  const TICKS_HOUR = 2500;
+  const TICKS_DAY = 60000;
+
+  // ---- URL options: ?side=480&bottom=270&name=errata&human=Human ----
+  const q = new URLSearchParams(location.search);
+  const root = document.documentElement;
+  if (q.get('side'))   root.style.setProperty('--side',   q.get('side')   + 'px');
+  if (q.get('bottom')) root.style.setProperty('--bottom', q.get('bottom') + 'px');
+  const NAME = q.get('name') || 'errata';
+  const HUMAN_LABEL = q.get('human') || 'Human';
+
+  const $ = (id) => document.getElementById(id);
+  $('name').textContent = NAME;
+
+  let lastId = 0;
+  let booted = false;
+  let queue = [];
+  let busy = false;
+  let currentMood = null;
+  const goals = { long: null, short: null };
+  let turnKey = null;
+  let pinKey = '';
+  let pinned = null;          // what the pin currently holds, for de-duping the feed
+  const evRows = new Map();   // feed id -> {el, age, tick}
+
+  // ---------- polling ----------
+  async function poll() {
+    try {
+      const r = await fetch('/state', { cache: 'no-store' });
+      if (!r.ok) return;
+      apply(await r.json());
+    } catch (e) { /* server not up yet; keep trying */ }
+  }
+  setInterval(poll, 500);
+  poll();
+
+  function apply(s) {
+    setGoal('long', s.goals && s.goals.long);
+    setGoal('short', s.goals && s.goals.short);
+    setStatus(s.status || {});
+    setTurn(s.status || {});
+    // The pin goes first: a summary that has just landed should already be
+    // pinned by the time the same item comes past in the feed, so the flow
+    // knows to skip it.
+    setPin(s.lastSummary);
+    const game = s.game || {};
+    setClock(game);
+    setChatModeration(s.chatModeration || {});
+    setEvents(s.feed || [], game.tick != null ? game.tick : null);
+
+    const fresh = (s.feed || []).filter((i) => i.id > lastId);
+    if (fresh.length) lastId = fresh[fresh.length - 1].id;
+
+    if (!booted) {
+      // First load: show history instantly, no pacing, and take the server's mood.
+      booted = true;
+      fresh.forEach(render);
+      setMood(s.mood || 'happy', false);
+      return;
+    }
+    for (const item of fresh) {
+      // Letters never enter the queue. render() returns immediately for them
+      // (they are drawn in the bottom bar, not here), but pump() still held
+      // the feed for PACE[kind] ?? 2000 ms afterwards -- so a batch of five
+      // letters, which overlay_client.overlay_ordered() exists to send, stalled
+      // the feed for ten seconds while drawing nothing, and the backlog trim
+      // below only ever drops thoughts and moods. errata's real thoughts were
+      // being silently dropped to make room for blanks. Rendering them here
+      // keeps the one thing render() does for a letter -- the mood -- without
+      // spending a slot on it.
+      if (item.kind === 'human' || item.kind === 'letter') render(item);
+      else queue.push(item);
+    }
+    while (queue.length > MAX_BACKLOG) {
+      const i = queue.findIndex((it) => it.kind === 'thought' || it.kind === 'mood');
+      if (i === -1) break;
+      queue.splice(i, 1);
+    }
+    pump();
+  }
+
+  function pump() {
+    if (busy || !queue.length) return;
+    busy = true;
+    const item = queue.shift();
+    render(item);
+    setTimeout(() => { busy = false; pump(); }, PACE[item.kind] ?? 2000);
+  }
+
+  // ---------- rendering ----------
+  function render(item) {
+    if (item.mood) setMood(item.mood, booted);
+    if (item.kind === 'mood') return;
+    // Already on screen as the pin — don't print it again directly underneath.
+    if (item.kind === 'summary' && pinned &&
+        item.text === pinned.text && String(item.turn) === String(pinned.turn)) return;
+
+    const el = document.createElement('div');
+    el.className = 'item ' + item.kind;
+    const color = COLORS[item.mood] || COLORS.happy;
+
+    if (item.kind === 'thought') {
+      const em = document.createElement('span');
+      em.className = 'em';
+      em.textContent = MOODS[item.mood] || '';
+      const t = document.createElement('span');
+      t.textContent = item.text;
+      el.append(em, t);
+    } else if (item.kind === 'summary') {
+      el.style.setProperty('--c', color);
+      if (item.turn != null) {
+        const turn = document.createElement('span');
+        turn.className = 'turn';
+        turn.textContent = 'Turn ' + item.turn;
+        el.append(turn);
+      }
+      el.append(document.createTextNode(item.text));
+    } else if (item.kind === 'human' || item.kind === 'chat') {
+      const who = document.createElement('span');
+      who.className = 'who';
+      who.textContent = (item.kind === 'human' ? HUMAN_LABEL : (item.name || 'chat')) + ': ';
+      el.append(who, document.createTextNode(item.text));
+    } else if (item.kind === 'letter') {
+      // Letters live in the bottom bar, not the thought feed.
+      return;
+    } else {
+      el.textContent = item.text || '';
+    }
+
+    const feed = $('feed');
+    feed.append(el);
+    while (feed.children.length > MAX_ITEMS) feed.firstChild.remove();
+  }
+
+  function setMood(mood, pop) {
+    if (!MOODS[mood] || mood === currentMood) return;
+    currentMood = mood;
+    const face = $('face');
+    face.textContent = MOODS[mood];
+    root.style.setProperty('--mood', COLORS[mood]);
+    if (pop) {
+      face.classList.remove('pop');
+      void face.offsetWidth;   // restart the animation
+      face.classList.add('pop');
+    }
+  }
+
+  function phaseWord(st) {
+    if (!st.turn) return 'getting ready';
+    return st.phase === 'core' ? 'core writing' : 'hands playing';
+  }
+
+  function setStatus(st) {
+    let text;
+    if (st.label) text = st.label;
+    else if (!st.turn) text = 'Getting ready';
+    else if (st.phase === 'core') text = `Turn ${st.turn}, core writing the summary`;
+    else text = `Turn ${st.turn}, hands playing`;
+    const el = $('status');
+    if (el.textContent !== text) el.textContent = text;
+  }
+
+  // ---------- the colony clock: paused / no data ----------
+  // /state has carried `game: {tick, paused, stale, wallTs}` since 2026-09-01
+  // and this page drew none of it but the tick. Two rules, both about not
+  // saying more than we know:
+  //
+  //   * Stale wins. `paused` is inferred by the server from two readings with
+  //     the same tick; once the readings stop arriving that inference is about
+  //     a moment that may be a minute old, so once we have lost touch we say
+  //     only that, never "paused" as well. The two are never on screen together.
+  //   * Nothing at all before the first reading. `tick == null` means no push
+  //     has ever landed and the bridge has never answered -- the overlay
+  //     running while the game hasn't started, which is normal and not news.
+  //     It also matches ageText(), which stays blank for the same reason, so
+  //     the whole clock UI is silent together rather than half-lit.
+  let clockKey = null;
+  function setClock(g) {
+    const known = g && g.tick != null;
+    const stale = known && !!g.stale;
+    const paused = known && !!g.paused && !stale;
+    const key = (stale ? 's' : '') + (paused ? 'p' : '');
+    if (key === clockKey) return;
+    clockKey = key;
+    $('badge-stale').classList.toggle('on', stale);
+    $('badge-paused').classList.toggle('on', paused);
+  }
+
+  // Only fixed health labels reach the stream. Queue details and moderation
+  // decisions stay in the control panel, and rejected message text is never drawn.
+  const CHAT_STATUS_LABELS = {
+    connecting: 'Chat connecting', connected: 'Chat connection live',
+    screening: 'Chat connection live', ready: 'Chat connection live', error: 'Chat temporarily unavailable'
+  };
+  let chatModerationKey = null;
+  function setChatModeration(m) {
+    const status = Object.hasOwn(CHAT_STATUS_LABELS, m && m.status) ? m.status : 'disabled';
+    if (status === chatModerationKey) return;
+    chatModerationKey = status;
+    const badge = $('badge-chat');
+    badge.dataset.status = status;
+    badge.classList.toggle('on', status !== 'disabled');
+    $('badge-chat-label').textContent = CHAT_STATUS_LABELS[status] || '';
+  }
+
+  // The bar's turn zone: a big numeral, the phase small and dim underneath.
+  // Same wording logic as the status line, just without the sentence around it.
+  function setTurn(st) {
+    const num = st.turn ? String(st.turn) : '—';
+    const phase = phaseWord(st);
+    const key = num + ' ' + phase;
+    if (key === turnKey) return;
+    const first = turnKey === null;
+    turnKey = key;
+    const box = $('turn-box');
+    const fill = () => {
+      $('turn-num').textContent = num;
+      $('turn-phase').textContent = phase;
+      box.classList.remove('swap');
+    };
+    if (first) fill();
+    else { box.classList.add('swap'); setTimeout(fill, 250); }
+  }
+
+  function setGoal(which, text) {
+    text = (text || '').trim();
+    if (goals[which] === text) return;
+    goals[which] = text;
+    const el = $('goal-' + which);
+    el.classList.add('swap');
+    setTimeout(() => {
+      if (text) { el.textContent = text; el.classList.remove('empty'); }
+      else {
+        el.textContent = which === 'long' ? 'No long-term goal yet' : 'Nothing planned yet';
+        el.classList.add('empty');
+      }
+      el.classList.remove('swap');
+    }, 250);
+  }
+
+  // ---------- the turn summary, in the bottom bar ----------
+  // Moved out of the side column 2026-09-01 so the column is all thoughts. It
+  // sits beside the turn numeral now, which is why it no longer draws its own
+  // "Turn N" label. `pinned` still feeds render()'s dedupe, so the same summary
+  // does not also scroll past in the feed.
+  function setPin(ls) {
+    const el = $('turn-sum');
+    const ok = ls && typeof ls.text === 'string' && ls.text.trim();
+    const key = ok ? String(ls.turn) + ' ' + ls.text : '';
+    if (key === pinKey) return;
+    const wasEmpty = !pinKey;
+    pinKey = key;
+    if (!ok) {
+      pinned = null;
+      el.classList.remove('swap');
+      el.textContent = '';
+      const e = document.createElement('span');
+      e.className = 'tsum-empty';
+      e.textContent = 'Nothing summarised yet';
+      el.append(e);
+      return;
+    }
+    pinned = { turn: ls.turn, text: ls.text };
+    const fill = () => {
+      el.style.setProperty('--c', COLORS[ls.mood] || COLORS.happy);
+      el.textContent = ls.text;
+      el.classList.remove('swap');
+    };
+    if (wasEmpty) fill();
+    else { el.classList.add('swap'); setTimeout(fill, 250); }
+  }
+
+  // ---------- recent events ----------
+  // In-game age. Nothing is shown when either clock is missing, or when the
+  // item is stamped later than the game is now (an older save was loaded and
+  // that item is from a timeline that no longer happened).
+  function ageText(tick, gameTick) {
+    if (tick == null || gameTick == null || tick > gameTick) return '';
+    const t = gameTick - tick;
+    if (t < TICKS_DAY) return Math.floor(t / TICKS_HOUR) + 'h';
+    return Math.floor(t / TICKS_DAY) + 'd' + Math.floor((t % TICKS_DAY) / TICKS_HOUR) + 'h';
+  }
+
+  function makeRow(item) {
+    const el = document.createElement('div');
+    el.className = 'ev fresh';
+    const dot = document.createElement('span');
+    dot.className = 'ev-dot ' + (item.tone === 'good' || item.tone === 'bad' ? item.tone : 'neutral');
+    const label = document.createElement('span');
+    label.className = 'ev-label';
+    label.textContent = item.text;
+    label.title = item.text;
+    const age = document.createElement('span');
+    age.className = 'ev-age';
+    el.append(dot, label, age);
+    return { el, age, tick: (typeof item.tick === 'number' ? item.tick : null) };
+  }
+
+  function setEvents(feed, gameTick) {
+    const box = $('events');
+    const letters = feed.filter((i) => i.kind === 'letter').slice(-EVENTS_SHOWN);
+    if (!letters.length) {
+      if (evRows.size || !box.firstChild) {
+        evRows.clear();
+        box.textContent = '';
+        const e = document.createElement('div');
+        e.className = 'ev-empty';
+        e.textContent = 'No events yet';
+        box.append(e);
+      }
+      return;
+    }
+    const empty = box.querySelector('.ev-empty');
+    if (empty) empty.remove();
+
+    // Oldest first, each new one prepended, so the newest ends up on top and no
+    // existing row is ever moved (moving a node restarts its entrance animation).
+    const keep = new Set();
+    for (const it of letters) {
+      keep.add(it.id);
+      if (!evRows.has(it.id)) {
+        const row = makeRow(it);
+        evRows.set(it.id, row);
+        box.prepend(row.el);
+      }
+    }
+    for (const [id, row] of evRows) {
+      if (!keep.has(id)) { row.el.remove(); evRows.delete(id); }
+    }
+    // Ages are recomputed every poll, so they climb with the colony clock and
+    // sit still while the game is paused.
+    for (const row of evRows.values()) {
+      const txt = ageText(row.tick, gameTick);
+      if (row.age.textContent !== txt) row.age.textContent = txt;
+    }
+  }
+})();
+</script>
+</body>
+</html>

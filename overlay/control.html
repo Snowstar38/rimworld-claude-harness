@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>errata controls</title>
+<style>
+  body { margin: 0; padding: 32px; background: #1E262B; color: #E8DCC4;
+         font: 16px/1.4 "Atkinson Hyperlegible", "Segoe UI", system-ui, sans-serif; max-width: 640px; }
+  h1 { font: 600 28px/1.1 Georgia, serif; margin: 0 0 28px; }
+  section { margin-bottom: 30px; }
+  /* Not the `font:` shorthand — "inherit" is not a valid family there, so the
+     whole declaration used to be dropped and these came out browser-bold. */
+  h2 { font-weight: 400; font-size: 15px; line-height: 1; color: rgba(232,220,196,.55); margin: 0 0 10px; }
+  textarea, input[type=text], input[type=number], select {
+    width: 100%; box-sizing: border-box; background: rgba(0,0,0,.25); color: inherit;
+    border: 1px solid rgba(232,220,196,.2); border-radius: 4px; padding: 10px 12px; font: inherit; }
+  textarea { min-height: 72px; resize: vertical; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; align-items: center; }
+  button { background: rgba(232,220,196,.1); color: inherit; border: 1px solid rgba(232,220,196,.25);
+           border-radius: 4px; padding: 8px 14px; font: inherit; cursor: pointer; }
+  button:hover { background: rgba(232,220,196,.18); }
+  button.send { background: #E89A8A; color: #1E262B; border-color: transparent; font-weight: 700; }
+  .mood { font-size: 22px; padding: 6px 10px; }
+  #log { color: rgba(232,220,196,.55); font-size: 14px; min-height: 1.4em; }
+  .test { border-top: 1px solid rgba(232,220,196,.14); padding-top: 22px; }
+  .hint { color: rgba(232,220,196,.45); font-size: 13px; margin-top: 8px; }
+  .hint b { color: rgba(232,220,196,.7); font-weight: 400; }
+  .tone { display: inline-flex; align-items: center; gap: 6px; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+  .dot.good { background: #8FBE76; } .dot.bad { background: #CC6F58; }
+  .dot.neutral { background: rgba(232,220,196,.42); }
+  .moderation-card { border: 1px solid rgba(232,220,196,.14); border-radius: 6px;
+    padding: 14px 16px; background: rgba(0,0,0,.12); }
+  .moderation-head { display: flex; align-items: center; gap: 9px; margin-bottom: 12px; }
+  .moderation-head .dot { background: rgba(232,220,196,.42); }
+  .moderation-head[data-status="ready"] .dot { background: #8FBE76; }
+  .moderation-head[data-status="connecting"] .dot,
+  .moderation-head[data-status="screening"] .dot { background: #E0A33B; }
+  .moderation-head[data-status="error"] .dot { background: #CC6F58; }
+  #moderation-status { font-weight: 700; }
+  .moderation-meta { color: rgba(232,220,196,.55); font-size: 13px; margin-left: auto; }
+  .moderation-counts { display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; }
+  .moderation-count { color: rgba(232,220,196,.55); font-size: 12px; }
+  .moderation-count b { display: block; color: #E8DCC4; font-size: 20px; font-weight: 400;
+    font-variant-numeric: tabular-nums; }
+  #moderation-decision { margin-top: 10px; }
+</style>
+</head>
+<body>
+<h1>errata controls</h1>
+
+<section>
+  <h2>Chat screening</h2>
+  <div class="moderation-card">
+    <div class="moderation-head" id="moderation-head" data-status="disabled">
+      <span class="dot"></span><span id="moderation-status">Disabled</span>
+      <span class="moderation-meta" id="moderation-meta"></span>
+    </div>
+    <div class="moderation-counts">
+      <span class="moderation-count"><b id="moderation-queued">0</b>queued</span>
+      <span class="moderation-count"><b id="moderation-approved">0</b>approved</span>
+      <span class="moderation-count"><b id="moderation-rejected">0</b>rejected</span>
+      <span class="moderation-count"><b id="moderation-errors">0</b>errors</span>
+      <span class="moderation-count"><b id="moderation-dropped">0</b>dropped</span>
+    </div>
+    <div class="hint" id="moderation-decision"></div>
+    <div class="hint">Approved chat is screened before appearing, but remains untrusted input to agents.</div>
+    <div class="hint">Light touch: pass chat verbatim; hold back clear, egregious attacks or abuse. <a href="/problem-usernames.txt" target="_blank" rel="noopener">Review repeat-offender usernames</a> (three clear strikes in an hour; no automatic bans).</div>
+  </div>
+</section>
+
+<section>
+  <h2>Send a message as the human</h2>
+  <textarea id="msg" placeholder="Tuk needs a bedroom with a door or he'll just walk out."></textarea>
+  <div class="row"><button class="send" id="sendmsg">Send</button></div>
+</section>
+
+<section>
+  <h2>Set the mood</h2>
+  <div class="row" id="moods"></div>
+</section>
+
+<section>
+  <h2>Goals</h2>
+  <input type="text" id="glong" placeholder="Long term">
+  <div style="height:8px"></div>
+  <input type="text" id="gshort" placeholder="Right now">
+  <div class="row"><button id="savegoals">Update goals</button></div>
+</section>
+
+<section>
+  <h2>Status line</h2>
+  <div class="row">
+    <select id="phase" style="width:auto"><option value="hands">hands</option><option value="core">core</option></select>
+    <input type="number" id="turn" min="0" value="1" style="width:100px">
+    <button id="savestatus">Update status</button>
+  </div>
+</section>
+
+<section class="test">
+  <h2>Test a letter &mdash; the bottom bar's "Recent events"</h2>
+  <input type="text" id="ltext" placeholder="Raid: Tribal ambush">
+  <div class="row">
+    <select id="ltone" style="width:auto">
+      <option value="bad">bad</option>
+      <option value="neutral">neutral</option>
+      <option value="good">good</option>
+    </select>
+    <input type="number" id="ltick" placeholder="tick (blank = now)" style="width:200px">
+    <button id="sendletter">Post letter</button>
+    <span class="tone"><span class="dot bad"></span><span class="dot neutral"></span><span class="dot good"></span></span>
+  </div>
+  <div class="hint">Leave the tick blank to stamp it with the colony's current time (age shows <b>0h</b>).
+    Subtract <b>2500</b> per in-game hour, <b>60000</b> per day, to age it.</div>
+</section>
+
+<section class="test">
+  <h2>Test the colony clock</h2>
+  <div class="row">
+    <input type="number" id="gtick" placeholder="ticksGame" style="width:200px">
+    <button id="sendtick">Push tick</button>
+    <button id="tickhour">+1 hour</button>
+    <button id="tickday">+1 day</button>
+  </div>
+  <div class="hint">Now: <b id="nowtick">?</b> &mdash; the ages in the bar are measured against this.
+    A real push from the game (or the server's own poller) overwrites it within a few seconds.</div>
+</section>
+
+<section class="test">
+  <h2>Test a turn summary &mdash; pins to the top of the feed</h2>
+  <textarea id="stext" placeholder="What the core would say about the turn just finished."></textarea>
+  <div class="row">
+    <input type="number" id="sturn" min="0" placeholder="turn" style="width:100px">
+    <button id="sendsummary">Post summary</button>
+  </div>
+  <div class="hint">The newest summary stays pinned above the scrolling feed until the next one lands.</div>
+</section>
+
+<section>
+  <div class="row"><button id="reset">Clear the feed</button></div>
+  <div class="hint">Clears letters and thoughts. Goals, status and the pinned summary stay.</div>
+</section>
+
+<div id="log"></div>
+
+<script>
+  const MOODS = { happy:'🙂', thinking:'🤔', sad:'😭', scared:'😨', welp:'😐', excited:'🤩', angry:'😠', veryhappy:'😁' };
+  const $ = (id) => document.getElementById(id);
+  const log = (t) => { $('log').textContent = t; };
+  async function post(path, body) {
+    try {
+      const r = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      const j = await r.json();
+      log(r.ok ? 'Sent.' : ('Rejected: ' + j.error));
+      return j;
+    } catch (e) { log('Server not reachable.'); throw e; }
+  }
+  const moods = $('moods');
+  for (const [name, face] of Object.entries(MOODS)) {
+    const b = document.createElement('button');
+    b.className = 'mood'; b.textContent = face; b.title = name;
+    b.onclick = () => post('/event', { kind: 'mood', mood: name });
+    moods.append(b);
+  }
+  $('sendmsg').onclick = () => {
+    const t = $('msg');
+    if (!t.value.trim()) return;
+    post('/event', { kind: 'human', text: t.value.trim() }).then(() => { t.value = ''; }, () => {});
+  };
+  $('msg').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); $('sendmsg').click(); }
+  });
+  $('savegoals').onclick = () =>
+    post('/goals', { long: $('glong').value, short: $('gshort').value });
+  $('savestatus').onclick = () =>
+    post('/status', { phase: $('phase').value, turn: Number($('turn').value) });
+  $('reset').onclick = () => post('/reset', {});
+
+  // ---- test affordances: exercise the bar without the game running ----
+  let nowTick = null;
+  function showTick(t) {
+    nowTick = (typeof t === 'number') ? t : null;
+    $('nowtick').textContent = nowTick == null ? 'unknown' : nowTick.toLocaleString();
+    if (nowTick != null && !$('gtick').value) $('gtick').value = nowTick;
+  }
+  $('sendletter').onclick = () => {
+    const text = $('ltext').value.trim();
+    if (!text) return;
+    const body = { kind: 'letter', text, tone: $('ltone').value };
+    const tick = $('ltick').value.trim();
+    if (tick !== '') body.tick = Number(tick);
+    post('/event', body).then(() => { $('ltext').value = ''; }, () => {});
+  };
+  $('ltext').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); $('sendletter').click(); }
+  });
+  function pushTick(t) {
+    if (!Number.isFinite(t)) { log('Need a tick number.'); return; }
+    $('gtick').value = t;
+    post('/game', { tick: t }).then((j) => { if (j && j.game) showTick(j.game.tick); }, () => {});
+  }
+  $('sendtick').onclick = () => pushTick(Number($('gtick').value));
+  $('tickhour').onclick = () => pushTick(Number($('gtick').value || nowTick || 0) + 2500);
+  $('tickday').onclick  = () => pushTick(Number($('gtick').value || nowTick || 0) + 60000);
+  $('sendsummary').onclick = () => {
+    const text = $('stext').value.trim();
+    if (!text) return;
+    const body = { kind: 'summary', text };
+    const t = $('sturn').value.trim();
+    if (t !== '') body.turn = Number(t);
+    post('/event', body).then(() => { $('stext').value = ''; }, () => {});
+  };
+
+  // Prefill goals/status/clock from the server, then keep the clock readout live.
+  const MODERATION_LABELS = {
+    disabled: 'Disabled', connecting: 'Connecting', connected: 'Connected',
+    screening: 'Screening', ready: 'Ready', error: 'Error'
+  };
+  function showModeration(m) {
+    m = m || {};
+    const status = Object.hasOwn(MODERATION_LABELS, m.status) ? m.status : 'disabled';
+    $('moderation-head').dataset.status = status;
+    $('moderation-status').textContent = MODERATION_LABELS[status];
+    $('moderation-queued').textContent = Number.isFinite(m.queued) ? m.queued : 0;
+    $('moderation-approved').textContent = Number.isFinite(m.approved) ? m.approved : 0;
+    $('moderation-rejected').textContent = Number.isFinite(m.rejected) ? m.rejected : 0;
+    $('moderation-errors').textContent = Number.isFinite(m.errors) ? m.errors : 0;
+    $('moderation-dropped').textContent = Number.isFinite(m.dropped) ? m.dropped : 0;
+    const source = [m.channel, m.model].filter(v => typeof v === 'string' && v.trim());
+    $('moderation-meta').textContent = source.join(' · ');
+    $('moderation-decision').textContent = typeof m.lastDecision === 'string' && m.lastDecision.trim()
+      ? 'Last decision: ' + m.lastDecision : 'No decisions yet.';
+  }
+  function refresh(first) {
+    fetch('/state', { cache: 'no-store' }).then(r => r.json()).then(s => {
+      if (first) {
+        $('glong').value = s.goals.long || '';
+        $('gshort').value = s.goals.short || '';
+        $('phase').value = s.status.phase || 'hands';
+        $('turn').value = s.status.turn || 0;
+        $('sturn').value = s.status.turn || 0;
+      }
+      showTick(s.game && s.game.tick);
+      showModeration(s.chatModeration);
+    }).catch(() => { if (first) log('Server not reachable.'); });
+  }
+  refresh(true);
+  setInterval(() => refresh(false), 3000);
+</script>
+</body>
+</html>
